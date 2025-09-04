@@ -1,5 +1,5 @@
 #include "utils.h"
-#include "scp.h"
+#include "lagrangian.h"
 #include "gurobi.h"
 #include "debug.h"
 

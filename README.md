@@ -8,7 +8,7 @@ It employs a bottom-up search strategy, starting from the simplest combinations 
 
 Solving the minterm matrix is an NP-hard problem beyond the scope of CCubes, which relies on Gurobi, an industry level optimization solver. For the time being, Gurobi's path is hardcoded in the Makefile and it needs to be changed manually. At runtime, the variable GUROBI_HOME needs to be exported because Gurobi will search for a valid license, which Gurobi offers freely for academic research.
 
-In case Gurobi is not available, the minterm matrix is currently solved using a simple greedy method as a fallback option. More solving methods will be added.
+In case Gurobi is not available, the minterm matrix is currently solved using a custom implementation of a Lagrangian relaxation method, as a fallback option. More solving methods will be added.
 
 The actual combination of Prime Implicants needed to cover the ON set minterms is decided by the solver, if no weights are applied. This is the quickest exact method, roughly equivalent to `espresso -Dso` type of output although it produces a much more efficient circuit.
 
@@ -40,7 +40,7 @@ Options:
                           1 (default) weight based on complexity levels k
                           2 additional weight if shared between outputs
   -s<number>          : how to solve the covering problem:
-                          0 greedy (fast)
+                          0 Lagrangian relaxation heuristic
                           11 (default) Gurobi exact
                           12 (not implemented), Gurobi solution pool to select the one
                               with the highest number of shared prime implicants

@@ -30,7 +30,7 @@ void help() {
     printf("                           1 (default) weight based on complexity levels k\n");
     printf("                           2 additional weight if shared between outputs\n");
     printf("  -s<number>          : how to solve the covering problem:\n");
-    printf("                           0 greedy (fast)\n");
+    printf("                           0 Lagrangian relaxation heuristic\n");
     printf("                           11 (default) Gurobi exact\n");
     printf("                           12 (not implemented), detect the most shared PIs\n");
     printf("  -d<level>[=<file>] : incremental debug information\n");
@@ -139,8 +139,8 @@ int main(int argc, char *argv[]) {
     if (SCP_TYPE == 11 || SCP_TYPE == 12) {
         if (!gurobi_ok) {
             SCP_TYPE = 0;
-            WEIGHT_PIC = 0;
-            printf("Warning: Gurobi not available, falling back to the simple greedy solver.\n");
+            // WEIGHT_PIC = 0;
+            printf("Warning: Gurobi not available, falling back to the Lagrangian solver.\n");
         }
     }
 
@@ -983,9 +983,8 @@ int main(int argc, char *argv[]) {
 
                 clock_gettime(CLOCK_MONOTONIC, &startg);
 
-                if (SCP_TYPE == 0) { // simple greedy algorithm
-
-                    solve_scp_greedy(
+                if (SCP_TYPE == 0) { // Lagrangian relaxation
+                    solve_scp_lagrangian(
                         pichart,
                         *foundPI,
                         ON_minterms,
