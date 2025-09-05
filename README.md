@@ -8,11 +8,11 @@ It employs a bottom-up search strategy, starting from the simplest combinations 
 
 Solving the minterm matrix is an NP-hard problem beyond the scope of CCubes, which relies on Gurobi, an industry level optimization solver. For the time being, Gurobi's path is hardcoded in the Makefile and it needs to be changed manually. At runtime, the variable GUROBI_HOME needs to be exported because Gurobi will search for a valid license, which Gurobi offers freely for academic research.
 
-In case Gurobi is not available, the minterm matrix is currently solved using a custom implementation of a Lagrangian relaxation method, as a fallback option. More solving methods will be added.
+As a fallback option, in case Gurobi is not available, the minterm matrix coverage is currently solved using a custom implementation of a Lagrangian relaxation method, based on the sources from BOOM. More solving methods will be added.
 
-The actual combination of Prime Implicants needed to cover the ON set minterms is decided by the solver, if no weights are applied. This is the quickest exact method, roughly equivalent to `espresso -Dso` type of output although it produces a much more efficient circuit.
+If no weights are applied, the combination of prime implicants that cover the ON set minterms is the quickest exact method, roughly equivalent to `espresso -Dso` type of output, although it produces a much more efficient circuit especially when using Gurobi's exact optimization.
 
-Other weighting options are available, for instance  `-w1` for weight based on complexity levels (prime implicants with lower number of literals will be given more weight). The option `-w2` adds additional weight if a prime implicant is shared between multiple outputs. The option `-s12` (unimplemented yet) aims to spend additional time collecting a pool of possible solutions from the solver and decide which solution is best by comparing their shared prime implicants with those from the other outputs. This might be useful since it is quite possible that different shared prime implicants are selected by the solver, despite them having an equal (weighted) contribution to optimality.
+Two weighting options are available, for instance  `-w1` for weight based on complexity levels (prime implicants with lower number of literals will be given more weight). The option `-w2` adds additional weight if a prime implicant is shared between multiple outputs. The option `-s12` (unimplemented yet) aims to spend additional time collecting a pool of possible solutions from the solver and decide which solution is best by comparing their shared prime implicants with those from the other outputs. This might be useful since it is quite possible that different shared prime implicants are selected by the solver, despite them having an equal (weighted) contribution to optimality.
 
 Unlike other minimizers like Espresso (usually single threaded), CCubes is scalable and can handle larger problem instances more efficiently. Where possible, it will use a parallel search process using available CPU cores. Theoretically, its scalability can be extended to distributed computing environments, allowing it to tackle even larger instances by using multiple machines.
 
@@ -45,7 +45,6 @@ Options:
                           12 (not implemented), Gurobi solution pool to select the one
                               with the highest number of shared prime implicants
   -d<level>[=<file>] : incremental debug information
-                          0 error only
                           1 errors + warnings
                           2 errors + warnings + info
                           3 everything (trace)

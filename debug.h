@@ -5,8 +5,7 @@
 
 // Debug levels (incremental thresholds)
 enum {
-    DBG_ERROR = 0,  // only errors
-    DBG_WARN  = 1,  // errors + warnings
+    DBG_ERROR = 1,  // errors + warnings
     DBG_INFO  = 2,  // errors + warnings + info
     DBG_TRACE = 3   // everything
 };
@@ -29,7 +28,6 @@ void debug_close(void);
     do { if (debug_enabled && (level) <= debug_level) { \
         fprintf(debug_out, "[%s] %s:%d: " fmt "\n", \
             (level)==DBG_ERROR ? "ERROR" : \
-            (level)==DBG_WARN  ? "WARN " : \
             (level)==DBG_INFO  ? "INFO " : "TRACE", \
             __FILE__, __LINE__, ##__VA_ARGS__); \
         fflush(debug_out); \
@@ -40,7 +38,6 @@ void debug_close(void);
 
 // Convenience wrappers for common levels
 #define DBG_ERROR_BLOCK   DBG_BLOCK(DBG_ERROR)
-#define DBG_WARN_BLOCK    DBG_BLOCK(DBG_WARN)
 #define DBG_INFO_BLOCK    DBG_BLOCK(DBG_INFO)
 #define DBG_TRACE_BLOCK   DBG_BLOCK(DBG_TRACE)
 

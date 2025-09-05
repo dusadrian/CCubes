@@ -34,7 +34,6 @@ void help() {
     printf("                           11 (default) Gurobi exact\n");
     printf("                           12 (not implemented), detect the most shared PIs\n");
     printf("  -d<level>[=<file>] : incremental debug information\n");
-    printf("                           0 error only\n");
     printf("                           1 errors + warnings\n");
     printf("                           2 errors + warnings + info\n");
     printf("                           3 everything (trace)\n");
@@ -115,7 +114,7 @@ int main(int argc, char *argv[]) {
 
             // validate level (default to ERROR if invalid)
             if (lvl < DBG_ERROR || lvl > DBG_TRACE) {
-                fprintf(stderr, "Invalid debug level: %d (must be 0–3)\n", lvl);
+                fprintf(stderr, "Invalid debug level: %d (must be 1–3)\n", lvl);
                 help();
                 return 1;
             }
@@ -397,10 +396,13 @@ int main(int argc, char *argv[]) {
         shifted_mask[r] = (VALUE_BIT_MASK << bit_index[r]);
     }
 
+    double scp_time = 0.0, k_scp_time = 0.0;
+
 
     int k;
     for (k = START_LEVEL; k <= ninputs; k++) {
 
+        k_scp_time = 0.0; // reset time for this level
         clock_gettime(CLOCK_MONOTONIC, &startk);
 
         uint64_t maxtasks = nchoosek(ninputs, k);
@@ -430,15 +432,15 @@ int main(int argc, char *argv[]) {
             int tempk[k];
             uint64_t combination = task;
 
-            DBG_INFO_BLOCK {
+            DBG_TRACE_BLOCK {
                 if (task % 1000000 == 0 && task / 1000000 > 0) { // every 1M tasks
                     fprintf(debug_out, "-");
                 }
-                if (task % 100000000 == 0 && task / 100000000 > 0) { // every 100M tasks
-                    fprintf(debug_out, " (%lld)", task / 100000000);
-                }
                 if (task % 50000000 == 0 && task / 50000000 > 0) { // every 50M tasks
                     fprintf(debug_out, "\n");
+                }
+                if (task % 100000000 == 0 && task / 100000000 > 0) { // every 100M tasks
+                    fprintf(debug_out, " (%lld)", task / 100000000);
                 }
             }
 
@@ -848,7 +850,7 @@ int main(int argc, char *argv[]) {
 
                             *estimPI += increase;
 
-                            DBG_INFO_BLOCK {
+                            DBG_TRACE_BLOCK {
                                 multiplier++;
                                 printf("%dx", multiplier);
                             }
@@ -926,7 +928,7 @@ int main(int argc, char *argv[]) {
             PInfo[o].nofpi[k - 1] = *foundPI; // TODO move this after checking the coverage at this level of k
 
             if (*foundPI > 0 && !*ON_set_covered) {
-                DBG_INFO_BLOCK {
+                DBG_TRACE_BLOCK {
                     fprintf(
                         debug_out,
                         "Trying to cover output %d with %d PIs\n",
@@ -953,7 +955,7 @@ int main(int argc, char *argv[]) {
                 *ON_set_covered = test_coverage;
             }
 
-            DBG_INFO_BLOCK {
+            DBG_TRACE_BLOCK {
                 fprintf(debug_out, "Output %d, found PIs: %d", o + 1, *foundPI);
             }
 
@@ -1055,7 +1057,8 @@ int main(int argc, char *argv[]) {
                     (endg.tv_sec - startg.tv_sec) +
                     (endg.tv_nsec - startg.tv_nsec) / 1e9;
 
-                DBG_INFO_BLOCK {
+                k_scp_time += execution_time;
+                DBG_TRACE_BLOCK {
                     fprintf(debug_out, ", PI chart solved in %.3f seconds\n", execution_time);
                 }
 
@@ -1096,7 +1099,7 @@ int main(int argc, char *argv[]) {
                     PInfo[o].stop_search = stop_counter[o] == MAX_LEVELS;
                 }
 
-                DBG_INFO_BLOCK {
+                DBG_TRACE_BLOCK {
                     fprintf(debug_out, "solmin: %d%s\n", *solmin, PInfo[o].stop_search ? ", stopping search" : "");
                     for (int i = 0; i < *solmin; i++) {
                         fprintf(debug_out, "%d ", indices[i] + 1);
@@ -1120,7 +1123,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            DBG_INFO_BLOCK {
+            DBG_TRACE_BLOCK {
                 fprintf(debug_out, "\n");
             }
 
@@ -1135,8 +1138,10 @@ int main(int argc, char *argv[]) {
             (endk.tv_nsec - startk.tv_nsec) / 1e9;
 
         DBG_INFO_BLOCK {
-            fprintf(debug_out, "k-level execution completed in %.3f seconds\n", execution_time);
+            fprintf(debug_out, "k-level execution completed in %.3f (%.3f) seconds\n", execution_time, k_scp_time);
         }
+
+        scp_time += k_scp_time;
 
         bool stop = true;
         for (int o = 0; o < noutputs; o++) {
@@ -1193,7 +1198,7 @@ int main(int argc, char *argv[]) {
         (end.tv_sec - start.tv_sec) +
         (end.tv_nsec - start.tv_nsec) / 1e9;
 
-    fprintf(stderr, "Execution completed in %.3f seconds\n", execution_time);
+    fprintf(stderr, "Execution completed in %.3f (%.3f SCP) seconds\n", execution_time, scp_time);
 
     DBG_INFO_BLOCK {
         fprintf(debug_out, "all good.\n");
