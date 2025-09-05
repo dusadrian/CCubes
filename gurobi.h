@@ -9,6 +9,8 @@
     #include "gurobi_c.h"
 #endif
 
+bool gurobi_license_is_valid(void);
+
 void gurobi_multiobjective(
     int pichart[],
     const int foundPI,

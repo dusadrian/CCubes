@@ -5,6 +5,7 @@
 # should NOT be indented with tabs, but with spaces
 ####
 
+.DEFAULT_GOAL := all
 
 # Compiler
 CC  := /opt/homebrew/opt/llvm/bin/clang
@@ -77,6 +78,16 @@ ifneq ("$(wildcard $(GUROBI_HOME))","")
   endif
 else
   $(info Gurobi not found -> disabling)
+endif
+
+# Gurobi license check target and conditional dependency
+.PHONY: check-gurobi
+check-gurobi:
+	@env GRB_LICENSE_FILE=$(GUROBI_LIC) $(GUROBI_HOME)/bin/grbprobe >/dev/null 2>&1 || { echo "Gurobi license invalid or expired"; exit 1; }
+
+# If we built with -DHAVE_GUROBI in CFLAGS, ensure we verify license at build time
+ifeq ($(filter -DHAVE_GUROBI,$(CFLAGS)),-DHAVE_GUROBI)
+  $(BIN): check-gurobi
 endif
 
 # Build rules: indent using TABS

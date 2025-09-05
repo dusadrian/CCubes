@@ -8,6 +8,57 @@
 
 #include "gurobi.h"
 
+bool gurobi_license_is_valid(void) {
+    GRBenv *env = NULL;
+    int error;
+
+    /* ----- Prepare a temporary log file path */
+    char tmpl[] = "/tmp/gurobi_check_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd != -1) close(fd);
+    /* ----- remove this part to keep gurobi.log in the current directory */
+
+    /* Temporarily suppress console output (license banner) */
+    FILE *nullout = fopen("/dev/null", "w");
+    int saved_stdout = -1, saved_stderr = -1;
+    if (nullout) {
+        saved_stdout = dup(fileno(stdout));
+        saved_stderr = dup(fileno(stderr));
+        dup2(fileno(nullout), fileno(stdout));
+        dup2(fileno(nullout), fileno(stderr));
+    }
+
+    error = GRBloadenv(&env, tmpl);
+
+    /* Restore console output */
+    if (nullout) {
+        fflush(stdout);
+        fflush(stderr);
+
+        if (saved_stdout != -1) {
+            dup2(saved_stdout, fileno(stdout));
+            close(saved_stdout);
+        }
+
+        if (saved_stderr != -1) {
+            dup2(saved_stderr, fileno(stderr));
+            close(saved_stderr);
+        }
+
+        fclose(nullout);
+    }
+
+    if (!error) {
+        /* Silence further logs just in case */
+        GRBsetintparam(env, "OutputFlag", 0);
+        GRBfreeenv(env);
+        return true;
+    } else {
+        if (env) GRBfreeenv(env);
+        return false;
+    }
+}
+
 void gurobi_multiobjective(
     int pichart[],
     const int foundPI,
@@ -201,8 +252,8 @@ void gurobi_solution_pool(
     //     printf("\n");
     // }
 
-    /* Try to initialize Gurobi environment with better error handling */
-    error = GRBloadenv(&env, NULL);  // Use NULL instead of "/dev/null" to avoid file issues
+    /* Initialize Gurobi environment; log to /dev/null to avoid gurobi.log in CWD */
+    error = GRBloadenv(&env, "/dev/null");
     if (error) {
         printf("ERROR: Failed to create Gurobi environment: %s\n", GRBgeterrormsg(env));
         goto QUIT;

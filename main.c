@@ -43,9 +43,6 @@ void help() {
 int main(int argc, char *argv[]) {
 
     bool gurobi_ok = false;
-    #ifdef HAVE_GUROBI
-        gurobi_ok = true;
-    #endif
 
     // Record start time for execution timing
     struct timespec start, end, startk, endk, startg, endg;
@@ -134,6 +131,12 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+
+#ifdef HAVE_GUROBI
+    if (SCP_TYPE == 11 || SCP_TYPE == 12) {
+        gurobi_ok = gurobi_license_is_valid();
+    }
+    #endif
 
     if (SCP_TYPE == 11 || SCP_TYPE == 12) {
         if (!gurobi_ok) {
