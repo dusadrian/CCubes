@@ -6,9 +6,9 @@ The minimization process is extremely efficient with incompletely specified func
 
 It employs a bottom-up search strategy, starting from the simplest combinations of 1 input, 2 inputs etc. and gradually increases the complexity. After each such level, it tries to solve the minterm matrix and stops as soon as there is a high probability that no new decisive prime implicants will be found at the next level.
 
-Solving the minterm matrix is an NP-hard problem beyond the scope of CCubes, which relies on Gurobi, an industry level optimization solver. For the time being, Gurobi's path is hardcoded in the Makefile and it needs to be changed manually. At runtime, the variable GUROBI_HOME needs to be exported because Gurobi will search for a valid license, which Gurobi offers freely for academic research.
+Solving the minterm matrix coverage is an NP-hard problem beyond the scope of CCubes. Exact solutions are provided by Gurobi, an industry level power optimization solver. For compilation, Gurobi's path is hardcoded in the Makefile and it needs to be changed manually. At runtime, Gurobi will search for a valid license, freely offered for academic research.
 
-As a fallback option, in case Gurobi is not available, the minterm matrix coverage is currently solved using a custom implementation of a Lagrangian relaxation method, based on the sources from BOOM. More solving methods will be added.
+The default option, in case Gurobi is not available, is to solve the minterm matrix coverage using a custom implementation of a parallel processing Lagrangian relaxation method, based on the sources of BOOM (courtesy of Petr Fišer). More solving methods will be added.
 
 If no weights are applied, the combination of prime implicants that cover the ON set minterms is the quickest exact method, roughly equivalent to `espresso -Dso` type of output, although it produces a much more efficient circuit especially when using Gurobi's exact optimization.
 
@@ -40,8 +40,8 @@ Options:
                           1 (default) weight based on complexity levels k
                           2 additional weight if shared between outputs
   -s<number>          : how to solve the covering problem:
-                          0 Lagrangian relaxation heuristic
-                          11 (default) Gurobi exact
+                          0 (default) Lagrangian relaxation heuristic
+                          11 Gurobi exact
                           12 (not implemented), Gurobi solution pool to select the one
                               with the highest number of shared prime implicants
   -d<level>[=<file>] : incremental debug information
