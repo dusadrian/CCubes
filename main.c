@@ -30,9 +30,9 @@ void help() {
     printf("                           1 (default) weight based on complexity levels k\n");
     printf("                           2 additional weight if shared between outputs\n");
     printf("  -s<number>          : how to solve the covering problem:\n");
-    printf("                           0 Lagrangian relaxation heuristic\n");
-    printf("                           11 (default) Gurobi exact\n");
-    printf("                           12 (not implemented), detect the most shared PIs\n");
+    printf("                           0 (default) Lagrangian relaxation heuristic\n");
+    printf("                           11 Gurobi exact\n");
+    printf("                           12 (not implemented), Gurobi and detect the most shared PIs\n");
     printf("  -d<level>[=<file>] : incremental debug information\n");
     printf("                           1 errors + warnings\n");
     printf("                           2 errors + warnings + info\n");
@@ -58,7 +58,7 @@ int main(int argc, char *argv[]) {
     int BITS_PER_WORD = 64;
     int THREADS = 0; // max by default, if OpenMP enabled
     int WEIGHT_PIC = 2;
-    int SCP_TYPE = 11;
+    int SCP_TYPE = 0;
     char *SRC_FILE = NULL;
     char *DST_FILE = NULL;
 
@@ -138,8 +138,7 @@ int main(int argc, char *argv[]) {
     if (SCP_TYPE == 11 || SCP_TYPE == 12) {
         if (!gurobi_ok) {
             SCP_TYPE = 0;
-            // WEIGHT_PIC = 0;
-            printf("Warning: Gurobi not available, falling back to the Lagrangian solver.\n");
+            printf("Gurobi not available, falling back to the Lagrangian solver.\n");
         }
     }
 
@@ -990,6 +989,7 @@ int main(int argc, char *argv[]) {
                         pichart,
                         *foundPI,
                         ON_minterms,
+                        NULL,
                         weights,
                         indices,
                         solmin
