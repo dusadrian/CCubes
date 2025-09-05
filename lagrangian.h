@@ -9,7 +9,8 @@ void solve_scp_lagrangian(
     int pichart[],
     const int foundPI,
     const int ON_minterms,
-    double weights[],
+    const double col_costs[],
+    const double weights[],
     int *solution,
     int *solmin
 );
