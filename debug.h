@@ -5,9 +5,9 @@
 
 // Debug levels (incremental thresholds)
 enum {
-    DBG_ERROR = 1,  // errors + warnings
-    DBG_INFO  = 2,  // errors + warnings + info
-    DBG_TRACE = 3   // everything
+    DBG_ERROR = 0,  // errors + warnings
+    DBG_INFO  = 1,  // errors + warnings + info
+    DBG_TRACE = 2   // everything
 };
 
 // Global debug configuration

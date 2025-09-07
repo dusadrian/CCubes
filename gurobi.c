@@ -222,11 +222,11 @@ void gurobi_solution_pool(
     int pichart[],
     const int foundPI,
     const int ON_minterms,
-    const int max_solutions, // maximum number of solutions to find
+    const int max_pool,      // maximum number of solutions to collect
     double weights[],        // the weights for each individual PI
-    int *solcount,           // no. of solutions found
-    int *solmat,             // solution matrix
-    int *solmin              // no. of PIs covering the ON_minterms
+    int *pool_count,           // number of solutions returned (<= max_pool)
+    int **pool_solutions,    // array of int* solutions
+    int *solmin              // minimal number of PIs covering the ON_minterms
 ) {
     int error = 0;
     GRBenv      *env        = NULL;
@@ -235,6 +235,20 @@ void gurobi_solution_pool(
     int         *ind        = NULL;
     double      *coeffs     = NULL; // objective coefficients (reused)
     double      *gurobi_sol = NULL;
+
+    if (pool_count) *pool_count = 0;
+    if (solmin) *solmin = 0;
+    if (
+        !pichart ||
+        foundPI <= 0 ||
+        ON_minterms <= 0 ||
+        max_pool <= 0 ||
+        !pool_count ||
+        !pool_solutions ||
+        !solmin
+    ) {
+        return;
+    }
 
     ind  = malloc(foundPI * sizeof(int));
     coeffs  = malloc(foundPI * sizeof(double));
@@ -314,7 +328,7 @@ void gurobi_solution_pool(
     error = GRBoptimize(model);
     if (error) goto QUIT;
 
-    double objval;
+    double objval = 0.0;
     error = GRBgetdblattr(model, GRB_DBL_ATTR_OBJVAL, &objval);
     if (error) goto QUIT;
 
@@ -330,7 +344,7 @@ void gurobi_solution_pool(
         if (error) goto QUIT;
     }
 
-    /* ---------- Phase 2: single objective MAX value^T x, with solution pool ---------- */
+    /* ---------- Phase 2: maximize weights^T x, enable solution pool ---------- */
 
     // set the *single* objective to maximize weighted value
     error = GRBsetdblattrarray(model, GRB_DBL_ATTR_OBJ, 0, foundPI, weights);
@@ -338,8 +352,8 @@ void gurobi_solution_pool(
     error = GRBsetintattr(model, GRB_INT_ATTR_MODELSENSE, GRB_MAXIMIZE);
     if (error) goto QUIT;
 
-    // enable solution pool (set on the model's env)
-    error = GRBsetintparam(menv, GRB_INT_PAR_POOLSOLUTIONS, max_solutions);
+    /* pool params on model's environment */
+    error = GRBsetintparam(menv, GRB_INT_PAR_POOLSOLUTIONS, max_pool);
     if (error) goto QUIT;
     error = GRBsetintparam(menv, GRB_INT_PAR_POOLSEARCHMODE, 2);
     if (error) goto QUIT;
@@ -352,13 +366,21 @@ void gurobi_solution_pool(
 
 
     /* get number of solutions in pool */
-    error = GRBgetintattr(model, GRB_INT_ATTR_SOLCOUNT, solcount);
+    error = GRBgetintattr(model, GRB_INT_ATTR_SOLCOUNT, pool_count);
     if (error) goto QUIT;
 
-    // printf("Found %d solutions in pool (max 100)\n", solcount);
+    // printf("Found %d solutions in pool (max 100)\n", pool_count);
+
+    /* buffer to collect indices per solution */
+    int *idxbuf = (int*)malloc((size_t)ON_minterms * sizeof(int));
+    if (!idxbuf) {
+        error = 1;
+        goto QUIT;
+    }
 
     /* loop over solutions in pool */
-    for (int s = 0; s < *solcount; s++) {
+    int stored = 0;
+    for (int s = 0; s < *pool_count && stored < max_pool; s++) {
 
         // Use model's environment when selecting solution from pool
         error = GRBsetintparam(menv, GRB_INT_PAR_SOLUTIONNUMBER, s);
@@ -368,12 +390,21 @@ void gurobi_solution_pool(
         int numvars = 0;
         error = GRBgetintattr(model, GRB_INT_ATTR_NUMVARS, &numvars);
         if (error) goto QUIT;
-        if (numvars < 0) { error = 1; goto QUIT; }
+
+        if (numvars < 0) {
+            error = 1;
+            goto QUIT;
+        }
+
         if (numvars > foundPI) {
             double *tmp = (double*)realloc(gurobi_sol, (size_t)numvars * sizeof(double));
-            if (!tmp) { error = 1; goto QUIT; }
+            if (!tmp) {
+                error = 1;
+                goto QUIT;
+            }
             gurobi_sol = tmp;
         }
+
         int len = (numvars < foundPI) ? numvars : foundPI;
 
         error = GRBgetdblattrarray(model, GRB_DBL_ATTR_XN, 0, len, gurobi_sol);
@@ -384,7 +415,7 @@ void gurobi_solution_pool(
         for (int j = 0; j < len; j++) {
             if (gurobi_sol[j] > 0.99) {
                 if (pos < ON_minterms) {
-                    solmat[s * ON_minterms + pos] = j;
+                    idxbuf[pos] = j;
                     // printf(" %d", j + 1);
                     pos++;
                 } else {
@@ -392,8 +423,12 @@ void gurobi_solution_pool(
                 }
             }
         }
-
         // printf("\n");
+
+        int *entry = (int*)malloc((size_t)(*solmin) * sizeof(int));
+        if (!entry) { error = 1; goto QUIT; }
+        memcpy(entry, idxbuf, (size_t)(*solmin) * sizeof(int));
+        pool_solutions[stored++] = entry;
     }
 
     QUIT:

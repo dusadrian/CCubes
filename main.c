@@ -21,23 +21,23 @@
 void help() {
     printf("Usage: ccubes [options] source.pla [dest.pla]\n");
     printf("Options:\n");
-    printf("  -k<number>          : start searching from level k\n");
-    printf("  -e<number>          : end criterion (default +1 level with the same minima)\n");
-    printf("  -b<number>          : bits per word, either 8, 16, 32, 64 (default) or 128\n");
-    printf("  -c<number>          : number of CPU cores / threads to use, if OpenMP available\n");
-    printf("  -w<number>          : weights applied to the prime implicants:\n");
-    printf("                           0 no weight\n");
-    printf("                           1 (default) weight based on complexity levels k\n");
-    printf("                           2 additional weight if shared between outputs\n");
-    printf("  -s<number>          : how to solve the covering problem:\n");
-    printf("                           0 (default) Lagrangian relaxation heuristic\n");
-    printf("                           11 Gurobi exact\n");
-    printf("                           12 (not implemented), Gurobi and detect the most shared PIs\n");
+    printf("  -k<number>         : start searching from level k\n");
+    printf("  -e<number>         : end criterion (default +1 level with the same minima)\n");
+    printf("  -b<number>         : bits per word, either 8, 16, 32, 64 (default) or 128\n");
+    printf("  -c<number>         : number of CPU cores / threads to use, if OpenMP available\n");
+    printf("  -w<number>         : weights applied to the prime implicants:\n");
+    printf("                         0 no weight\n");
+    printf("                         1 (default) weight based on complexity levels k\n");
+    printf("                         2 additional weight if shared between outputs\n");
+    printf("  -s<number>         : how to solve the covering problem:\n");
+    printf("                         0 (default) Lagrangian relaxation heuristic\n");
+    printf("                         1 Gurobi exact\n");
     printf("  -d<level>[=<file>] : incremental debug information\n");
-    printf("                           1 errors + warnings\n");
-    printf("                           2 errors + warnings + info\n");
-    printf("                           3 everything (trace)\n");
-    printf("  -h, --help          : show this help message\n");
+    printf("                         0 errors + warnings\n");
+    printf("                         1 errors + warnings + info\n");
+    printf("                         2 everything (trace)\n");
+    printf("  -p<number>         : decide from a pool of up to <number> equally optimal solutions\n");
+    printf("  -h, --help         : show this help message\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -54,8 +54,9 @@ int main(int argc, char *argv[]) {
     int MAX_LEVELS = 1;
     int BITS_PER_WORD = 64;
     int THREADS = 0; // max by default, if OpenMP enabled
-    int WEIGHT_PIC = 2;
+    int WEIGHT_PIC = 1;
     int SCP_TYPE = 0;
+    int POOL_MAX = 1; // collect up to this many solutions
     char *SRC_FILE = NULL;
     char *DST_FILE = NULL;
 
@@ -83,10 +84,15 @@ int main(int argc, char *argv[]) {
             }
         } else if (strncmp(argv[i], "-w", 2) == 0) {
             WEIGHT_PIC = atoi(argv[i] + 2);
+            if (WEIGHT_PIC < 0 || WEIGHT_PIC > 2) {
+                fprintf(stderr, "Invalid weight option: %d (must be 0, 1, or 2)\n", WEIGHT_PIC);
+                help();
+                return 1;
+            }
         } else if (strncmp(argv[i], "-s", 2) == 0) {
             SCP_TYPE = atoi(argv[i] + 2);
-            if (SCP_TYPE != 0 && SCP_TYPE != 11) {
-                fprintf(stderr, "Invalid SCP type: %d (must be 0 or 11)\n", SCP_TYPE);
+            if (SCP_TYPE != 0 && SCP_TYPE != 1) {
+                fprintf(stderr, "Invalid SCP solver: %d (must be 0 or 1)\n", SCP_TYPE);
                 help();
                 return 1;
             }
@@ -118,6 +124,9 @@ int main(int argc, char *argv[]) {
 
             debug_init(file, lvl);
 
+        } else if (strncmp(argv[i], "-p", 2) == 0) {
+            POOL_MAX = atoi(argv[i] + 2);
+            if (POOL_MAX < 1) POOL_MAX = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             help();
             return 0;
@@ -132,20 +141,21 @@ int main(int argc, char *argv[]) {
         }
     }
 
-#ifdef HAVE_GUROBI
-    if (SCP_TYPE == 11 || SCP_TYPE == 12) {
-        gurobi_ok = gurobi_license_is_valid();
-    }
+    #ifdef HAVE_GUROBI
+        if (SCP_TYPE == 1) {
+            gurobi_ok = gurobi_license_is_valid();
+        }
     #endif
 
-    if (SCP_TYPE == 11 || SCP_TYPE == 12) {
+
+    if (SCP_TYPE == 1) {
         if (!gurobi_ok) {
             SCP_TYPE = 0;
             printf("Gurobi not available, falling back to the Lagrangian solver.\n");
         }
     }
 
-    if (SCP_TYPE == 12) {
+    if (POOL_MAX > 1) {
         WEIGHT_PIC = 2;
     }
 
@@ -708,197 +718,199 @@ int main(int argc, char *argv[]) {
                 int counter = 0; // counter for the unique PIs
 
                 for (int o = 0; o < noutputs; o++) {
-                DBG_TRACE_BLOCK {
-                    fprintf(debug_out, "Output %d, found PIs:", o + 1);
-                }
-                for (int f = 0; f < buffer[tid][o].found; f++) {
                     DBG_TRACE_BLOCK {
-                        fprintf(debug_out, " %d", buffer[tid][o].decpos[f]);
+                        fprintf(debug_out, "Output %d, found PIs:", o + 1);
                     }
-                    bool unique = true;
 
-                    for (int u = 0; u < counter; u++) {
-                        if (buffer[tid][o].decpos[f] == uniquePIs[u]) {
-                            output_map[u * noutputs + shared_count[u]] = o;
-                            found_map[u * noutputs + shared_count[u]] = f;
-                            covsum_map[u * noutputs + shared_count[u]] = buffer[tid][o].covsum[f];
-                            shared_count[u]++;
-                            unique = false;
-                            break;
+                    for (int f = 0; f < buffer[tid][o].found; f++) {
+                        DBG_TRACE_BLOCK {
+                            fprintf(debug_out, " %d", buffer[tid][o].decpos[f]);
                         }
-                    }
+                        bool unique = true;
 
-                    if (unique) {
-                        uniquePIs[counter] = buffer[tid][o].decpos[f];
-                        output_map[counter * noutputs + 0] = o;
-                        found_map[counter * noutputs + 0] = f;
-                        covsum_map[counter * noutputs + 0] = buffer[tid][o].covsum[f];
-                        shared_count[counter]++;
-                        counter++;
-                    }
-                }
-                DBG_TRACE_BLOCK {
-                    fprintf(debug_out, "\n");
-                }
-            }
-
-            DBG_TRACE_BLOCK {
-                // for (int o = 0; o < noutputs; o++) {
-                //     fprintf(debug_out, "Output %d, found PIs: %d\n", o + 1, PInfo[o].task_found);
-                //     for (int f = 0; f < PInfo[o].task_found; f++) {
-                //         fprintf(debug_out, "  PI %d: decpos = %d, covsum = %d\n",
-                //                 f + 1,
-                //                 PInfo[o].task_decpos[f],
-                //                 PInfo[o].task_covsum[f]);
-                //         fprintf(debug_out, "    fixed bits: ");
-                //         for (int w = 0; w < implicant_words; w++) {
-                //             fprintf(debug_out, "%llu ", PInfo[o].task_fixed_bits[f * implicant_words + w]);
-                //         }
-                //         fprintf(debug_out, "\n    value bits: ");
-                //         for (int w = 0; w < implicant_words; w++) {
-                //             fprintf(debug_out, "%llu ", PInfo[o].task_value_bits[f * implicant_words + w]);
-                //         }
-                //         fprintf(debug_out, "\n");
-                //     }
-                // }
-
-                // for (int u = 0; u < counter; u++) {
-                //     fprintf(debug_out, "Unique PI %d: decpos = %d, shared_count = %d, outputs: ",
-                //             u + 1,
-                //             uniquePIs[u],
-                //             shared_count[u]);
-                //     for (int s = 0; s < shared_count[u]; s++) {
-                //         fprintf(debug_out, "%d ", output_map[u * max_found + s] + 1);
-                //     }
-                //     fprintf(debug_out, "\n");
-                // }
-            }
-
-            for (int u = 0; u < counter; u++) {
-                for (int s = 0; s < shared_count[u]; s++) {
-                    int f = found_map[u * noutputs + s];
-                    int u_covsum = covsum_map[u * noutputs + s];
-
-                    // the output this PI belongs to
-                    int o = output_map[u * noutputs + s];
-
-                    int ON_minterms = PInfo[o].ON_minterms;
-                    int *covered = PInfo[o].covered;
-                    int *last_index = PInfo[o].last_index;
-                    int *k_last_index = PInfo[o].k_last_index;
-                    int pichart_words = PInfo[o].pichart_words;
-                    uint64_t *pichart_pos = PInfo[o].pichart_pos;
-                    int *pichart = PInfo[o].pichart;
-                    uint64_t *implicants_pos = PInfo[o].implicants_pos;
-                    uint64_t *implicants_val = PInfo[o].implicants_val;
-                    int *estimPI = &PInfo[o].estimPI;
-                    int *foundPI = &PInfo[o].foundPI;
-                    int *shared = PInfo[o].shared;
-                    int *covsum = PInfo[o].covsum;
-
-                    uint64_t *task_pichart_values = buffer[tid][o].pichart_values;
-
-                    bool redundant = false;
-
-                    // check if the PI is redundant by row dominance
-                    // but now against the previous PIs from the SAME complexity level k
-
-                    int start_index = (k == 1 || u_covsum <= 1) ? 0 : last_index[u_covsum - 1];
-
-                    for (int rd = start_index; rd < ((u_covsum <= 1) ? 0 : k_last_index[u_covsum - 1]); rd++) {
-                        bool dominated = true;
-                        for (int w = 0; w < pichart_words; w++) {
-                            if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
-                                dominated = false;
+                        for (int u = 0; u < counter; u++) {
+                            if (buffer[tid][o].decpos[f] == uniquePIs[u]) {
+                                output_map[u * noutputs + shared_count[u]] = o;
+                                found_map[u * noutputs + shared_count[u]] = f;
+                                covsum_map[u * noutputs + shared_count[u]] = buffer[tid][o].covsum[f];
+                                shared_count[u]++;
+                                unique = false;
                                 break;
                             }
                         }
 
-                        if (dominated) {
-                            redundant = true;
-                            break;
+                        if (unique) {
+                            uniquePIs[counter] = buffer[tid][o].decpos[f];
+                            output_map[counter * noutputs + 0] = o;
+                            found_map[counter * noutputs + 0] = f;
+                            covsum_map[counter * noutputs + 0] = buffer[tid][o].covsum[f];
+                            shared_count[counter]++;
+                            counter++;
                         }
                     }
 
-                    if (redundant) continue;
-
-                    // Sanitize covsum bounds to avoid OOB on k_last_index
-                    if (u_covsum < 1) u_covsum = 1;
-                    if (u_covsum > ON_minterms) u_covsum = ON_minterms;
-
-                    #ifdef _OPENMP
-                        #pragma omp critical
-                    #endif
-                    {
-
-                        // Ensure capacity before writing the next PI
-                        if ((*foundPI + 1) > *estimPI) {
-                            resize((void**)&pichart,        TYPE_INT,    increase, *estimPI, ON_minterms);
-                            resize((void**)&pichart_pos,    TYPE_UINT64, increase, *estimPI, pichart_words);
-                            resize((void**)&implicants_pos, TYPE_UINT64, increase, *estimPI, implicant_words);
-                            resize((void**)&implicants_val, TYPE_UINT64, increase, *estimPI, implicant_words);
-                            resize((void**)&shared,         TYPE_INT,    increase, *estimPI, 1);
-                            resize((void**)&covsum,         TYPE_INT,    increase, *estimPI, 1);
-                            resize((void**)&covered,        TYPE_INT,    increase, *estimPI, 1);
-
-                            // Update the PInfo structure pointers after resize
-                            PInfo[o].pichart = pichart;
-                            PInfo[o].pichart_pos = pichart_pos;
-                            PInfo[o].implicants_pos = implicants_pos;
-                            PInfo[o].implicants_val = implicants_val;
-                            PInfo[o].shared = shared;
-                            PInfo[o].covsum = covsum;
-                            PInfo[o].covered = covered;
-
-                            *estimPI += increase;
-
-                            DBG_TRACE_BLOCK {
-                                multiplier++;
-                                printf("%dx", multiplier);
-                            }
-                        }
-
-                        // push the PI information to the global arrays
-
-                        for (int w = 0; w < implicant_words; w++) {
-                            implicants_pos[(*foundPI) * implicant_words + w] = fixed_bits[w];
-                            implicants_val[(*foundPI) * implicant_words + w] = buffer[tid][o].value_bits[f * implicant_words + w];
-                        }
-
-                        // populate the coverage matrix
-                        for (int r = 0; r < ON_minterms; r++) {
-                            for (int w = 0; w < pichart_words; w++) {
-                                pichart_pos[(*foundPI) * pichart_words + w] = buffer[tid][o].pichart_values[f * pichart_words + w];
-                            }
-
-                            pichart[(*foundPI) * ON_minterms + r] = buffer[tid][o].coverage[f * ON_minterms + r];
-                        }
-
-                        shared[*foundPI] = shared_count[u] - 1;
-                        if (max_shared < shared[*foundPI]) {
-                            max_shared = shared[*foundPI];
-                        }
-                        covsum[*foundPI] = u_covsum;
-
-                        int insert_at = k_last_index[u_covsum - 1];
-                        if (insert_at < 0) insert_at = 0;
-                        if (insert_at > *foundPI) insert_at = *foundPI;
-
-                        for (int i = *foundPI; i > insert_at; i--) {
-                            covered[i] = covered[i - 1];
-                        }
-
-                        covered[insert_at] = *foundPI;
-
-                        // Shift boundaries for all buckets at or above this covsum
-                        for (int l = u_covsum - 1; l < ON_minterms; l++) {
-                            k_last_index[l] += 1;
-                        }
-
-                        (*foundPI)++;
+                    DBG_TRACE_BLOCK {
+                        fprintf(debug_out, "\n");
                     }
                 }
-            }
+
+                DBG_TRACE_BLOCK {
+                    // for (int o = 0; o < noutputs; o++) {
+                    //     fprintf(debug_out, "Output %d, found PIs: %d\n", o + 1, PInfo[o].task_found);
+                    //     for (int f = 0; f < PInfo[o].task_found; f++) {
+                    //         fprintf(debug_out, "  PI %d: decpos = %d, covsum = %d\n",
+                    //                 f + 1,
+                    //                 PInfo[o].task_decpos[f],
+                    //                 PInfo[o].task_covsum[f]);
+                    //         fprintf(debug_out, "    fixed bits: ");
+                    //         for (int w = 0; w < implicant_words; w++) {
+                    //             fprintf(debug_out, "%llu ", PInfo[o].task_fixed_bits[f * implicant_words + w]);
+                    //         }
+                    //         fprintf(debug_out, "\n    value bits: ");
+                    //         for (int w = 0; w < implicant_words; w++) {
+                    //             fprintf(debug_out, "%llu ", PInfo[o].task_value_bits[f * implicant_words + w]);
+                    //         }
+                    //         fprintf(debug_out, "\n");
+                    //     }
+                    // }
+
+                    // for (int u = 0; u < counter; u++) {
+                    //     fprintf(debug_out, "Unique PI %d: decpos = %d, shared_count = %d, outputs: ",
+                    //             u + 1,
+                    //             uniquePIs[u],
+                    //             shared_count[u]);
+                    //     for (int s = 0; s < shared_count[u]; s++) {
+                    //         fprintf(debug_out, "%d ", output_map[u * max_found + s] + 1);
+                    //     }
+                    //     fprintf(debug_out, "\n");
+                    // }
+                }
+
+                for (int u = 0; u < counter; u++) {
+                    for (int s = 0; s < shared_count[u]; s++) {
+                        int f = found_map[u * noutputs + s];
+                        int u_covsum = covsum_map[u * noutputs + s];
+
+                        // the output this PI belongs to
+                        int o = output_map[u * noutputs + s];
+
+                        int ON_minterms = PInfo[o].ON_minterms;
+                        int *covered = PInfo[o].covered;
+                        int *last_index = PInfo[o].last_index;
+                        int *k_last_index = PInfo[o].k_last_index;
+                        int pichart_words = PInfo[o].pichart_words;
+                        uint64_t *pichart_pos = PInfo[o].pichart_pos;
+                        int *pichart = PInfo[o].pichart;
+                        uint64_t *implicants_pos = PInfo[o].implicants_pos;
+                        uint64_t *implicants_val = PInfo[o].implicants_val;
+                        int *estimPI = &PInfo[o].estimPI;
+                        int *foundPI = &PInfo[o].foundPI;
+                        int *shared = PInfo[o].shared;
+                        int *covsum = PInfo[o].covsum;
+
+                        uint64_t *task_pichart_values = buffer[tid][o].pichart_values;
+
+                        bool redundant = false;
+
+                        // check if the PI is redundant by row dominance
+                        // but now against the previous PIs from the SAME complexity level k
+
+                        int start_index = (k == 1 || u_covsum <= 1) ? 0 : last_index[u_covsum - 1];
+
+                        for (int rd = start_index; rd < ((u_covsum <= 1) ? 0 : k_last_index[u_covsum - 1]); rd++) {
+                            bool dominated = true;
+                            for (int w = 0; w < pichart_words; w++) {
+                                if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
+                                    dominated = false;
+                                    break;
+                                }
+                            }
+
+                            if (dominated) {
+                                redundant = true;
+                                break;
+                            }
+                        }
+
+                        if (redundant) continue;
+
+                        // Sanitize covsum bounds to avoid OOB on k_last_index
+                        if (u_covsum < 1) u_covsum = 1;
+                        if (u_covsum > ON_minterms) u_covsum = ON_minterms;
+
+                        #ifdef _OPENMP
+                            #pragma omp critical
+                        #endif
+                        {
+
+                            // Ensure capacity before writing the next PI
+                            if ((*foundPI + 1) > *estimPI) {
+                                resize((void**)&pichart,        TYPE_INT,    increase, *estimPI, ON_minterms);
+                                resize((void**)&pichart_pos,    TYPE_UINT64, increase, *estimPI, pichart_words);
+                                resize((void**)&implicants_pos, TYPE_UINT64, increase, *estimPI, implicant_words);
+                                resize((void**)&implicants_val, TYPE_UINT64, increase, *estimPI, implicant_words);
+                                resize((void**)&shared,         TYPE_INT,    increase, *estimPI, 1);
+                                resize((void**)&covsum,         TYPE_INT,    increase, *estimPI, 1);
+                                resize((void**)&covered,        TYPE_INT,    increase, *estimPI, 1);
+
+                                // Update the PInfo structure pointers after resize
+                                PInfo[o].pichart = pichart;
+                                PInfo[o].pichart_pos = pichart_pos;
+                                PInfo[o].implicants_pos = implicants_pos;
+                                PInfo[o].implicants_val = implicants_val;
+                                PInfo[o].shared = shared;
+                                PInfo[o].covsum = covsum;
+                                PInfo[o].covered = covered;
+
+                                *estimPI += increase;
+
+                                DBG_TRACE_BLOCK {
+                                    multiplier++;
+                                    printf("%dx", multiplier);
+                                }
+                            }
+
+                            // push the PI information to the global arrays
+
+                            for (int w = 0; w < implicant_words; w++) {
+                                implicants_pos[(*foundPI) * implicant_words + w] = fixed_bits[w];
+                                implicants_val[(*foundPI) * implicant_words + w] = buffer[tid][o].value_bits[f * implicant_words + w];
+                            }
+
+                            // populate the coverage matrix
+                            for (int r = 0; r < ON_minterms; r++) {
+                                for (int w = 0; w < pichart_words; w++) {
+                                    pichart_pos[(*foundPI) * pichart_words + w] = buffer[tid][o].pichart_values[f * pichart_words + w];
+                                }
+
+                                pichart[(*foundPI) * ON_minterms + r] = buffer[tid][o].coverage[f * ON_minterms + r];
+                            }
+
+                            shared[*foundPI] = shared_count[u] - 1;
+                            if (max_shared < shared[*foundPI]) {
+                                max_shared = shared[*foundPI];
+                            }
+                            covsum[*foundPI] = u_covsum;
+
+                            int insert_at = k_last_index[u_covsum - 1];
+                            if (insert_at < 0) insert_at = 0;
+                            if (insert_at > *foundPI) insert_at = *foundPI;
+
+                            for (int i = *foundPI; i > insert_at; i--) {
+                                covered[i] = covered[i - 1];
+                            }
+
+                            covered[insert_at] = *foundPI;
+
+                            // Shift boundaries for all buckets at or above this covsum
+                            for (int l = u_covsum - 1; l < ON_minterms; l++) {
+                                k_last_index[l] += 1;
+                            }
+
+                            (*foundPI)++;
+                        }
+                    }
+                }
 
                 free(output_map);
                 free(covsum_map);
@@ -987,19 +999,45 @@ int main(int argc, char *argv[]) {
 
                 clock_gettime(CLOCK_MONOTONIC, &startg);
 
-                if (SCP_TYPE == 0) { // Lagrangian relaxation
+                if (SCP_TYPE == 0 && POOL_MAX == 1) { // Lagrangian relaxation
                     solve_scp_lagrangian(
                         pichart,
                         *foundPI,
                         ON_minterms,
-                        NULL,
                         weights,
                         indices,
                         solmin
                     );
                 }
 
-                if (SCP_TYPE == 11) { // Gurobi: blended multi-objective
+                if (SCP_TYPE == 0 && POOL_MAX > 1) { // Lagrangian relaxation with solution pool (incompletely implemented)
+                    int pool_count = 0;
+                    int **pool_solutions = (int**)calloc((size_t)POOL_MAX, sizeof(int*));
+                    if (!pool_solutions) {
+                        fprintf(stderr, "Error: Memory allocation failed for pool arrays\n");
+                        cleanup(PInfo, buffer);
+                        return 1;
+                    }
+
+                    solve_scp_lagrangian_pool(
+                        pichart,
+                        *foundPI,
+                        ON_minterms,
+                        weights,
+                        POOL_MAX,
+                        &pool_count,
+                        pool_solutions,
+                        solmin
+                    );
+
+                    // Each pooled solution has length solmin
+                    for (int pi = 0; pi < pool_count; ++pi) {
+                        free(pool_solutions[pi]);
+                    }
+                    free(pool_solutions);
+                }
+
+                if (SCP_TYPE == 1 && POOL_MAX == 1) { // Gurobi: blended multi-objective
                     gurobi_multiobjective(
                         pichart,
                         *foundPI,
@@ -1010,47 +1048,48 @@ int main(int argc, char *argv[]) {
                     );
                 }
 
-                if (SCP_TYPE == 12) { // Gurobi: solution pool (incompletely implemented)
+                if (SCP_TYPE == 1 && POOL_MAX > 1) { // Gurobi: solution pool (uniform API)
 
-                    // The goal is to find as many alternative solutions, containing as many shared PIs as possible
-                    // and the best solution would be the one with the greatest number of shared PIs.
-
-                    int solcount = 0;
-
-                    // TODO replace 100 with something related to the number of shared PIs (alternative solutions)
-                    int max_solutions = 100;
-                    int *solmat = (int *)malloc(max_solutions * ON_minterms * sizeof(int));
-                    if (!solmat) {
-                        fprintf(stderr, "Error: Memory allocation failed for solution matrix\n");
+                    int pool_count = 0;
+                    int **pool_solutions = (int**)calloc((size_t)POOL_MAX, sizeof(int*));
+                    if (!pool_solutions) {
+                        fprintf(stderr, "Error: Memory allocation failed for pool arrays\n");
                         cleanup(PInfo, buffer);
                         return 1;
                     }
 
-                    int *pichart_data = calloc(*foundPI * ON_minterms, sizeof(int));
-                    for (int i = 0; i < *foundPI * ON_minterms; i++) {
-                        pichart_data[i] = pichart[i];
+                    int *pichart_data = (int*)calloc((size_t)(*foundPI) * (size_t)ON_minterms, sizeof(int));
+                    if (!pichart_data) {
+                        fprintf(stderr, "Error: Memory allocation failed for pichart copy\n");
+                        cleanup(PInfo, buffer);
+                        return 1;
                     }
+                    for (int i = 0; i < *foundPI * ON_minterms; i++) pichart_data[i] = pichart[i];
 
                     gurobi_solution_pool(
                         pichart_data,
                         *foundPI,
                         ON_minterms,
-                        max_solutions,
+                        POOL_MAX,
                         weights,
-                        &solcount,
-                        solmat,
+                        &pool_count,
+                        pool_solutions,
                         solmin
                     );
 
-                    // TODO: code to find the best solution
-
-                    free(solmat);
+                    // Each pooled solution has length solmin; API now matches Lagrangian pool
+                    for (int pi = 0; pi < pool_count; ++pi) {
+                        free(pool_solutions[pi]);
+                    }
+                    free(pool_solutions);
                     free(pichart_data);
                 }
 
 
                 if (*solmin == 0) {
-                    fprintf(stderr, "Error: solving the minterm coverage failed.\n");
+                    DBG_ERROR_BLOCK {
+                        fprintf(debug_out, "Error: solving the minterm coverage failed.\n");
+                    }
                     cleanup(PInfo, buffer);
                     return 1;
                 }

@@ -24,9 +24,9 @@ void gurobi_solution_pool(
     int pichart[],
     const int foundPI,
     const int ON_minterms,
-    const int max_solutions, // maximum number of solutions to find
+    const int max_pool,      // maximum number of solutions to collect
     double weights[],        // the weights for each individual PI
-    int *solcount,           // no. of solutions found
-    int *solmat,             // solution matrix
-    int *solmin              // no. of PIs covering the ON_minterms
+    int *pool_count,         // number of solutions returned (<= max_pool)
+    int **pool_solutions,    // array of int* solutions
+    int *solmin              // minimal number of PIs covering the ON_minterms
 );

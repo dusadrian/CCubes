@@ -13,9 +13,16 @@
 
 #define EPS 1e-12
 
-/* Build adjacency: rowsCovered[c] = list of rows that column c covers
-                    colsCovering[r] = list of columns that cover row r
-Returns 0 on success, -2 if any row has no covering column (infeasible), -1 on OOM. */
+/*
+Build adjacency:
+rowsCovered[c] = list of rows that column c covers
+colsCovering[r] = list of columns that cover row r
+Returns:
+0 on success
+-2 if any row has no covering column (infeasible)
+-1 on out of memory.
+*/
+
 static int build_adjacency(
     const int *pichart,
     int rows, int cols,
@@ -170,7 +177,8 @@ static void prune_redundancy(
         for (int k = 0; k < rowsCoveredCount[c]; ++k) {
             int r = rowsCovered[c][k];
             if (coverCount[r] <= 1) {
-                removable = false; break;
+                removable = false;
+                break;
             }
         }
 
@@ -180,7 +188,9 @@ static void prune_redundancy(
                 coverCount[r]--;
             }
 
-            for (int j = i + 1; j < write; ++j) sol[j - 1] = sol[j];
+            for (int j = i + 1; j < write; ++j) {
+                sol[j - 1] = sol[j];
+            }
             write--;
         }
     }
@@ -189,20 +199,21 @@ static void prune_redundancy(
     free(coverCount);
 }
 
-/* Greedy construction guided by reduced costs:
-Primary: maximize newCover (min #columns objective)
-Tie 1: smaller reduced_cost (more negative is better)
+/*
+Greedy construction guided by Lagrangian scores
+Primary: maximize newCover (minimize number of columns)
+Tie 1: smaller lagr_score (more negative is better)
 Tie 2: higher weight
 Tie 3: smaller index
 */
-static void greedy_from_reduced_costs(
+static void greedy_from_lagr_scores(
     int rows,
     int cols,
     int **rowsCovered,
     int *rowsCoveredCount,
     int **colsCovering,
     int *colsCoveringCount,
-    const double *reduced_cost,
+    const double *lagr_score,
     const double *weights, /* weights can be NULL */
     int *sol,
     int *sol_len
@@ -224,7 +235,7 @@ static void greedy_from_reduced_costs(
     while (covered < rows) {
         int best = -1;
         int bestNew = -1;
-        double bestRC = DBL_MAX;
+        double bestLS = DBL_MAX;
         double bestW = -DBL_MAX;
 
         for (int c = 0; c < cols; ++c) {
@@ -237,15 +248,15 @@ static void greedy_from_reduced_costs(
             }
             if (newCover <= 0) continue;
 
-            double rc = reduced_cost ? reduced_cost[c] : 0.0;
+            double ls = lagr_score ? lagr_score[c] : 0.0;
             double w = weights ? weights[c] : 0.0;
 
             bool better = false;
             if (newCover > bestNew) better = true;
             else if (newCover == bestNew) {
-                if (rc < bestRC) {
+                if (ls < bestLS) {
                     better = true;
-                } else if (fabs(rc - bestRC) <= EPS) {
+                } else if (fabs(ls - bestLS) <= EPS) {
                     if (w > bestW) {
                         better = true;
                     } else if (fabs(w - bestW) <= EPS) {
@@ -256,7 +267,7 @@ static void greedy_from_reduced_costs(
             if (better) {
                 best = c;
                 bestNew = newCover;
-                bestRC = rc;
+                bestLS = ls;
                 bestW = w;
             }
         }
@@ -292,17 +303,18 @@ static void greedy_from_reduced_costs(
     free(colSelected);
 }
 
-/* Compute Lagrangian reduced costs with real column costs:
-rc[c] = cost[c] - sum_{r in rowsCovered[c]} t[r]
-ZLB = sum_i t[i] + sum_c min(0, rc[c]) */
+/*
+Compute Lagrangian scores:
+rc_c = 1.0 - sum_{r in rowsCovered_c} t[r]
+ZLB = sum_i t_i + sum_c min(0, rc_c)
+*/
 static double compute_reduced_and_lb(
     int rows,
     int cols,
     int **rowsCovered,
     int *rowsCoveredCount,
     const double *t,
-    const double *col_costs,
-    double *rc /* out */
+    double *ls /* out */
 ) {
     double ZLB = 0.0;
     double ZLB_rows = 0.0;
@@ -311,7 +323,9 @@ static double compute_reduced_and_lb(
     #ifdef _OPENMP
         #pragma omp parallel for reduction(+:ZLB_rows) schedule(static)
     #endif
-    for (int i = 0; i < rows; ++i) ZLB_rows += t[i];
+    for (int i = 0; i < rows; ++i) {
+        ZLB_rows += t[i];
+    }
 
     #ifdef _OPENMP
         #pragma omp parallel for reduction(+:ZLB_neg) schedule(static)
@@ -322,25 +336,43 @@ static double compute_reduced_and_lb(
             int r = rowsCovered[c][k];
             sum += t[r];
         }
-        double cc = col_costs ? col_costs[c] : 1.0;
-        rc[c] = cc - sum;
-        if (rc[c] < 0.0) ZLB_neg += rc[c];
+        double cc = 1.0;
+        ls[c] = cc - sum;
+        if (ls[c] < 0.0) ZLB_neg += ls[c];
     }
     ZLB = ZLB_rows + ZLB_neg;
     return ZLB;
 }
 
-/* Subgradient update (unchanged logic, but UB is real cost):
-x[c] = 1 if rc[c] < 0 else 0 (LP solution)
-slack[i] = 1 - sum_{c covering i} x[c]
+/*
+A "slack" measures how far a constraint is from being tight.
+Positive slack means the constraint is not yet satisfied, zero slack means tight, negative means surplus.
+In this code, a slack is the per-row violation of the covering constraint under the current Lagrangian/primal guess
+- Constraint per row i: sum over columns covering i of x_c >= 1
+- Slack definition: slack_i = 1 − Σ_{c covers i} x_c
+- slack_i > 0: row i is under-covered (violation)
+- slack_i = 0: row i is exactly satisfied
+- slack_i < 0: row i is over-covered
+
+How it’s used:
+- Build a tentative primal x by taking columns with negative lagr_score (x_c = 1 if rc_c < 0, else 0).
+- The vector slack is exactly the subgradient of the dual Lagrangian at the current multipliers t.
+- Step size uses (UB − ZLB) / Σ slack_i^2, and multipliers update as t_i := max(0, t_i + step · slack_i).
+- If all slack_i are zero, there’s no subgradient direction to update (no progress possible).
+
+Subgradient update:
+x_c = 1 if rc_c < 0 else 0 (LP solution)
+slack_i = 1 - sum_{c covering i} x_c
 step = step_coef * (UB - ZLB) / sum(slack^2), t := max(0, t + step*slack)
-Returns 1 if step applied, 0 if slacks zero or no progress possible. */
+Returns 1 if step applied, 0 if slacks zero or no progress possible.
+*/
+
 static int subgradient_update(
     int rows,
     int cols,
     int **colsCovering,
     int *colsCoveringCount,
-    const double *rc,
+    const double *ls,
     double UB, double ZLB,
     double *t,
     double *step_coef,
@@ -354,7 +386,9 @@ static int subgradient_update(
     #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
     #endif
-    for (int c = 0; c < cols; ++c) x[c] = (rc[c] < 0.0) ? 1 : 0;
+    for (int c = 0; c < cols; ++c) {
+        x[c] = (ls[c] < 0.0) ? 1 : 0;
+    }
 
     double *slack = (double*)malloc((size_t)rows * sizeof(double));
     if (!slack) {
@@ -416,8 +450,14 @@ static int subgradient_update(
     return 1;
 }
 
-/* Row-targeted heuristic: for each uncovered row, pick a covering column with min reduced cost.
-Tie: fewer rc (more negative) preferred; if equal, prefer covering more rows; then lower cost; then lower index. */
+/*
+Row-targeted heuristic: for each uncovered row, pick a covering column with minimal Lagrangian score.
+Tie order:
+(1) more negative Lagrangian score
+(2) higher weight
+(3) covers more rows
+(4) lower index.
+*/
 static void heuristic_row_min_rc(
     int rows,
     int cols,
@@ -425,9 +465,8 @@ static void heuristic_row_min_rc(
     int *rowsCoveredCount,
     int **colsCovering,
     int *colsCoveringCount,
-    const double *reduced_cost,
+    const double *lagr_score,
     const double *weights, /* tie-break: higher is better */
-    const double *col_costs,
     int *sol, int *sol_len
 ) {
     (void)colsCoveringCount;
@@ -448,37 +487,36 @@ static void heuristic_row_min_rc(
 
         /* choose candidate among columns covering row i */
         int best = -1;
-        double bestRC = DBL_MAX;
+        double bestLS = DBL_MAX;
         int bestOnes = -1;
-        double bestCost = DBL_MAX;
         double bestWeight = -DBL_MAX;
 
         for (int k = 0; k < colsCoveringCount[i]; ++k) {
             int c = colsCovering[i][k];
-            double rc = reduced_cost ? reduced_cost[c] : 0.0;
-            double cc = col_costs ? col_costs[c] : 1.0;
+            double ls = lagr_score ? lagr_score[c] : 0.0;
             double w  = weights ? weights[c] : 0.0;
             int ones = rowsCoveredCount[c];
 
             bool better = false;
-            if (rc < bestRC) better = true;
-            else if (fabs(rc - bestRC) <= EPS) {
-                if (w > bestWeight) better = true;
-                else if (fabs(w - bestWeight) <= EPS) {
-                    if (ones > bestOnes) better = true;
-                    else if (ones == bestOnes) {
-                        if (cc < bestCost) better = true;
-                        else if (fabs(cc - bestCost) <= EPS) {
-                            if (best == -1 || c < best) better = true;
+            if (ls < bestLS) {
+                better = true;
+            } else if (fabs(ls - bestLS) <= EPS) {
+                if (w > bestWeight) {
+                    better = true;
+                } else if (fabs(w - bestWeight) <= EPS) {
+                    if (ones > bestOnes) {
+                        better = true;
+                    } else if (ones == bestOnes) {
+                        if (best == -1 || c < best) {
+                            better = true;
                         }
                     }
                 }
             }
             if (better) {
                 best = c;
-                bestRC = rc;
+                bestLS = ls;
                 bestOnes = ones;
-                bestCost = cc;
                 bestWeight = w;
             }
         }
@@ -493,9 +531,12 @@ static void heuristic_row_min_rc(
         if (!x[best]) {
             x[best] = 1;
             sol[out++] = best;
-            for (int kk = 0; kk < rowsCoveredCount[best]; ++kk) {
-                int r = rowsCovered[best][kk];
-                if (!rowCovered[r]) { rowCovered[r] = true; covered++; }
+            for (int c = 0; c < rowsCoveredCount[best]; ++c) {
+                int r = rowsCovered[best][c];
+                if (!rowCovered[r]) {
+                    rowCovered[r] = true;
+                    covered++;
+                }
             }
         }
 
@@ -504,46 +545,51 @@ static void heuristic_row_min_rc(
 
     *sol_len = out;
 
-    /* Removal: try to drop columns in order of worst reduced cost first */
+    /* Removal: try to drop columns in order of worst Lagrangian score first */
     if (out > 0) {
         /* Build cover counts */
         int *coverCount = (int*)calloc((size_t)rows, sizeof(int));
         int *order = (int*)malloc((size_t)out * sizeof(int));
-        double *rc_sel = (double*)malloc((size_t)out * sizeof(double));
-        if (coverCount && order && rc_sel) {
+        double *ls_sel = (double*)malloc((size_t)out * sizeof(double));
+
+        if (coverCount && order && ls_sel) {
             for (int i = 0; i < out; ++i) {
-                int c = sol[i];
+                int s = sol[i];
                 order[i] = i; /* index into sol */
-                rc_sel[i] = reduced_cost ? reduced_cost[c] : 0.0;
-                for (int k = 0; k < rowsCoveredCount[c]; ++k) {
-                    int r = rowsCovered[c][k];
+                ls_sel[i] = lagr_score ? lagr_score[s] : 0.0;
+                for (int c = 0; c < rowsCoveredCount[s]; ++c) {
+                    int r = rowsCovered[s][c];
                     coverCount[r]++;
                 }
             }
-            /* sort order by rc descending (worst first) */
+            /* sort order by score descending (worst first) */
             for (int i = 0; i < out; ++i) {
                 for (int j = i + 1; j < out; ++j) {
-                    if (rc_sel[order[j]] > rc_sel[order[i]]) {
-                        int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+                    if (ls_sel[order[j]] > ls_sel[order[i]]) {
+                        int tmp = order[i];
+                        order[i] = order[j];
+                        order[j] = tmp;
                     }
                 }
             }
             /* attempt removals */
-            for (int oi = 0; oi < out; ++oi) {
-                int idx = order[oi];
+            for (int o = 0; o < out; ++o) {
+                int idx = order[o];
                 if (idx < 0) continue;
-                int c = sol[idx];
+                int s = sol[idx];
                 bool can_remove = true;
-                for (int k = 0; k < rowsCoveredCount[c]; ++k) {
-                    int r = rowsCovered[c][k];
+
+                for (int c = 0; c < rowsCoveredCount[s]; ++c) {
+                    int r = rowsCovered[s][c];
                     if (coverCount[r] <= 1) {
                         can_remove = false;
                         break;
                     }
                 }
+
                 if (can_remove) {
-                    for (int k = 0; k < rowsCoveredCount[c]; ++k) {
-                        int r = rowsCovered[c][k];
+                    for (int c = 0; c < rowsCoveredCount[s]; ++c) {
+                        int r = rowsCovered[s][c];
                         coverCount[r]--;
                     }
 
@@ -554,16 +600,17 @@ static void heuristic_row_min_rc(
                     out--;
 
                     /* adjust later order indices */
-                    for (int jj = oi + 1; jj < *sol_len; ++jj) {
-                        if (order[jj] > idx) order[jj]--;
+                    for (int j = o + 1; j < *sol_len; ++j) {
+                        if (order[j] > idx) order[j]--;
                     }
                 }
             }
             *sol_len = out;
         }
+
         free(coverCount);
         free(order);
-        free(rc_sel);
+        free(ls_sel);
     }
 
     prune_redundancy(rows, rowsCovered, rowsCoveredCount, sol, sol_len);
@@ -579,34 +626,61 @@ static double solution_total_weight(const int *sol, int sol_len, const double *w
     return s;
 }
 
-static double solution_total_cost(const int *sol, int sol_len, const double *col_costs) {
-    double s = 0.0;
 
-    if (sol && sol_len > 0) {
-        for (int i = 0; i < sol_len; ++i) {
-            int c = sol[i];
-            s += col_costs ? col_costs[c] : 1.0;
-        }
-    }
-
-    return s;
+/* ---------- Solution pool helpers ---------- */
+static int pool_cmp_int_asc(const void *a, const void *b) {
+    int ia = *(const int*)a, ib = *(const int*)b;
+    return (ia > ib) - (ia < ib);
 }
 
-/* Public API (cost-aware): Lagrangian-based SCP heuristic using real column costs.
-- pichart: column-major (pichart[c * ON_minterms + r])
-- col_costs: per-column costs (NULL => unit costs)
-- foundPI: columns
-- ON_minterms: rows
-- weights: can be NULL; higher is better (tie-break inside heuristics)
-- solution: out column indices (0-based), size >= foundPI
-- solmin: out size (number of columns); -1 if infeasible
-*/
+static void pool_normalize(const int *sol, int len, int *out_sorted) {
+    memcpy(out_sorted, sol, (size_t)len * sizeof(int));
+    qsort(out_sorted, (size_t)len, sizeof(int), pool_cmp_int_asc);
+}
 
+static int pool_equal_sets(const int *a, int la, const int *b, int lb) {
+    if (la != lb) return 0;
+    for (int i = 0; i < la; ++i) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+static void pool_clear(int **pool_solutions, int *pool_count) {
+    if (!pool_solutions || !pool_count) return;
+    for (int i = 0; i < *pool_count; ++i) {
+        free(pool_solutions[i]);
+        pool_solutions[i] = NULL;
+    }
+    *pool_count = 0;
+}
+
+static int pool_add_if_new(
+    int **pool_solutions,
+    int *pool_count,
+    int max_pool,
+    const int *sol_sorted,
+    int len
+) {
+    if (!pool_solutions || !pool_count || max_pool <= 0) return 0;
+    for (int i = 0; i < *pool_count; ++i) {
+        if (pool_equal_sets(sol_sorted, len, pool_solutions[i], len)) return 0; /* duplicate */
+    }
+
+    if (*pool_count >= max_pool) return 0; /* full */
+
+    int *dst = (int*)malloc((size_t)len * sizeof(int));
+    if (!dst) return 0;
+    memcpy(dst, sol_sorted, (size_t)len * sizeof(int));
+    pool_solutions[(*pool_count)++] = dst;
+    return 1;
+}
+
+/* ---------- Main functions ---------- */
 void solve_scp_lagrangian(
     int pichart[],
     const int foundPI,
     const int ON_minterms,
-    const double col_costs[],
     const double weights[],
     int *solution,
     int *solmin
@@ -640,15 +714,15 @@ void solve_scp_lagrangian(
     int rows = ON_minterms, cols = foundPI;
 
     double *t = (double*)calloc((size_t)rows, sizeof(double));
-    double *rc = (double*)malloc((size_t)cols * sizeof(double));
+    double *ls = (double*)malloc((size_t)cols * sizeof(double));
     int *sol_tmp = (int*)malloc((size_t)cols * sizeof(int));
     int *sol_tmp2 = (int*)malloc((size_t)cols * sizeof(int));
     int best_sol_size = -1;
     int stuck_iter = 0;
 
-    if (!t || !rc || !sol_tmp || !sol_tmp2) {
+    if (!t || !ls || !sol_tmp || !sol_tmp2) {
         free(t);
-        free(rc);
+        free(ls);
         free(sol_tmp);
         free(sol_tmp2);
 
@@ -672,26 +746,21 @@ void solve_scp_lagrangian(
     const double step_min = 0.005;       /* minimal step coefficient */
     const int halve_period = 8;          /* halve step if no progress for this many iterations */
 
-    /* Better initialization of multipliers: t[i] = min cost of a covering column */
+    /* Initialize multipliers to unit cost */
     for (int i = 0; i < rows; ++i) {
-        double m = DBL_MAX;
-        for (int k = 0; k < colsCoveringCount[i]; ++k) {
-            int c = colsCovering[i][k];
-            double cc = col_costs ? col_costs[c] : 1.0;
-            if (cc < m) m = cc;
-        }
-        t[i] = (m == DBL_MAX) ? 1.0 : m;
+        (void)colsCoveringCount;
+        (void)colsCovering;
+        t[i] = 1.0;
     }
 
-    /* Initial heuristics with current rc (computed from t) */
+    /* Initial heuristics with current ls (computed from t) */
     compute_reduced_and_lb(
         rows,
         cols,
         rowsCovered,
         rowsCoveredCount,
         t,
-        col_costs,
-        rc
+        ls
     );
 
     int sol_size = -1, sol_size2 = -1;
@@ -703,21 +772,20 @@ void solve_scp_lagrangian(
         rowsCoveredCount,
         colsCovering,
         colsCoveringCount,
-        rc,
+        ls,
         weights,
-        col_costs,
         sol_tmp,
         &sol_size
     );
 
-    greedy_from_reduced_costs(
+    greedy_from_lagr_scores(
         rows,
         cols,
         rowsCovered,
         rowsCoveredCount,
         colsCovering,
         colsCoveringCount,
-        rc,
+        ls,
         weights,
         sol_tmp2,
         &sol_size2
@@ -725,7 +793,7 @@ void solve_scp_lagrangian(
 
     if (sol_size == -1 && sol_size2 == -1) {
         free(t);
-        free(rc);
+        free(ls);
         free(sol_tmp);
         free(sol_tmp2);
         free_adjacency(
@@ -740,33 +808,37 @@ void solve_scp_lagrangian(
         return;
     }
 
-    double cost1 = (sol_size != -1) ? solution_total_cost(sol_tmp, sol_size, col_costs) : DBL_MAX;
-    double cost2 = (sol_size2 != -1) ? solution_total_cost(sol_tmp2, sol_size2, col_costs) : DBL_MAX;
     double w1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
     double w2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
 
-    double bestUBCost;
+    double bestUB; /* UB equals current solution length (unit-cost) */
     int bestTerms;
     double bestWeight;
+
     if (
-        cost1 < cost2 - EPS ||
+        sol_size != -1 &&
         (
-            fabs(cost1 - cost2) <= EPS &&
+            sol_size2 == -1 ||
+            sol_size < sol_size2 ||
             (
-                sol_size < sol_size2 || (sol_size == sol_size2 && w1 >= w2)
+                sol_size == sol_size2 && w1 >= w2
             )
         )
     ) {
-        bestUBCost = cost1;
+
+        bestUB = (double)sol_size;
         bestTerms = sol_size;
         bestWeight = w1;
         best_sol_size = sol_size;
+
         memcpy(solution, sol_tmp, (size_t)sol_size * sizeof(int));
     } else {
-        bestUBCost = cost2;
+
+        bestUB = (double)sol_size2;
         bestTerms = sol_size2;
         bestWeight = w2;
         best_sol_size = sol_size2;
+
         memcpy(solution, sol_tmp2, (size_t)sol_size2 * sizeof(int));
     }
 
@@ -779,8 +851,7 @@ void solve_scp_lagrangian(
             rowsCovered,
             rowsCoveredCount,
             t,
-            col_costs,
-            rc
+            ls
         );
 
         double LBint = ceil(ZLB - 1e-12);
@@ -798,14 +869,393 @@ void solve_scp_lagrangian(
                 rowsCoveredCount,
                 colsCovering,
                 colsCoveringCount,
-                rc,
+                ls,
                 weights,
-                col_costs,
                 sol_tmp,
                 &sol_size
             );
 
-            greedy_from_reduced_costs(
+            greedy_from_lagr_scores(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                ls,
+                weights,
+                sol_tmp2,
+                &sol_size2
+            );
+
+            double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
+            double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
+
+            /* Improve by primary objective: fewer terms; tie-break by higher weight */
+            if (
+                sol_size != -1 &&
+                (
+                    sol_size < bestTerms ||
+                    (
+                        sol_size == bestTerms && candW1 > bestWeight + EPS
+                    )
+                )
+            ) {
+                bestUB = (double)sol_size;
+                bestTerms = sol_size;
+                bestWeight = candW1;
+                best_sol_size = sol_size;
+
+                memcpy(solution, sol_tmp, (size_t)sol_size * sizeof(int));
+            }
+
+            if (
+                sol_size2 != -1 &&
+                (
+                    sol_size2 < bestTerms ||
+                    (
+                        sol_size2 == bestTerms && candW2 > bestWeight + EPS
+                    )
+                )
+            ) {
+                bestUB = (double)sol_size2;
+                bestTerms = sol_size2;
+                bestWeight = candW2;
+                best_sol_size = sol_size2;
+
+                memcpy(solution, sol_tmp2, (size_t)sol_size2 * sizeof(int));
+            }
+        }
+
+        if (bestUB <= LBint + EPS) break; /* proved optimal (within epsilon) */
+
+        int updated = subgradient_update(
+            rows,
+            cols,
+            colsCovering,
+            colsCoveringCount,
+            ls,
+            bestUB,
+            ZLB,
+            t,
+            &step_coef,
+            step_min,
+            &stuck_iter,
+            halve_period
+        );
+
+        if (!updated || step_coef <= step_min + EPS) {
+            /* final refresh */
+            heuristic_row_min_rc(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                ls,
+                weights,
+                sol_tmp,
+                &sol_size
+            );
+
+            greedy_from_lagr_scores(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                ls,
+                weights,
+                sol_tmp2,
+                &sol_size2
+            );
+
+            double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
+            double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
+
+            if (
+                sol_size != -1 &&
+                (
+                    sol_size < bestTerms ||
+                    (
+                        sol_size == bestTerms && candW1 > bestWeight + EPS
+                    )
+                )
+            ) {
+                bestUB = (double)sol_size;
+                bestTerms = sol_size;
+                bestWeight = candW1;
+                best_sol_size = sol_size;
+
+                memcpy(solution, sol_tmp, (size_t)sol_size * sizeof(int));
+            }
+
+            if (
+                sol_size2 != -1 &&
+                (
+                    sol_size2 < bestTerms ||
+                    (
+                        sol_size2 == bestTerms && candW2 > bestWeight + EPS
+                    )
+                )
+            ) {
+                bestUB = (double)sol_size2;
+                bestTerms = sol_size2;
+                bestWeight = candW2;
+                best_sol_size = sol_size2;
+
+                memcpy(solution, sol_tmp2, (size_t)sol_size2 * sizeof(int));
+            }
+            break;
+        }
+    }
+
+    *solmin = best_sol_size;
+
+    free(t);
+    free(ls);
+    free(sol_tmp);
+    free(sol_tmp2);
+    free_adjacency(
+        rowsCovered,
+        rowsCoveredCount,
+        cols,
+        colsCovering,
+        colsCoveringCount,
+        rows
+    );
+}
+
+void solve_scp_lagrangian_pool(
+    int pichart[],
+    const int foundPI,
+    const int ON_minterms,
+    const double weights[],
+    int max_pool,
+    int *out_pool_count,
+    int **pool_solutions,
+    int *solmin
+) {
+    if (solmin) *solmin = -1;
+    if (
+        !pichart ||
+        foundPI <= 0 ||
+        ON_minterms <= 0 ||
+        !out_pool_count ||
+        !pool_solutions ||
+        !solmin
+    ) return;
+
+    int **rowsCovered = NULL, *rowsCoveredCount = NULL;
+    int **colsCovering = NULL, *colsCoveringCount = NULL;
+
+    int rc_ad = build_adjacency(
+        pichart,
+        ON_minterms,
+        foundPI,
+        &rowsCovered,
+        &rowsCoveredCount,
+        &colsCovering,
+        &colsCoveringCount
+    );
+
+    if (rc_ad == -2 || rc_ad == -1) {
+        /* infeasible or OOM */
+        return;
+    }
+
+    int rows = ON_minterms, cols = foundPI;
+
+    double *t = (double*)calloc((size_t)rows, sizeof(double));
+    double *rc = (double*)malloc((size_t)cols * sizeof(double));
+    int *sol_tmp = (int*)malloc((size_t)cols * sizeof(int));
+    int *sol_tmp2 = (int*)malloc((size_t)cols * sizeof(int));
+    int *norm = (int*)malloc((size_t)cols * sizeof(int));
+
+    if (!t || !rc || !sol_tmp || !sol_tmp2 || !norm) {
+        free(t);
+        free(rc);
+        free(sol_tmp);
+        free(sol_tmp2);
+        free(norm);
+        free_adjacency(
+            rowsCovered,
+            rowsCoveredCount,
+            cols,
+            colsCovering,
+            colsCoveringCount,
+            rows
+        );
+        return;
+    }
+
+    int pool_count = 0;
+    int pool_min_len = INT_MAX; /* track minimal len seen, pool only stores solutions with this len */
+
+    if (!(max_pool > 1 && out_pool_count && pool_solutions)) {
+        max_pool = 1;
+    }
+
+    /* init multipliers (unit cost) */
+    for (int i = 0; i < rows; ++i) {
+        (void)colsCoveringCount;
+        (void)colsCovering;
+        t[i] = 1.0;
+    }
+
+    /* initial rc */
+    compute_reduced_and_lb(
+        rows,
+        cols,
+        rowsCovered,
+        rowsCoveredCount,
+        t,
+        rc
+    );
+
+    int sol_size = -1, sol_size2 = -1;
+
+    heuristic_row_min_rc(
+        rows,
+        cols,
+        rowsCovered,
+        rowsCoveredCount,
+        colsCovering,
+        colsCoveringCount,
+        rc,
+        weights,
+        sol_tmp,
+        &sol_size
+    );
+
+    greedy_from_lagr_scores(
+        rows,
+        cols,
+        rowsCovered,
+        rowsCoveredCount,
+        colsCovering,
+        colsCoveringCount,
+        rc,
+        weights,
+        sol_tmp2,
+        &sol_size2
+    );
+
+    if (sol_size == -1 && sol_size2 == -1) {
+        free(t);
+        free(rc);
+        free(sol_tmp);
+        free(sol_tmp2);
+        free(norm);
+        free_adjacency(
+            rowsCovered,
+            rowsCoveredCount,
+            cols,
+            colsCovering,
+            colsCoveringCount,
+            rows
+        );
+        return;
+    }
+
+    double w1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
+    double w2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
+
+    double bestUB;
+    int bestTerms;
+    double bestWeight;
+
+    if (
+        sol_size != -1 &&
+        (
+            sol_size2 == -1 ||
+            sol_size < sol_size2 ||
+            (
+                sol_size == sol_size2 && w1 >= w2
+            )
+        )
+    ) {
+        bestUB = (double)sol_size;
+        bestTerms = sol_size;
+        bestWeight = w1;
+        *solmin = sol_size;
+    } else {
+        bestUB = (double)sol_size2;
+        bestTerms = sol_size2;
+        bestWeight = w2;
+        *solmin = sol_size2;
+    }
+
+    /* seed pool: add only minimal-len solutions */
+    if (max_pool > 1) {
+        if (sol_size != -1) {
+            if (sol_size < pool_min_len) {
+                pool_clear(pool_solutions, &pool_count);
+                pool_min_len = sol_size;
+            }
+
+            if (sol_size == pool_min_len) {
+                pool_normalize(sol_tmp, sol_size, norm);
+                pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size);
+            }
+        }
+
+        if (sol_size2 != -1) {
+            if (sol_size2 < pool_min_len) {
+                pool_clear(pool_solutions, &pool_count);
+                pool_min_len = sol_size2;
+            }
+
+            if (sol_size2 == pool_min_len) {
+                pool_normalize(sol_tmp2, sol_size2, norm);
+                pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size2);
+            }
+        }
+    }
+
+    double bestLB = -DBL_MAX;
+
+    /* parameters */
+    const int max_iter = 5000;
+    const int heur_every = 3;
+    double step_coef = 1.5;
+    const double step_min = 0.005;
+    const int halve_period = 8;
+    int stuck_iter = 0;
+
+    for (int it = 0; it < max_iter; ++it) {
+        double ZLB = compute_reduced_and_lb(
+            rows,
+            cols,
+            rowsCovered,
+            rowsCoveredCount,
+            t,
+            rc
+        );
+
+        double LBint = ceil(ZLB - EPS);
+        if (LBint > bestLB + EPS) {
+            bestLB = LBint;
+            stuck_iter = 0;
+        }
+
+        if (it % heur_every == 0) {
+            heuristic_row_min_rc(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                rc,
+                weights,
+                sol_tmp,
+                &sol_size
+            );
+
+            greedy_from_lagr_scores(
                 rows,
                 cols,
                 rowsCovered,
@@ -818,42 +1268,109 @@ void solve_scp_lagrangian(
                 &sol_size2
             );
 
-            double candCost1 = (sol_size != -1) ? solution_total_cost(sol_tmp, sol_size, col_costs) : DBL_MAX;
-            double candCost2 = (sol_size2 != -1) ? solution_total_cost(sol_tmp2, sol_size2, col_costs) : DBL_MAX;
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
             double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
 
-            /* Improve by primary objective cost; if equal, fewer terms; if still equal, higher weight */
+            /* candidate 1 */
             if (
-                candCost1 < bestUBCost - EPS ||
+                sol_size != -1 &&
                 (
-                    fabs(candCost1 - bestUBCost) <= EPS &&
-                    (sol_size < bestTerms || (sol_size == bestTerms && candW1 > bestWeight + EPS))
+                    sol_size < bestTerms ||
+                    (
+                        sol_size == bestTerms && candW1 > bestWeight + EPS
+                    )
                 )
             ) {
-                bestUBCost = candCost1;
+                bestUB = (double)sol_size;
                 bestTerms = sol_size;
                 bestWeight = candW1;
-                best_sol_size = sol_size;
-                memcpy(solution, sol_tmp, (size_t)sol_size * sizeof(int));
+                *solmin = sol_size;
+
+                if (max_pool > 1) {
+                    if (sol_size < pool_min_len) {
+                        pool_clear(pool_solutions, &pool_count);
+                        pool_min_len = sol_size;
+                    }
+
+                    if (sol_size == pool_min_len) {
+                        pool_normalize(sol_tmp, sol_size, norm);
+                        pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size);
+                    }
+                }
+            } else if (max_pool > 1) {
+                if (sol_size != -1) {
+                    if (sol_size < pool_min_len) {
+                        pool_clear(pool_solutions, &pool_count);
+                        pool_min_len = sol_size;
+                    }
+
+                    if (sol_size == pool_min_len) {
+                        pool_normalize(sol_tmp, sol_size, norm);
+                        pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size);
+                    }
+                }
+
+                if (
+                    sol_size != -1 &&
+                    sol_size == bestTerms &&
+                    candW1 > bestWeight + EPS
+                ) {
+                    bestWeight = candW1;
+                    *solmin = sol_size;
+                }
             }
 
+            /* candidate 2 */
             if (
-                candCost2 < bestUBCost - EPS ||
+                sol_size2 != -1 &&
                 (
-                    fabs(candCost2 - bestUBCost) <= EPS &&
-                    (sol_size2 < bestTerms || (sol_size2 == bestTerms && candW2 > bestWeight + EPS))
+                    sol_size2 < bestTerms ||
+                    (
+                        sol_size2 == bestTerms && candW2 > bestWeight + EPS
+                    )
                 )
             ) {
-                bestUBCost = candCost2;
+                bestUB = (double)sol_size2;
                 bestTerms = sol_size2;
                 bestWeight = candW2;
-                best_sol_size = sol_size2;
-                memcpy(solution, sol_tmp2, (size_t)sol_size2 * sizeof(int));
+                *solmin = sol_size2;
+
+                if (max_pool > 1) {
+                    if (sol_size2 < pool_min_len) {
+                        pool_clear(pool_solutions, &pool_count);
+                        pool_min_len = sol_size2;
+                    }
+
+                    if (sol_size2 == pool_min_len) {
+                        pool_normalize(sol_tmp2, sol_size2, norm);
+                        pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size2);
+                    }
+                }
+            } else if (max_pool > 1) {
+                if (sol_size2 != -1) {
+                    if (sol_size2 < pool_min_len) {
+                        pool_clear(pool_solutions, &pool_count);
+                        pool_min_len = sol_size2;
+                    }
+
+                    if (sol_size2 == pool_min_len) {
+                        pool_normalize(sol_tmp2, sol_size2, norm);
+                        pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size2);
+                    }
+                }
+
+                if (
+                    sol_size2 != -1 &&
+                    sol_size2 == bestTerms &&
+                    candW2 > bestWeight + EPS
+                ) {
+                    bestWeight = candW2;
+                    *solmin = sol_size2;
+                }
             }
         }
 
-        if (bestUBCost <= LBint + EPS) break; /* proved optimal (within epsilon) */
+        if (bestUB <= LBint + EPS) break;
 
         int updated = subgradient_update(
             rows,
@@ -861,7 +1378,7 @@ void solve_scp_lagrangian(
             colsCovering,
             colsCoveringCount,
             rc,
-            bestUBCost,
+            bestUB,
             ZLB,
             t,
             &step_coef,
@@ -881,12 +1398,11 @@ void solve_scp_lagrangian(
                 colsCoveringCount,
                 rc,
                 weights,
-                col_costs,
                 sol_tmp,
                 &sol_size
             );
 
-            greedy_from_reduced_costs(
+            greedy_from_lagr_scores(
                 rows,
                 cols,
                 rowsCovered,
@@ -899,51 +1415,121 @@ void solve_scp_lagrangian(
                 &sol_size2
             );
 
-            double candCost1 = (sol_size != -1) ? solution_total_cost(sol_tmp, sol_size, col_costs) : DBL_MAX;
-            double candCost2 = (sol_size2 != -1) ? solution_total_cost(sol_tmp2, sol_size2, col_costs) : DBL_MAX;
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
             double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
+
             if (
-                candCost1 < bestUBCost - EPS ||
+                sol_size != -1 &&
                 (
-                    fabs(candCost1 - bestUBCost) <= EPS &&
+                    sol_size < bestTerms ||
                     (
-                        sol_size < bestTerms || (sol_size == bestTerms && candW1 > bestWeight + EPS)
+                        sol_size == bestTerms && candW1 > bestWeight + EPS
                     )
                 )
             ) {
-                bestUBCost = candCost1;
+                bestUB = (double)sol_size;
                 bestTerms = sol_size;
                 bestWeight = candW1;
-                best_sol_size = sol_size;
-                memcpy(solution, sol_tmp, (size_t)sol_size * sizeof(int));
+                *solmin = sol_size;
+
+                if (max_pool > 1) {
+                    if (sol_size < pool_min_len) {
+                        pool_clear(pool_solutions, &pool_count);
+                        pool_min_len = sol_size;
+                    }
+
+                    if (sol_size == pool_min_len) {
+                        pool_normalize(sol_tmp, sol_size, norm);
+                        pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size);
+                    }
+                }
+
+            } else if (max_pool > 1) {
+                if (sol_size != -1) {
+                    if (sol_size < pool_min_len) {
+                        pool_clear(pool_solutions, &pool_count);
+                        pool_min_len = sol_size;
+                    }
+
+                    if (sol_size == pool_min_len) {
+                        pool_normalize(sol_tmp, sol_size, norm);
+                        pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size);
+                    }
+                }
+
+                if (
+                    sol_size != -1 &&
+                    sol_size == bestTerms &&
+                    candW1 > bestWeight + EPS
+                ) {
+                    bestWeight = candW1;
+                    *solmin = sol_size;
+                }
             }
 
             if (
-                candCost2 < bestUBCost - EPS ||
+                sol_size2 != -1 &&
                 (
-                    fabs(candCost2 - bestUBCost) <= EPS &&
+                    sol_size2 < bestTerms ||
                     (
-                        sol_size2 < bestTerms || (sol_size2 == bestTerms && candW2 > bestWeight + EPS)
+                        sol_size2 == bestTerms && candW2 > bestWeight + EPS
                     )
                 )
             ) {
-                bestUBCost = candCost2;
+                bestUB = (double)sol_size2;
                 bestTerms = sol_size2;
                 bestWeight = candW2;
-                best_sol_size = sol_size2;
-                memcpy(solution, sol_tmp2, (size_t)sol_size2 * sizeof(int));
+                *solmin = sol_size2;
+
+                if (max_pool > 1) {
+                    if (sol_size2 < pool_min_len) {
+                        pool_clear(pool_solutions, &pool_count);
+                        pool_min_len = sol_size2;
+                    }
+
+                    if (sol_size2 == pool_min_len) {
+                        pool_normalize(sol_tmp2, sol_size2, norm);
+                        pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size2);
+                    }
+                }
+            } else if (max_pool > 1) {
+                if (sol_size2 != -1) {
+                    if (sol_size2 < pool_min_len) {
+                        pool_clear(pool_solutions, &pool_count);
+                        pool_min_len = sol_size2;
+                    }
+
+                    if (sol_size2 == pool_min_len) {
+                        pool_normalize(sol_tmp2, sol_size2, norm);
+                        pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size2);
+                    }
+                }
+
+                if (
+                    sol_size2 != -1 &&
+                    sol_size2 == bestTerms &&
+                    candW2 > bestWeight + EPS
+                ) {
+                    bestWeight = candW2;
+                    *solmin = sol_size2;
+                }
             }
             break;
         }
     }
 
-    *solmin = best_sol_size;
+    /* output */
+    if (max_pool > 1 && out_pool_count) {
+        /* Return the pool */
+        *out_pool_count = pool_count;
+    }
 
+    /* cleanup */
     free(t);
     free(rc);
     free(sol_tmp);
     free(sol_tmp2);
+    free(norm);
     free_adjacency(
         rowsCovered,
         rowsCoveredCount,
