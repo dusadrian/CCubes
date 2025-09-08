@@ -54,6 +54,8 @@ typedef struct {
     int      *k_covered;
 
     int *solution;
+    int pool_count;
+    int **pool_solutions;
 } PIstorage;
 
 typedef struct ThreadBuffer {

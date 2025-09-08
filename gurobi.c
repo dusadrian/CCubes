@@ -224,7 +224,7 @@ void gurobi_solution_pool(
     const int ON_minterms,
     const int max_pool,      // maximum number of solutions to collect
     double weights[],        // the weights for each individual PI
-    int *pool_count,           // number of solutions returned (<= max_pool)
+    int *pool_count,         // number of solutions returned (<= max_pool)
     int **pool_solutions,    // array of int* solutions
     int *solmin              // minimal number of PIs covering the ON_minterms
 ) {
@@ -266,11 +266,34 @@ void gurobi_solution_pool(
     //     printf("\n");
     // }
 
-    /* Initialize Gurobi environment; log to /dev/null to avoid gurobi.log in CWD */
-    error = GRBloadenv(&env, "/dev/null");
-    if (error) {
-        printf("ERROR: Failed to create Gurobi environment: %s\n", GRBgeterrormsg(env));
-        goto QUIT;
+    /* Initialize Gurobi environment; silence license banner and log to /dev/null */
+    {
+        FILE *nullout = fopen("/dev/null", "w");
+        int saved_stdout = -1, saved_stderr = -1;
+        if (nullout) {
+            saved_stdout = dup(fileno(stdout));
+            saved_stderr = dup(fileno(stderr));
+            dup2(fileno(nullout), fileno(stdout));
+            dup2(fileno(nullout), fileno(stderr));
+        }
+
+        error = GRBloadenv(&env, "/dev/null");
+
+        if (nullout) {
+            fflush(stdout);
+            fflush(stderr);
+            if (saved_stdout != -1) {
+                dup2(saved_stdout, fileno(stdout));
+                close(saved_stdout);
+            }
+            if (saved_stderr != -1) {
+                dup2(saved_stderr, fileno(stderr));
+                close(saved_stderr);
+            }
+            fclose(nullout);
+        }
+
+        if (error) goto QUIT;
     }
 
     /* silence solver logs */
@@ -399,7 +422,7 @@ void gurobi_solution_pool(
         if (numvars > foundPI) {
             double *tmp = (double*)realloc(gurobi_sol, (size_t)numvars * sizeof(double));
             if (!tmp) {
-                error = 1;
+                printf("ERROR: Failed to allocate memory for Gurobi solution vector\n");
                 goto QUIT;
             }
             gurobi_sol = tmp;
@@ -426,7 +449,10 @@ void gurobi_solution_pool(
         // printf("\n");
 
         int *entry = (int*)malloc((size_t)(*solmin) * sizeof(int));
-        if (!entry) { error = 1; goto QUIT; }
+        if (!entry) {
+            printf("ERROR: Failed to allocate memory for solution entry\n");
+            goto QUIT;
+        }
         memcpy(entry, idxbuf, (size_t)(*solmin) * sizeof(int));
         pool_solutions[stored++] = entry;
     }

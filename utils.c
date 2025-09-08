@@ -611,6 +611,10 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
         free(PInfo[o].nofpi);
 
         free(PInfo[o].solution);
+        for (int p = 0; p < PInfo[o].pool_count; p++) {
+            free(PInfo[o].pool_solutions[p]);
+        }
+        free(PInfo[o].pool_solutions);
     }
 
     free(PInfo);

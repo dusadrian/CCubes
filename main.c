@@ -103,26 +103,25 @@ int main(int argc, char *argv[]) {
             char *opt = argv[i] + 2;  // string after "-d"
             char *eq  = strchr(opt, '=');
 
-            int lvl   = DBG_ERROR;
+            int debug_level   = 0; // default to DBG_ERROR
             const char *file = NULL;
 
             if (eq) {
                 // split into number + filename
                 *eq = '\0';
-                lvl = atoi(opt);
+                debug_level = atoi(opt);
                 file = eq + 1;
             } else {
-                lvl = atoi(opt);
+                debug_level = atoi(opt);
             }
 
-            // validate level (default to ERROR if invalid)
-            if (lvl < DBG_ERROR || lvl > DBG_TRACE) {
-                fprintf(stderr, "Invalid debug level: %d (must be 1–3)\n", lvl);
+            if (debug_level < 0 || debug_level > 2) {
+                fprintf(stderr, "Invalid debug level: %d (must be 0–2)\n", debug_level);
                 help();
                 return 1;
             }
 
-            debug_init(file, lvl);
+            debug_init(file, debug_level);
 
         } else if (strncmp(argv[i], "-p", 2) == 0) {
             POOL_MAX = atoi(argv[i] + 2);
@@ -349,6 +348,18 @@ int main(int argc, char *argv[]) {
 
         PInfo[o].stop_search = ON_minterms == 0; // if there are no ON-set minterms, then stop searching for PIs
 
+        PInfo[o].solution = NULL;
+        PInfo[o].pool_count = 0;
+        PInfo[o].pool_solutions = NULL;
+        if (POOL_MAX > 1) {
+            PInfo[o].pool_solutions = (int **) calloc((size_t)POOL_MAX, sizeof(int*));
+            if (!PInfo[o].pool_solutions) {
+                fprintf(stderr, "Error: Memory allocation failed for pool_solutions\n");
+                cleanup(PInfo, buffer);
+                return 1;
+            }
+        }
+
     }
 
     // allocate memory buffer for each thread
@@ -473,11 +484,11 @@ int main(int argc, char *argv[]) {
             }
 
             DBG_TRACE_BLOCK {
-                fprintf(debug_out, "tempk: ");
-                for (int i = 0; i < k; i++) {
-                    fprintf(debug_out, "%d ", tempk[i] + 1);
-                }
-                fprintf(debug_out, "\n");
+                // fprintf(debug_out, "tempk: ");
+                // for (int i = 0; i < k; i++) {
+                //     fprintf(debug_out, "%d ", tempk[i] + 1);
+                // }
+                // fprintf(debug_out, "\n");
             }
 
             uint64_t fixed_bits[implicant_words];
@@ -719,13 +730,16 @@ int main(int argc, char *argv[]) {
 
                 for (int o = 0; o < noutputs; o++) {
                     DBG_TRACE_BLOCK {
-                        fprintf(debug_out, "Output %d, found PIs:", o + 1);
+                        // if (buffer[tid][o].found > 0) {
+                        //     fprintf(debug_out, "Output %d, found PIs:", o + 1);
+                        // }
                     }
 
                     for (int f = 0; f < buffer[tid][o].found; f++) {
                         DBG_TRACE_BLOCK {
-                            fprintf(debug_out, " %d", buffer[tid][o].decpos[f]);
+                            // fprintf(debug_out, " %d", buffer[tid][o].decpos[f]);
                         }
+
                         bool unique = true;
 
                         for (int u = 0; u < counter; u++) {
@@ -750,7 +764,9 @@ int main(int argc, char *argv[]) {
                     }
 
                     DBG_TRACE_BLOCK {
-                        fprintf(debug_out, "\n");
+                        // if (buffer[tid][o].found > 0) {
+                        //     fprintf(debug_out, "\n");
+                        // }
                     }
                 }
 
@@ -929,250 +945,455 @@ int main(int argc, char *argv[]) {
 
 
         // solve the PI charts per output
-        for (int o = 0; o < noutputs; o++) {
-            int *foundPI = &PInfo[o].foundPI;
-            bool *ON_set_covered = &PInfo[o].ON_set_covered;
-            int ON_minterms = PInfo[o].ON_minterms;
-            int *pichart = PInfo[o].pichart;
-            int *prevsolmin = &PInfo[o].prevsolmin;
-            int *solmin = &PInfo[o].solmin;
-            int *previndices = PInfo[o].previndices;
-            int *indices = PInfo[o].indices;
+        if (POOL_MAX == 1) {
+            for (int o = 0; o < noutputs; o++) {
+                int *foundPI = &PInfo[o].foundPI;
+                bool *ON_set_covered = &PInfo[o].ON_set_covered;
+                int ON_minterms = PInfo[o].ON_minterms;
+                int *pichart = PInfo[o].pichart;
+                int *prevsolmin = &PInfo[o].prevsolmin;
+                int *solmin = &PInfo[o].solmin;
+                int *previndices = PInfo[o].previndices;
+                int *indices = PInfo[o].indices;
 
-            PInfo[o].nofpi[k - 1] = *foundPI; // TODO move this after checking the coverage at this level of k
+                PInfo[o].nofpi[k - 1] = *foundPI; // TODO move this after checking the coverage at this level of k
 
-            if (*foundPI > 0 && !*ON_set_covered) {
-                DBG_TRACE_BLOCK {
-                    fprintf(
-                        debug_out,
-                        "Trying to cover output %d with %d PIs\n",
-                        o + 1, *foundPI
-                    );
-                }
-                bool test_coverage = true;
+                if (*foundPI > 0 && !*ON_set_covered) {
+                    bool test_coverage = true;
 
-                int r = 0;
-                while (r < ON_minterms && test_coverage) {
+                    int r = 0;
+                    while (r < ON_minterms && test_coverage) {
 
-                    bool minterm_covered = false;
-                    int c = 0;
+                        bool minterm_covered = false;
+                        int c = 0;
 
-                    while (c < *foundPI && !minterm_covered) {
-                        minterm_covered = pichart[c * ON_minterms + r];
-                        c++;
+                        while (c < *foundPI && !minterm_covered) {
+                            minterm_covered = pichart[c * ON_minterms + r];
+                            c++;
+                        }
+
+                        test_coverage = minterm_covered;
+                        r++;
                     }
 
-                    test_coverage = minterm_covered;
-                    r++;
+                    *ON_set_covered = test_coverage;
                 }
 
-                *ON_set_covered = test_coverage;
-            }
 
-            DBG_TRACE_BLOCK {
-                fprintf(debug_out, "Output %d, found PIs: %d", o + 1, *foundPI);
-            }
-
-            if (*ON_set_covered && !PInfo[o].stop_search) {
-
-                double *weights = NULL;
-
-                if (WEIGHT_PIC > 0) {
-                    weights = calloc(*foundPI, sizeof(double));
-                    layer_weights[k] = 1;
-                    for (int i = k - 1; i > 0; i--) {
-                        layer_weights[i] = layer_weights[i + 1] * 2;
+                if (*ON_set_covered && !PInfo[o].stop_search) {
+                    DBG_TRACE_BLOCK {
+                        fprintf(debug_out, "Output %d, found PIs: %d", o + 1, *foundPI);
                     }
 
-                    int counter = 0;
-                    for (int l = 1; l < k; l++) {
-                        int layer_pis = PInfo[o].nofpi[l] - PInfo[o].nofpi[l - 1];
-                        for (int i = 0; i < layer_pis; i++) {
-                            weights[counter] = layer_weights[l];
-                            if (WEIGHT_PIC == 2) {
-                                weights[counter] += 1 * (PInfo[o].shared[counter] - 1); // additional weight for shared PIs
+                    double *weights = NULL;
+
+                    if (WEIGHT_PIC > 0) {
+                        weights = calloc(*foundPI, sizeof(double));
+                        layer_weights[k] = 1;
+                        for (int i = k - 1; i > 0; i--) {
+                            layer_weights[i] = layer_weights[i + 1] * 2;
+                        }
+
+                        int counter = 0;
+                        for (int l = 1; l < k; l++) {
+                            int layer_pis = PInfo[o].nofpi[l] - PInfo[o].nofpi[l - 1];
+                            for (int i = 0; i < layer_pis; i++) {
+                                weights[counter] = layer_weights[l];
+                                if (WEIGHT_PIC == 2) {
+                                    weights[counter] += 1 * (PInfo[o].shared[counter] - 1); // additional weight for shared PIs
+                                }
+                                counter++;
                             }
-                            counter++;
                         }
                     }
-                }
 
-                clock_gettime(CLOCK_MONOTONIC, &startg);
+                    clock_gettime(CLOCK_MONOTONIC, &startg);
 
-                if (SCP_TYPE == 0 && POOL_MAX == 1) { // Lagrangian relaxation
-                    solve_scp_lagrangian(
-                        pichart,
-                        *foundPI,
-                        ON_minterms,
-                        weights,
-                        indices,
-                        solmin
-                    );
-                }
+                    if (SCP_TYPE == 0) { // Lagrangian relaxation
+                        solve_scp_lagrangian(
+                            pichart,
+                            *foundPI,
+                            ON_minterms,
+                            weights,
+                            indices,
+                            solmin
+                        );
+                    }
 
-                if (SCP_TYPE == 0 && POOL_MAX > 1) { // Lagrangian relaxation with solution pool (incompletely implemented)
-                    int pool_count = 0;
-                    int **pool_solutions = (int**)calloc((size_t)POOL_MAX, sizeof(int*));
-                    if (!pool_solutions) {
-                        fprintf(stderr, "Error: Memory allocation failed for pool arrays\n");
+                    if (SCP_TYPE == 1) { // Gurobi: blended multi-objective
+                        gurobi_multiobjective(
+                            pichart,
+                            *foundPI,
+                            ON_minterms,
+                            weights,
+                            indices,
+                            solmin
+                        );
+                    }
+
+                    if (*solmin == 0) {
+                        DBG_ERROR_BLOCK {
+                            fprintf(debug_out, "Error: solving the minterm coverage failed.\n");
+                        }
                         cleanup(PInfo, buffer);
                         return 1;
                     }
 
-                    solve_scp_lagrangian_pool(
-                        pichart,
-                        *foundPI,
-                        ON_minterms,
-                        weights,
-                        POOL_MAX,
-                        &pool_count,
-                        pool_solutions,
-                        solmin
-                    );
+                    clock_gettime(CLOCK_MONOTONIC, &endg);
 
-                    // Each pooled solution has length solmin
-                    for (int pi = 0; pi < pool_count; ++pi) {
-                        free(pool_solutions[pi]);
+                    execution_time =
+                        (endg.tv_sec - startg.tv_sec) +
+                        (endg.tv_nsec - startg.tv_nsec) / 1e9;
+
+                    k_scp_time += execution_time;
+
+                    DBG_TRACE_BLOCK {
+                        fprintf(debug_out, " (SCP %.3fs)", execution_time);
                     }
-                    free(pool_solutions);
+
+                    free(weights);
+
+                    DBG_TRACE_BLOCK {
+                        // // print the PI chart
+                        // fprintf(debug_out, "\nPI chart for output %d(%d):\n", o + 1, ON_minterms);
+                        // for (int r = 0; r < ON_minterms; r++) {
+                        //     for (int c = 0; c < *foundPI; c++) {
+                        //         fprintf(debug_out, "%d ", pichart[c * ON_minterms + r]);
+                        //     }
+                        //     fprintf(debug_out, "\n");
+                        // }
+                    }
+
+                    if (*solmin < *prevsolmin) {
+                        // either solmin is smaller than the previously found solmin,
+                        // or it is the very first time a solmin was found
+
+                        *prevsolmin = *solmin;
+                        for (int i = 0; i < *solmin; i++) {
+                            previndices[i] = indices[i];
+                        }
+
+                        stop_counter[o] = 0;
+
+                        DBG_TRACE_BLOCK {
+                            if (!PInfo[o].stop_search) {
+                                fprintf(debug_out, " solution (%d)", *solmin);
+                                for (int i = 0; i < *solmin; i++) {
+                                    fprintf(debug_out, " %d", indices[i] + 1);
+                                }
+                                fprintf(debug_out, "\n");
+                            }
+                        }
+                    } else {
+                        // the minimum number of PIs did not change in the current level of complexity
+                        // we can safely retain the less complex PIs from the previous level
+                        for (int i = 0; i < *solmin; i++) {
+                            indices[i] = previndices[i];
+                        }
+
+                        *solmin = *prevsolmin;
+                        stop_counter[o]++;
+
+                        DBG_TRACE_BLOCK {
+                            if (!PInfo[o].stop_search) {
+                                fprintf(debug_out, " solution (%d)", *solmin);
+                                for (int i = 0; i < *solmin; i++) {
+                                    fprintf(debug_out, " %d", indices[i] + 1);
+                                }
+                                fprintf(debug_out, "%s\n", stop_counter[o] >= MAX_LEVELS ? " -- stopping search" : "");
+                            }
+                        }
+
+                        PInfo[o].stop_search = stop_counter[o] >= MAX_LEVELS;
+                    }
+
+                    DBG_TRACE_BLOCK {
+                        // fprintf(debug_out, "solmin: %d%s\n", *solmin, PInfo[o].stop_search ? ", stopping search" : "");
+                        // for (int i = 0; i < *solmin; i++) {
+                        //     fprintf(debug_out, "%d ", indices[i] + 1);
+                        // }
+                        // fprintf(debug_out, "\n");
+
+                        // // Print the PIs:
+                        // for (int c = 0; c < *solmin; c++) {
+                        //     for (int r = 0; r < ninputs; r++) {
+                        //         int value = 0;
+                        //         int position = r * (*solmin) + c;
+
+                        //         if (PInfo[o].implicants_pos[indices[c] * implicant_words + word_index[r]] & shifted_mask[r]) {
+                        //             value = 1 + (int)((PInfo[o].implicants_val[indices[c] * implicant_words + word_index[r]] >> bit_index[r]) & VALUE_BIT_MASK);
+                        //         }
+
+                        //         fprintf(debug_out, "%d ", value);
+                        //     }
+                        //     fprintf(debug_out, "\n");
+                        // }
+                    }
                 }
 
-                if (SCP_TYPE == 1 && POOL_MAX == 1) { // Gurobi: blended multi-objective
-                    gurobi_multiobjective(
-                        pichart,
-                        *foundPI,
-                        ON_minterms,
-                        weights,
-                        indices,
-                        solmin
-                    );
+
+                for (int i = 0; i < ON_minterms; i++) {
+                    PInfo[o].last_index[i] = PInfo[o].k_last_index[i];
+                }
+            } // end of outputs loop solving SCP
+
+        } // end of searching for solutions without pooling
+
+        if (POOL_MAX > 1) { // pooled solutions
+
+            double pool_execution_time[noutputs];
+
+            for (int o = 0; o < noutputs; o++) {
+                pool_execution_time[o] = 0.0;
+
+                int *foundPI = &PInfo[o].foundPI;
+                bool *ON_set_covered = &PInfo[o].ON_set_covered;
+                int ON_minterms = PInfo[o].ON_minterms;
+                int *pichart = PInfo[o].pichart;
+                int *solmin = &PInfo[o].solmin;
+                int *pool_count = &PInfo[o].pool_count;
+                int **pool_solutions = PInfo[o].pool_solutions;
+
+                PInfo[o].nofpi[k - 1] = *foundPI;
+
+                if (*foundPI > 0 && !*ON_set_covered) {
+                    bool test_coverage = true;
+
+                    int r = 0;
+                    while (r < ON_minterms && test_coverage) {
+
+                        bool minterm_covered = false;
+                        int c = 0;
+
+                        while (c < *foundPI && !minterm_covered) {
+                            minterm_covered = pichart[c * ON_minterms + r];
+                            c++;
+                        }
+
+                        test_coverage = minterm_covered;
+                        r++;
+                    }
+
+                    *ON_set_covered = test_coverage;
                 }
 
-                if (SCP_TYPE == 1 && POOL_MAX > 1) { // Gurobi: solution pool (uniform API)
+                if (*ON_set_covered && !PInfo[o].stop_search) {
 
-                    int pool_count = 0;
-                    int **pool_solutions = (int**)calloc((size_t)POOL_MAX, sizeof(int*));
-                    if (!pool_solutions) {
-                        fprintf(stderr, "Error: Memory allocation failed for pool arrays\n");
+                    double *weights = NULL;
+
+                    if (WEIGHT_PIC > 0) {
+                        weights = calloc(*foundPI, sizeof(double));
+                        layer_weights[k] = 1;
+                        for (int i = k - 1; i > 0; i--) {
+                            layer_weights[i] = layer_weights[i + 1] * 2;
+                        }
+
+                        int counter = 0;
+                        for (int l = 1; l < k; l++) {
+                            int layer_pis = PInfo[o].nofpi[l] - PInfo[o].nofpi[l - 1];
+                            for (int i = 0; i < layer_pis; i++) {
+                                weights[counter] = layer_weights[l];
+                                if (WEIGHT_PIC == 2) {
+                                    weights[counter] += 1 * (PInfo[o].shared[counter] - 1); // additional weight for shared PIs
+                                }
+                                counter++;
+                            }
+                        }
+                    }
+
+                    clock_gettime(CLOCK_MONOTONIC, &startg);
+
+                    if (SCP_TYPE == 0) { // Lagrangian relaxation with solution pool
+                        solve_scp_lagrangian_pool(
+                            pichart,
+                            *foundPI,
+                            ON_minterms,
+                            weights,
+                            POOL_MAX,
+                            pool_count,
+                            pool_solutions,
+                            solmin
+                        );
+                    }
+
+                    if (SCP_TYPE == 1) { // Gurobi: solution pool
+                        gurobi_solution_pool(
+                            pichart,
+                            *foundPI,
+                            ON_minterms,
+                            POOL_MAX,
+                            weights,
+                            pool_count,
+                            pool_solutions,
+                            solmin
+                        );
+                    }
+
+
+                    if (*solmin == 0) {
+                        DBG_ERROR_BLOCK {
+                            fprintf(debug_out, "Error: solving the minterm coverage failed.\n");
+                        }
                         cleanup(PInfo, buffer);
                         return 1;
                     }
 
-                    int *pichart_data = (int*)calloc((size_t)(*foundPI) * (size_t)ON_minterms, sizeof(int));
-                    if (!pichart_data) {
-                        fprintf(stderr, "Error: Memory allocation failed for pichart copy\n");
-                        cleanup(PInfo, buffer);
-                        return 1;
-                    }
-                    for (int i = 0; i < *foundPI * ON_minterms; i++) pichart_data[i] = pichart[i];
+                    clock_gettime(CLOCK_MONOTONIC, &endg);
+                    execution_time =
+                        (endg.tv_sec - startg.tv_sec) +
+                        (endg.tv_nsec - startg.tv_nsec) / 1e9;
 
-                    gurobi_solution_pool(
-                        pichart_data,
-                        *foundPI,
-                        ON_minterms,
-                        POOL_MAX,
-                        weights,
-                        &pool_count,
-                        pool_solutions,
-                        solmin
-                    );
+                    k_scp_time += execution_time;
 
-                    // Each pooled solution has length solmin; API now matches Lagrangian pool
-                    for (int pi = 0; pi < pool_count; ++pi) {
-                        free(pool_solutions[pi]);
-                    }
-                    free(pool_solutions);
-                    free(pichart_data);
+                    pool_execution_time[o] = execution_time;
+
+                    free(weights);
                 }
 
 
-                if (*solmin == 0) {
-                    DBG_ERROR_BLOCK {
-                        fprintf(debug_out, "Error: solving the minterm coverage failed.\n");
-                    }
-                    cleanup(PInfo, buffer);
-                    return 1;
+                for (int i = 0; i < ON_minterms; i++) {
+                    PInfo[o].last_index[i] = PInfo[o].k_last_index[i];
                 }
 
-                clock_gettime(CLOCK_MONOTONIC, &endg);
-                execution_time =
-                    (endg.tv_sec - startg.tv_sec) +
-                    (endg.tv_nsec - startg.tv_nsec) / 1e9;
+            } // end of outputs loop solving SCP
 
-                k_scp_time += execution_time;
-                DBG_TRACE_BLOCK {
-                    fprintf(debug_out, ", PI chart solved in %.3f seconds\n", execution_time);
+
+            /*
+             * Cross-output selection from solution pools:
+             * For each output, pick the solution in its pool whose PIs are most shared
+             * with the other outputs' pools.
+             */
+            int *chosen_idx = (int*)calloc((size_t)noutputs, sizeof(int));
+            if (!chosen_idx) {
+                fprintf(stderr, "Error: Memory allocation failed for chosen_idx\n");
+                cleanup(PInfo, buffer);
+                return 1;
+            }
+
+            for (int o = 0; o < noutputs; ++o) {
+                int pool_count_val = PInfo[o].pool_count;
+                int solmin_o = PInfo[o].solmin;
+
+                if (pool_count_val <= 0 || solmin_o <= 0) {
+                    chosen_idx[o] = -1;
+                    continue;
                 }
 
-                free(weights);
+                int best_score = -1;
+                int best_p = 0;
 
-                DBG_TRACE_BLOCK {
-                    // // print the PI chart
-                    // fprintf(debug_out, "\nPI chart for output %d(%d):\n", o + 1, ON_minterms);
-                    // for (int r = 0; r < ON_minterms; r++) {
-                    //     for (int c = 0; c < *foundPI; c++) {
-                    //         fprintf(debug_out, "%d ", pichart[c * ON_minterms + r]);
-                    //     }
-                    //     fprintf(debug_out, "\n");
-                    // }
+                for (int p = 0; p < pool_count_val; ++p) {
+                    int *sol = PInfo[o].pool_solutions[p];
+                    int score = 0;
+
+                    for (int j = 0; j < solmin_o; ++j) {
+                        int col = sol[j];
+                        // For each other output, count at most once per output if this PI appears anywhere in its pool
+                        for (int oo = 0; oo < noutputs; ++oo) {
+                            if (oo == o) continue;
+                            int pc2 = PInfo[oo].pool_count;
+                            int solmin_oo = PInfo[oo].solmin;
+                            if (pc2 <= 0 || solmin_oo <= 0) continue;
+
+                            bool found_in_oo = false;
+                            for (int pp = 0; pp < pc2 && !found_in_oo; ++pp) {
+                                int *sol2 = PInfo[oo].pool_solutions[pp];
+                                for (int jj = 0; jj < solmin_oo; ++jj) {
+                                    int col2 = sol2[jj];
+                                    bool eq = true;
+                                    for (int w = 0; w < implicant_words; ++w) {
+                                        uint64_t pos1 = PInfo[o].implicants_pos[col * implicant_words + w];
+                                        uint64_t val1 = PInfo[o].implicants_val[col * implicant_words + w];
+                                        uint64_t pos2 = PInfo[oo].implicants_pos[col2 * implicant_words + w];
+                                        uint64_t val2 = PInfo[oo].implicants_val[col2 * implicant_words + w];
+                                        if (pos1 != pos2 || val1 != val2) {
+                                            eq = false;
+                                            break;
+                                        }
+                                    }
+                                    if (eq) {
+                                        found_in_oo = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (found_in_oo) score++;
+                        }
+                    }
+
+                    if (score > best_score) {
+                        best_score = score;
+                        best_p = p;
+                    }
                 }
 
+                chosen_idx[o] = best_p;
+            }
 
-                if (*solmin < *prevsolmin) {
-                    // either solmin is smaller than the previously found solmin,
-                    // or it is the very first time a solmin was found
+            // Copy chosen solutions into indices for each output
+            for (int o = 0; o < noutputs; ++o) {
+                int *prevsolmin = &PInfo[o].prevsolmin;
+                int *solmin      = &PInfo[o].solmin;
+                int *previndices =  PInfo[o].previndices;
+                int *indices     =  PInfo[o].indices;
 
-                    *prevsolmin = *solmin;
-                    for (int i = 0; i < *solmin; i++) {
-                        previndices[i] = indices[i];
+                int pool_count_val = PInfo[o].pool_count;
+                int solmin_o = PInfo[o].solmin;
+
+                /* Only update stop logic if a valid solution exists at this k */
+                if (solmin_o > 0) {
+                    bool has_choice = !(pool_count_val <= 0 || chosen_idx[o] < 0);
+                    if (has_choice) {
+                        int *src = PInfo[o].pool_solutions[chosen_idx[o]];
+                        for (int i = 0; i < solmin_o; ++i) {
+                            indices[i] = src[i];
+                        }
                     }
 
-                    stop_counter[o] = 0;
-
-                } else {
-                    // the minimum number of PIs did not change in the current level of complexity
-                    // we can safely retain the less complex PIs from the previous level
-                    for (int i = 0; i < *solmin; i++) {
-                        indices[i] = previndices[i];
+                    DBG_INFO_BLOCK {
+                        if (*solmin > 0 && !PInfo[o].stop_search) {
+                            fprintf(debug_out, "[pool] Output %d (SCP %.3fs) solution (%d): ", o + 1, pool_execution_time[o], *solmin);
+                            for (int i = 0; i < *solmin; i++) {
+                                fprintf(debug_out, "%d ", indices[i] + 1);
+                            }
+                        }
                     }
 
-                    *solmin = *prevsolmin;
-                    stop_counter[o]++;
-                    PInfo[o].stop_search = stop_counter[o] == MAX_LEVELS;
-                }
+                    if (*solmin < *prevsolmin) {
+                        *prevsolmin = *solmin;
+                        for (int i = 0; i < *solmin; i++) {
+                            previndices[i] = indices[i];
+                        }
 
-                DBG_TRACE_BLOCK {
-                    fprintf(debug_out, "solmin: %d%s\n", *solmin, PInfo[o].stop_search ? ", stopping search" : "");
-                    for (int i = 0; i < *solmin; i++) {
-                        fprintf(debug_out, "%d ", indices[i] + 1);
+                        stop_counter[o] = 0;
+
+                        DBG_INFO_BLOCK {
+                            if (!PInfo[o].stop_search) {
+                                fprintf(debug_out, "\n");
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i < *solmin; i++) {
+                            indices[i] = previndices[i];
+                        }
+
+                        *solmin = *prevsolmin;
+                        stop_counter[o]++;
+
+                        DBG_INFO_BLOCK {
+                            if (!PInfo[o].stop_search) {
+                                fprintf(debug_out, "%s\n", stop_counter[o] >= MAX_LEVELS ? "-- stopping search" : "");
+                            }
+                        }
+
+                        PInfo[o].stop_search = stop_counter[o] >= MAX_LEVELS;
                     }
-                    fprintf(debug_out, "\n");
-
-                    // // Print the PIs:
-                    // for (int c = 0; c < *solmin; c++) {
-                    //     for (int r = 0; r < ninputs; r++) {
-                    //         int value = 0;
-                    //         int position = r * (*solmin) + c;
-
-                    //         if (PInfo[o].implicants_pos[indices[c] * implicant_words + word_index[r]] & shifted_mask[r]) {
-                    //             value = 1 + (int)((PInfo[o].implicants_val[indices[c] * implicant_words + word_index[r]] >> bit_index[r]) & VALUE_BIT_MASK);
-                    //         }
-
-                    //         fprintf(debug_out, "%d ", value);
-                    //     }
-                    //     fprintf(debug_out, "\n");
-                    // }
                 }
             }
 
-            DBG_TRACE_BLOCK {
-                fprintf(debug_out, "\n");
-            }
+            free(chosen_idx);
 
-            for (int i = 0; i < ON_minterms; i++) {
-                PInfo[o].last_index[i] = PInfo[o].k_last_index[i];
-            }
-        }
+        } // end of searching for solutions with pooling
 
         clock_gettime(CLOCK_MONOTONIC, &endk);
         execution_time =
@@ -1200,7 +1421,7 @@ int main(int argc, char *argv[]) {
 
 
     for (int o = 0; o < noutputs; o++) {
-        int solmin = PInfo[o].solmin > 0 ? PInfo[o].solmin : 1; // at least one solution is needed
+        int solmin = PInfo[o].solmin > 0 ? PInfo[o].solmin : 1; // at least one solution term is needed
         PInfo[o].solution = (int *) calloc(solmin * ninputs, sizeof(int));
 
         for (int c = 0; c < PInfo[o].solmin; c++) {
