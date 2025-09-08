@@ -46,8 +46,8 @@ Options:
                           1 Gurobi exact
   -p<number>          : decide from a pool of up to <number> equally optimal solutions
   -d<level>[=<file>]  : incremental debug information
-                          1 errors + warnings
-                          2 errors + warnings + info
-                          3 everything (trace)
+                          0 errors + warnings
+                          1 errors + warnings + info
+                          2 everything (trace)
   -h, --help          : show this help message
 ```
