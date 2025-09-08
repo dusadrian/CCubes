@@ -24,9 +24,11 @@ There is a minimal help system integrated into CCubes. Users can enable debug ou
 
 The debug levels are preliminary, and more detailed logging functionality will be added in the future.
 
-Compile the binary according to your system using `make`, with various options indicated in the Makefile.
+For very large problem instances, CCubes can save its state into a binary checkpoint file and exit, when a certain `-t` time limit is reached. The process can be resumed later from the checkpoint file, allowing users to continue the minimization process without re-specifying the input and output files. Even when `-r` resuming from a checkpoint, a further successive time limit can be specified to save another intermediate checkpoint. If the binary checkpoint file is not specified, it will default to `chk_<basename(source)>.bin`.Preliminary tests show that creating intermediate checkpoints more than double the performance in execution time, likely because of memory allocations.
 
-The destination .pla file is optional. If not specified, a .pla file prefixed with "ccubes_" will be created in the current directory.
+Compile the binary according to your system using `make`, with various options and customization indicated in the Makefile.
+
+The destination .pla file is optional. If not specified, a `ccubes_<basename(source)>.pla` file will be created in the current directory.
 
 # USAGE
 
@@ -46,8 +48,11 @@ Options:
                           1 Gurobi exact
   -p<number>          : decide from a pool of up to <number> equally optimal solutions
   -d<level>[=<file>]  : incremental debug information
-                          0 errors + warnings
+                          0 (default) errors + warnings
                           1 errors + warnings + info
                           2 everything (trace)
+  -t<sec>[=<file>]    : time limit after which a checkpoint will be saved to <file>
+  -r=<file>           : resume from checkpoint file
+  -i=<file>           : inspect checkpoint (print progress and metadata)
   -h, --help          : show this help message
 ```

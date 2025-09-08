@@ -13,6 +13,7 @@
 #include <math.h>
 #include <time.h>
 #include "main.h"
+#include "checkpoint.h"
 
 #ifdef _OPENMP
     #include <omp.h>
@@ -33,10 +34,13 @@ void help() {
     printf("                         0 (default) Lagrangian relaxation heuristic\n");
     printf("                         1 Gurobi exact\n");
     printf("  -d<level>[=<file>] : incremental debug information\n");
-    printf("                         0 errors + warnings\n");
+    printf("                         0 (default) errors + warnings\n");
     printf("                         1 errors + warnings + info\n");
     printf("                         2 everything (trace)\n");
     printf("  -p<number>         : decide from a pool of up to <number> equally optimal solutions\n");
+    printf("  -t<sec>[=<file>]   : time limit; save checkpoint and exit; when resuming, defaults to overwriting the -r file\\n");
+    printf("  -r=<file>          : resume from checkpoint file\n");
+    printf("  -i=<file>          : inspect checkpoint (print progress and metadata)\n");
     printf("  -h, --help         : show this help message\n");
 }
 
@@ -59,6 +63,17 @@ int main(int argc, char *argv[]) {
     int POOL_MAX = 1; // collect up to this many solutions
     char *SRC_FILE = NULL;
     char *DST_FILE = NULL;
+    // resume timing bases
+    double BASE_ELAPSED = 0.0;
+    double BASE_SCP = 0.0;
+
+    // checkpoint/time limit
+    double TIME_LIMIT_SEC = 0.0;
+    char *CHK_SAVE_PATH = NULL;
+    char *RESUME_PATH = NULL;
+    char *INFO_PATH = NULL; // -i: inspect checkpoint file
+    int RESUME_K = -1;
+    bool RESUME_READY_FOR_COVERAGE = false;
 
     if (argc < 2) {
         help();
@@ -126,6 +141,41 @@ int main(int argc, char *argv[]) {
         } else if (strncmp(argv[i], "-p", 2) == 0) {
             POOL_MAX = atoi(argv[i] + 2);
             if (POOL_MAX < 1) POOL_MAX = 1;
+        } else if (strncmp(argv[i], "-t", 2) == 0) {
+            char *opt = argv[i] + 2;  // string after "-t"
+            char *eq  = strchr(opt, '=');
+            if (eq) {
+                *eq = '\0';
+                TIME_LIMIT_SEC = atof(opt);
+                CHK_SAVE_PATH  = eq + 1;
+            } else {
+                TIME_LIMIT_SEC = atof(opt);
+            }
+            if (TIME_LIMIT_SEC < 0) TIME_LIMIT_SEC = 0;
+        } else if (strncmp(argv[i], "-r", 2) == 0) {
+            // Support -r=<file> (preferred) and legacy -r<file>
+            if (argv[i][2] == '=') {
+                RESUME_PATH = argv[i] + 3;
+            } else if (argv[i][2] != '\0') {
+                RESUME_PATH = argv[i] + 2;
+            } else if (i + 1 < argc) {
+                RESUME_PATH = argv[++i];
+            } else {
+                fprintf(stderr, "Error: -r requires a file path (use -r=<file>)\n");
+                return 1;
+            }
+        } else if (strncmp(argv[i], "-i", 2) == 0) {
+            // Support -i=<file> (preferred) and legacy -i<file>
+            if (argv[i][2] == '=') {
+                INFO_PATH = argv[i] + 3;
+            } else if (argv[i][2] != '\0') {
+                INFO_PATH = argv[i] + 2;
+            } else if (i + 1 < argc) {
+                INFO_PATH = argv[++i];
+            } else {
+                fprintf(stderr, "Error: -i requires a file path (use -i=<file>)\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             help();
             return 0;
@@ -158,7 +208,18 @@ int main(int argc, char *argv[]) {
         WEIGHT_PIC = 2;
     }
 
-    if (!SRC_FILE) {
+    // Inspect checkpoint and exit
+    if (INFO_PATH) {
+        print_info(INFO_PATH);
+        return 0;
+    }
+
+    if (INFO_PATH) {
+        print_info(INFO_PATH);
+        return 0;
+    }
+
+    if (!SRC_FILE && !RESUME_PATH) {
         fprintf(stderr, "Error: source .pla file is required.\n");
         help();
         return 1;
@@ -175,36 +236,135 @@ int main(int argc, char *argv[]) {
     PIstorage *PInfo = NULL;
     int *nofvalues = NULL;
     int ninputs = 0, noutputs = 0, max_value = 0;
+    int *loaded_stopc = NULL; // resume: stop counters per output
+    // Keep loaded bit parameters accessible outside the resume block
+    int loaded_value_bit_width_saved = 0;
+    int loaded_implicant_words_saved = 0;
 
+    // If resuming, load checkpoint before reading PLA
+    if (RESUME_PATH) {
 
-    read_pla_file(
-        SRC_FILE,
-        &PInfo,
-        &ninputs,
-        &noutputs,
-        &nofvalues,
-        &max_value
-    );
+        int loaded_bits = 0, loaded_value_bit_width = 0, loaded_implicant_words = 0;
+        int loaded_MAX_LEVELS=0, loaded_WEIGHT_PIC=0, loaded_SCP_TYPE=0, loaded_POOL_MAX=0, loaded_START_LEVEL=0;
+        char *loaded_src_path = NULL;
+        char *loaded_dst_path = NULL;
+        double _ck_elapsed_total = 0.0, _ck_elapsed_scp = 0.0;
+        uint64_t _ck_last_task = 0ull;
 
-    if (PInfo == NULL || ninputs <= 0 || noutputs <= 0) {
-        printf("Error: Invalid .pla file or no inputs/outputs found.\n");
-        return 1;
+        if (
+            load_checkpoint(
+                RESUME_PATH,
+                &PInfo,
+                &ninputs,
+                &noutputs,
+                &loaded_bits,
+                &loaded_value_bit_width,
+                &loaded_implicant_words,
+                &RESUME_K,
+                &loaded_stopc,
+                &loaded_MAX_LEVELS,
+                &loaded_WEIGHT_PIC,
+                &loaded_SCP_TYPE,
+                &loaded_POOL_MAX,
+                &loaded_START_LEVEL,
+                &nofvalues,
+                &loaded_src_path,
+                &loaded_dst_path,
+                &_ck_elapsed_total,
+                &_ck_elapsed_scp,
+                &_ck_last_task
+            ) != 0
+        ) {
+            fprintf(stderr, "Error: failed to load checkpoint from %s\n", RESUME_PATH);
+            return 1;
+        }
+
+        // If not overridden on CLI, adopt saved paths
+        if (!SRC_FILE && loaded_src_path) {
+            SRC_FILE = loaded_src_path; /* keep for later */
+        } else {
+            if (loaded_src_path) free(loaded_src_path);
+        }
+
+        if (!DST_FILE && loaded_dst_path) {
+            DST_FILE = loaded_dst_path;
+        } else {
+            if (loaded_dst_path) free(loaded_dst_path);
+        }
+
+        BITS_PER_WORD = loaded_bits;
+        MAX_LEVELS = loaded_MAX_LEVELS;
+        WEIGHT_PIC = loaded_WEIGHT_PIC;
+        SCP_TYPE = loaded_SCP_TYPE;
+        POOL_MAX = loaded_POOL_MAX;
+        loaded_value_bit_width_saved = loaded_value_bit_width;
+        loaded_implicant_words_saved = loaded_implicant_words;
+
+        // Resume timing bases
+        BASE_ELAPSED = _ck_elapsed_total;
+        BASE_SCP = _ck_elapsed_scp;
+
+        // Resume will start at the saved k (coverage stage)
+        START_LEVEL = RESUME_K;
+        RESUME_READY_FOR_COVERAGE = true;
+        // Persist loaded widths for later use
+        // We'll set value_bit_width and implicant_words to these after computing max_value for non-resume
+        // loaded_stopc will be applied after stop_counter allocation below
+        // (do not free here)
+        // Store in temporary globals via static locals is not needed; we'll assign below
+        // To do so, we'll place them in file-scope variables here with shadowless names via statements below
+        // We'll encode them into placeholders for later assignment by duplicating code blocks
+        // (actual assignment is performed after PLA read below)
+        // We cannot assign to undeclared value_bit_width yet, so remember via local variables in this block scope
+        // We'll use them immediately below when deciding widths
+        // To achieve that we will declare and set dedicated flags outside this block
     }
 
-    int bits_needed = (int)ceil(log2(max_value));
-    int value_bit_width = 1; // at least 1 bits is needed to represent binary values
-    while (value_bit_width < bits_needed) {
-        value_bit_width *= 2; // Round up to the next power of 2
+
+    if (!RESUME_PATH) {
+        read_pla_file(
+            SRC_FILE,
+            &PInfo,
+            &ninputs,
+            &noutputs,
+            &nofvalues,
+            &max_value
+        );
+
+        if (PInfo == NULL || ninputs <= 0 || noutputs <= 0) {
+            printf("Error: Invalid .pla file or no inputs/outputs found.\n");
+            return 1;
+        }
     }
 
-    if (value_bit_width > BITS_PER_WORD) {
-        BITS_PER_WORD = value_bit_width; // Adjust the bits per word
+    // Determine value bit width and implicant words
+    int value_bit_width = 1; // default minimum
+    int implicant_words = 0;
+    if (!RESUME_PATH) {
+        // Compute from input domain: values are encoded as 0..max_value, inclusive
+        int bits_needed = (int)ceil(log2((double)(max_value + 1)));
+        if (bits_needed < 1) bits_needed = 1;
+        while (value_bit_width < bits_needed) {
+            value_bit_width *= 2; // Round up to next power of two
+        }
+        if (value_bit_width > BITS_PER_WORD) {
+            BITS_PER_WORD = value_bit_width; // Adjust the bits per word
+        }
+        implicant_words = (ninputs * value_bit_width + BITS_PER_WORD - 1) / BITS_PER_WORD;
+    } else {
+        // Use exactly the saved widths from the checkpoint
+        value_bit_width = loaded_value_bit_width_saved;
+        implicant_words = loaded_implicant_words_saved;
+        // BITS_PER_WORD was already set from the checkpoint above
     }
 
     uint64_t VALUE_BIT_MASK = (1ULL << value_bit_width) - 1ULL;
 
-    // Words needed per PI representation
-    int implicant_words = (ninputs * value_bit_width + BITS_PER_WORD - 1) / BITS_PER_WORD;
+    // Ensure pichart_words are aligned with BITS_PER_WORD (already set on load for resume)
+    PInfo[0].pichart_words = (PInfo[0].ON_minterms + BITS_PER_WORD - 1) / BITS_PER_WORD;
+    for (int o = 0; o < noutputs; o++) {
+        PInfo[o].pichart_words = (PInfo[o].ON_minterms + BITS_PER_WORD - 1) / BITS_PER_WORD;
+    }
 
 
 
@@ -246,6 +406,7 @@ int main(int argc, char *argv[]) {
     }
 
     int stop_counter[noutputs];
+    // Initialize per-output state (allocate only if not resuming)
     for (int o = 0; o < noutputs; o++) {
 
         // --- temporary debugging code ---
@@ -256,77 +417,91 @@ int main(int argc, char *argv[]) {
         int ON_minterms = PInfo[o].ON_minterms;
 
         // preallocating for a moderate number; grows dynamically as needed
-        PInfo[o].estimPI = 500000;
-        // PInfo[o].k_estimPI = 1000000;
-
-        // the index of the PIs, in descending order of their number of covered ON-set minterms
-        PInfo[o].covered = (int *) calloc(PInfo[o].estimPI, sizeof(int));
-        if (!PInfo[o].covered) {
-            fprintf(stderr, "Error: Memory allocation failed for covered array\n");
-            cleanup(PInfo, buffer);
-            return 1;
+        if (!RESUME_PATH) {
+            PInfo[o].estimPI = 500000;
+        } else {
+            if (PInfo[o].estimPI < PInfo[o].foundPI) PInfo[o].estimPI = PInfo[o].foundPI; // minimal capacity
         }
 
-        PInfo[o].last_index = (int *) calloc(ON_minterms, sizeof(int));
-        PInfo[o].k_last_index = (int *) calloc(ON_minterms, sizeof(int));
+        // allocate only if not already present (resume)
+        if (!PInfo[o].covered) {
+            PInfo[o].covered = (int *) calloc(PInfo[o].estimPI, sizeof(int));
+            if (!PInfo[o].covered) {
+                fprintf(stderr, "Error: Memory allocation failed for covered array\n");
+                cleanup(PInfo, buffer);
+                return 1;
+            }
+        }
+
+        if (!PInfo[o].last_index) PInfo[o].last_index = (int *) calloc(ON_minterms, sizeof(int));
+        if (!PInfo[o].k_last_index) PInfo[o].k_last_index = (int *) calloc(ON_minterms, sizeof(int));
         if (!PInfo[o].last_index || !PInfo[o].k_last_index) {
             fprintf(stderr, "Error: Memory allocation failed for index arrays\n");
             cleanup(PInfo, buffer);
             return 1;
         }
 
-        // prefixing (int *) before calloc() prefills all values sizeof(with) 0s
-        PInfo[o].pichart = (int *) calloc(PInfo[o].estimPI * ON_minterms, sizeof(int));
         if (!PInfo[o].pichart) {
-            fprintf(stderr, "Error: Memory allocation failed for pichart\n");
-            cleanup(PInfo, buffer);
-            return 1;
+            PInfo[o].pichart = (int *) calloc(PInfo[o].estimPI * ON_minterms, sizeof(int));
+            if (!PInfo[o].pichart) {
+                fprintf(stderr, "Error: Memory allocation failed for pichart\n");
+                cleanup(PInfo, buffer);
+                return 1;
+            }
         }
 
         PInfo[o].pichart_words = (ON_minterms + BITS_PER_WORD - 1) / BITS_PER_WORD; // Words needed per coverage matrix columns
-        PInfo[o].pichart_pos = (uint64_t *) calloc(PInfo[o].estimPI * PInfo[o].pichart_words, sizeof(uint64_t));
         if (!PInfo[o].pichart_pos) {
-            fprintf(stderr, "Error: Memory allocation failed for pichart_pos\n");
-            cleanup(PInfo, buffer);
-            return 1;
+            PInfo[o].pichart_pos = (uint64_t *) calloc(PInfo[o].estimPI * PInfo[o].pichart_words, sizeof(uint64_t));
+            if (!PInfo[o].pichart_pos) {
+                fprintf(stderr, "Error: Memory allocation failed for pichart_pos\n");
+                cleanup(PInfo, buffer);
+                return 1;
+            }
         }
 
-        PInfo[o].implicants_pos = (uint64_t *) calloc(PInfo[o].estimPI * implicant_words, sizeof(uint64_t));
-        PInfo[o].implicants_val = (uint64_t *) calloc(PInfo[o].estimPI * implicant_words, sizeof(uint64_t));
+        if (!PInfo[o].implicants_pos) PInfo[o].implicants_pos = (uint64_t *) calloc(PInfo[o].estimPI * implicant_words, sizeof(uint64_t));
+        if (!PInfo[o].implicants_val) PInfo[o].implicants_val = (uint64_t *) calloc(PInfo[o].estimPI * implicant_words, sizeof(uint64_t));
         if (!PInfo[o].implicants_pos || !PInfo[o].implicants_val) {
             fprintf(stderr, "Error: Memory allocation failed for implicants arrays\n");
             cleanup(PInfo, buffer);
             return 1;
         }
 
-        PInfo[o].shared = (int *) calloc(PInfo[o].estimPI, sizeof(int));
-        PInfo[o].covsum = (int *) calloc(PInfo[o].estimPI, sizeof(int));
+        if (!PInfo[o].shared) PInfo[o].shared = (int *) calloc(PInfo[o].estimPI, sizeof(int));
+        if (!PInfo[o].covsum) PInfo[o].covsum = (int *) calloc(PInfo[o].estimPI, sizeof(int));
         if (!PInfo[o].shared || !PInfo[o].covsum) {
             fprintf(stderr, "Error: Memory allocation failed for shared/covsum arrays\n");
             cleanup(PInfo, buffer);
             return 1;
         }
 
-        PInfo[o].foundPI = 0;
-        PInfo[o].solmin = 0;
+        if (!RESUME_PATH) {
+            PInfo[o].foundPI = 0;
+            PInfo[o].solmin = 0;
+        }
 
         // the previous (level k - 1), minimum number of PIs to solve the coverage matrix
-        PInfo[o].prevsolmin = ON_minterms + 1; // Initializtion: set to a value larger than the maximum possible number of PIs
+        if (!RESUME_PATH) {
+            PInfo[o].prevsolmin = ON_minterms + 1; // Initialization
+        }
 
         // the positions of the PIs solving the coverage matrix
         // this vector can never be lengthier than the number of ON minterms (ON_minterms)
-        PInfo[o].previndices = (int *) calloc(ON_minterms, sizeof(int));
-        PInfo[o].indices = (int *) calloc(ON_minterms, sizeof(int));
+        if (!PInfo[o].previndices) PInfo[o].previndices = (int *) calloc(ON_minterms, sizeof(int));
+        if (!PInfo[o].indices)     PInfo[o].indices     = (int *) calloc(ON_minterms, sizeof(int));
         if (!PInfo[o].previndices || !PInfo[o].indices) {
             fprintf(stderr, "Error: Memory allocation failed for indices arrays\n");
             cleanup(PInfo, buffer);
             return 1;
         }
 
-        PInfo[o].ON_set_covered = false;
+        if (!RESUME_PATH) {
+            PInfo[o].ON_set_covered = false;
+        }
 
-        PInfo[o].cov_word_index = (int *) calloc(ON_minterms, sizeof(int));
-        PInfo[o].shifted_cov_mask = (uint64_t *) calloc(ON_minterms, sizeof(uint64_t));
+        if (!PInfo[o].cov_word_index)   PInfo[o].cov_word_index   = (int *) calloc(ON_minterms, sizeof(int));
+        if (!PInfo[o].shifted_cov_mask) PInfo[o].shifted_cov_mask = (uint64_t *) calloc(ON_minterms, sizeof(uint64_t));
         if (!PInfo[o].cov_word_index || !PInfo[o].shifted_cov_mask) {
             fprintf(stderr, "Error: Memory allocation failed for coverage arrays\n");
             cleanup(PInfo, buffer);
@@ -336,6 +511,13 @@ int main(int argc, char *argv[]) {
         for (int r = 0; r < ON_minterms; r++) {
             PInfo[o].cov_word_index[r] = r / BITS_PER_WORD;
             PInfo[o].shifted_cov_mask[r] = (1ULL << (r % BITS_PER_WORD));
+        }
+
+        // If resuming, restore stop counter from checkpoint
+        if (loaded_stopc) {
+            stop_counter[o] = loaded_stopc[o];
+        } else {
+            stop_counter[o] = 0;
         }
 
         // store the number of PIs at each level of complexity k
@@ -361,6 +543,8 @@ int main(int argc, char *argv[]) {
         }
 
     }
+
+    if (loaded_stopc) { free(loaded_stopc); loaded_stopc = NULL; }
 
     // allocate memory buffer for each thread
     for (int t = 0; t < THREADS; t++) {
@@ -429,6 +613,9 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &startk);
 
         uint64_t maxtasks = nchoosek(ninputs, k);
+        volatile bool time_up = false;
+        double time_up_elapsed = 0.0;
+        uint64_t last_task_reached = 0ull;
         if (maxtasks == 0) {
             // overflow, too many tasks
             cleanup(PInfo, buffer);
@@ -442,29 +629,70 @@ int main(int argc, char *argv[]) {
         }
 
         // Parallelize tasks loop with thread-local buffer buffers (see buffer[tid][o])
+        if (!(RESUME_READY_FOR_COVERAGE && RESUME_K == k)) {
         #ifdef _OPENMP
-            #pragma omp parallel for if(THREADS > 1) schedule(static, 1)
+            #pragma omp parallel for if(THREADS > 1) schedule(static, 1) shared(time_up, time_up_elapsed, last_task_reached)
         #endif
         for (uint64_t task = 0; task < maxtasks; task++) {
+
+            #ifdef _OPENMP
+            if (time_up) {
+                #pragma omp cancellation point for
+                continue;
+            }
+            #endif
 
             int tid = 0;
             #ifdef _OPENMP
                 tid = omp_get_thread_num();
             #endif
 
+            // Periodically check time limit
+            if (TIME_LIMIT_SEC > 0) {
+                if ((task & 0x3FFull) == 0) { // every 1024 tasks
+                    struct timespec _now;
+                    clock_gettime(CLOCK_MONOTONIC, &_now);
+                    double delta = (_now.tv_sec - start.tv_sec) + (_now.tv_nsec - start.tv_nsec) / 1e9;
+
+                    if (delta >= TIME_LIMIT_SEC) {
+                        #ifdef _OPENMP
+                        #pragma omp critical
+                        #endif
+                        {
+                            if (!time_up) {
+                                time_up = true;
+                                time_up_elapsed = BASE_ELAPSED + delta;
+                                if (task > last_task_reached) last_task_reached = task;
+                            }
+                        }
+                        #ifdef _OPENMP
+                        #pragma omp cancel for
+                        #endif
+                    }
+                }
+            }
+
+            // record last task seen
+            #ifdef _OPENMP
+            #pragma omp critical
+            #endif
+            {
+                if (task > last_task_reached) last_task_reached = task;
+            }
+
             int tempk[k];
             uint64_t combination = task;
 
             DBG_TRACE_BLOCK {
-                if (task % 1000000 == 0 && task / 1000000 > 0) { // every 1M tasks
-                    fprintf(debug_out, "-");
-                }
-                if (task % 50000000 == 0 && task / 50000000 > 0) { // every 50M tasks
-                    fprintf(debug_out, "\n");
-                }
-                if (task % 100000000 == 0 && task / 100000000 > 0) { // every 100M tasks
-                    fprintf(debug_out, " (%lld)", task / 100000000);
-                }
+                // if (task % 1000000 == 0 && task / 1000000 > 0) { // every 1M tasks
+                //     fprintf(debug_out, "-");
+                // }
+                // if (task % 50000000 == 0 && task / 50000000 > 0) { // every 50M tasks
+                //     fprintf(debug_out, "\n");
+                // }
+                // if (task % 100000000 == 0 && task / 100000000 > 0) { // every 100M tasks
+                //     fprintf(debug_out, " (%lld)", task / 100000000);
+                // }
             }
 
             // fill the combination for the current task / combination number
@@ -942,7 +1170,59 @@ int main(int argc, char *argv[]) {
             }
 
         } // end of tasks loop
+        RESUME_READY_FOR_COVERAGE = false; // only skip once
+        }
 
+
+        // Time-limit checkpoint (post-loop or early-cancel)
+        if (TIME_LIMIT_SEC > 0 && time_up) {
+            if (!CHK_SAVE_PATH) {
+                if (RESUME_PATH) {
+                    CHK_SAVE_PATH = RESUME_PATH; // overwrite the same checkpoint when resuming
+                } else if (SRC_FILE) {
+                    CHK_SAVE_PATH = prefix_basename(SRC_FILE, "chk_");
+                } else {
+                    CHK_SAVE_PATH = "ccubes_checkpoint.bin";
+                }
+            }
+
+            // Determine intended destination path to persist
+            const char *dst_to_save = DST_FILE;
+            char *tmp_dst_alloc = NULL;
+            if (!dst_to_save && SRC_FILE) {
+                tmp_dst_alloc = prefix_basename(SRC_FILE, "ccubes_");
+                dst_to_save = tmp_dst_alloc; // may be NULL on OOM
+            }
+
+            if (save_checkpoint(
+                    CHK_SAVE_PATH,
+                    PInfo,
+                    ninputs,
+                    noutputs,
+                    BITS_PER_WORD,
+                    value_bit_width,
+                    implicant_words,
+                    k,
+                    stop_counter,
+                    MAX_LEVELS,
+                    WEIGHT_PIC,
+                    SCP_TYPE,
+                    POOL_MAX,
+                    START_LEVEL,
+                    SRC_FILE,
+                    dst_to_save,
+                    time_up_elapsed,
+                    BASE_SCP + scp_time,
+                    last_task_reached
+                ) == 0) {
+                fprintf(stderr, "Time limit reached. Checkpoint saved to %s at k=%d task=%llu.\n", CHK_SAVE_PATH, k, (unsigned long long)last_task_reached);
+            } else {
+                fprintf(stderr, "Time limit reached. Failed to save checkpoint to %s.\n", CHK_SAVE_PATH);
+            }
+            if (tmp_dst_alloc) free(tmp_dst_alloc);
+            cleanup(PInfo, buffer);
+            return 0;
+        }
 
         // solve the PI charts per output
         if (POOL_MAX == 1) {
@@ -1439,29 +1719,65 @@ int main(int argc, char *argv[]) {
 
 
     if (DST_FILE == NULL) {
-        const char *prefix = "ccubes_";
-        char *filename = prefix_basename(SRC_FILE, prefix);
-        if (!filename) {
-            DST_FILE = "outfile.pla";
-        } else {
-            DST_FILE = filename;
-            // Note: filename memory will be cleaned up along with other resources
+        if (RESUME_PATH) {
+            // Derive sensible default from checkpoint name, always ending with .pla
+            const char *base = strrchr(RESUME_PATH, '/');
+            base = base ? base + 1 : RESUME_PATH;
+
+            const char *chk_prefix = "chk_";
+            size_t chk_len = strlen(chk_prefix);
+
+            // Determine the meaningful part after removing chk_ if present
+            const char *rest = (strncmp(base, chk_prefix, chk_len) == 0) ? (base + chk_len) : base;
+
+            // Strip extension from rest
+            const char *dot = strrchr(rest, '.');
+            size_t stem_len = dot ? (size_t)(dot - rest) : strlen(rest);
+
+            const char *out_prefix = "ccubes_";
+            size_t out_len = strlen(out_prefix) + stem_len + 4 /*.pla*/ + 1;
+            char *outname = (char *)malloc(out_len);
+            if (outname) {
+                strcpy(outname, out_prefix);
+                strncat(outname, rest, stem_len);
+                outname[strlen(out_prefix) + stem_len] = '\0';
+                strcat(outname, ".pla");
+                DST_FILE = outname; // freed on process exit
+            }
+        } else if (SRC_FILE) {
+            const char *prefix = "ccubes_";
+            char *filename = prefix_basename(SRC_FILE, prefix);
+            if (filename) {
+                DST_FILE = filename;
+                // Note: filename memory will be cleaned up along with other resources
+            }
         }
     }
 
+    if (DST_FILE == NULL) {
+        fprintf(stderr, "Error: failed to determine destination .pla filename.\n");
+        cleanup(PInfo, buffer);
+        debug_close();
+        return 1;
+    }
+
     write_pla_file(DST_FILE, PInfo);
+    fprintf(stderr, "Output written to %s\n", DST_FILE);
 
 
     // Free allocated memory
     cleanup(PInfo, buffer);
 
-    // Calculate and log execution time
+    // Calculate and log execution time (accumulated across resumes)
     clock_gettime(CLOCK_MONOTONIC, &end);
     execution_time =
         (end.tv_sec - start.tv_sec) +
         (end.tv_nsec - start.tv_nsec) / 1e9;
 
-    fprintf(stderr, "Execution completed in %.3f (%.3f SCP) seconds\n", execution_time, scp_time);
+    double total_exec_time = BASE_ELAPSED + execution_time;
+    double total_scp_time  = BASE_SCP + scp_time;
+
+    fprintf(stderr, "Execution completed in %.3f (%.3f SCP) seconds\n", total_exec_time, total_scp_time);
 
     DBG_INFO_BLOCK {
         fprintf(debug_out, "all good.\n");

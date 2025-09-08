@@ -1,3 +1,6 @@
+#ifndef UTILS_H
+#define UTILS_H
+
 #include <limits.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -98,3 +101,7 @@ void write_pla_file(const char *filename, PIstorage *PInfo);
 void cleanup(PIstorage *PInfo, ThreadBuffer **buffer);
 
 char *prefix_basename(const char *filepath, const char *prefix);
+
+void print_info(const char *path);
+
+#endif // UTILS_H

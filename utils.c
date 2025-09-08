@@ -7,6 +7,7 @@
  */
 
 #include "utils.h"
+#include "checkpoint.h"
 
 void error_message(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -660,4 +661,83 @@ char *prefix_basename(const char *filepath, const char *prefix) {
     return new_name;
 }
 
+void print_info(const char *INFO_PATH) {
+    PIstorage *pi_tmp = NULL;
+    int ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0, sl=0;
+    int *stopc_tmp = NULL; int *nofvals_tmp = NULL; char *src_saved=NULL; char *dst_saved=NULL;
+    double elapsed_total = 0.0, elapsed_scp = 0.0; uint64_t last_task = 0ull;
+
+    if (load_checkpoint(
+            INFO_PATH,
+            &pi_tmp,
+            &ni,
+            &no,
+            &bpw,
+            &vbw,
+            &ipw,
+            &ck,
+            &stopc_tmp,
+            &ml,
+            &wp,
+            &st,
+            &pm,
+            &sl,
+            &nofvals_tmp,
+            &src_saved,
+            &dst_saved,
+            &elapsed_total,
+            &elapsed_scp,
+            &last_task
+    ) != 0) {
+        fprintf(stderr, "Error: failed to load checkpoint from %s\n", INFO_PATH);
+        return;
+    }
+
+    // printf("Checkpoint: %s\n", INFO_PATH);
+    printf("Source: %s\n", src_saved ? src_saved : "-");
+    printf("Destination: %s\n", dst_saved ? dst_saved : "-");
+    printf("Inputs: %d, Outputs: %d\n", ni, no);
+    // printf("Bits per word: %d, value bit width: %d, implicant words: %d\n", bpw, vbw, ipw);
+        printf("Level k reached: %d (start level: %d, stop after max levels: %d)\n", ck, sl, ml);
+    uint64_t maxt = nchoosek(ni, ck);
+
+    if (ck > 0 && maxt > 0) {
+        double pct = (double)(last_task + 1) * 100.0 / (double)maxt;
+        if (pct > 100.0) pct = 100.0;
+        printf("Progress at k: task=%llu / %llu (%.2f%%)\n", (unsigned long long)last_task, (unsigned long long)maxt, pct);
+    }
+
+    printf("Total time spent: %.3fs (%.3fs SCP)\n", elapsed_total, elapsed_scp);
+    // printf("Stage: ready_for_coverage\n");
+
+    for (int o = 0; o < no; ++o) {
+        bool stop_flag = false;
+
+        if (stopc_tmp) {
+            stop_flag = stopc_tmp[o] >= ml;
+        } else {
+            stop_flag = pi_tmp[o].stop_search;
+        }
+
+        printf(
+            "Output %d: ON=%d OFF=%d foundPI=%d solmin=%d covered=%s stop=%s\n",
+            o,
+            pi_tmp[o].ON_minterms,
+            pi_tmp[o].OFF_minterms,
+            pi_tmp[o].foundPI,
+            pi_tmp[o].solmin,
+            pi_tmp[o].ON_set_covered ? "yes" : "no",
+            stop_flag ? "yes" : "no"
+        );
+    }
+
+    if (src_saved) free(src_saved);
+    if (dst_saved) free(dst_saved);
+    if (nofvals_tmp) free(nofvals_tmp);
+    if (stopc_tmp) free(stopc_tmp);
+
+    // Use cleanup to free PInfo; provide a dummy buffer holder
+    ThreadBuffer **dummy = (ThreadBuffer**)calloc(1, sizeof(ThreadBuffer*));
+    cleanup(pi_tmp, dummy);
+}
 
