@@ -120,7 +120,7 @@ void print_info(
     const int info_level
 );
 
-void process_task(
+int process_task(
     uint64_t task,
     int k,
     int ninputs,

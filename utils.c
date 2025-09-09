@@ -743,7 +743,7 @@ void print_info(const char *INFO_PATH, const int info_level) {
 }
 
 
-void process_task(
+int process_task(
     uint64_t task,
     int k,
     int ninputs,
@@ -832,8 +832,12 @@ void process_task(
 
 
         // allocate vectors of decimal numbers for the ON-set and OFF-set rows
-        int decpos[ON_minterms];
-        int decneg[OFF_minterms];
+        int *decpos = (int *) calloc((size_t)ON_minterms, sizeof(int));
+        int *decneg = (int *) calloc((size_t)OFF_minterms, sizeof(int));
+        if (!decpos || !decneg) {
+            fprintf(stderr, "Error: Memory allocation failed for decimal position arrays\n");
+            return 1;
+        }
 
         // create the vector of multiple bases, useful when calculating the decimal representation
         // of a particular combination of columns, for each row
@@ -844,6 +848,30 @@ void process_task(
         // 2, 3 and 2 values then mbase will be [1, 2, 6] from: 1, 1 * 2 = 2, 2 * 3 = 6
         for (int i = 1; i < k; i++) {
             mbase[i] = mbase[i - 1] * nofvalues[tempk[i - 1]];
+        }
+
+        // Compute the total number of potential PIs for this combination: T = prod(v_s)
+        int space_size = 1;
+        for (int i = 0; i < k; i++) {
+            space_size *= nofvalues[tempk[i]];
+        }
+        if (space_size < 1) space_size = 1;
+
+        // First pass: compute decpos for all ON rows (0 means invalid due to DC on selected inputs)
+        for (int r = 0; r < ON_minterms; r++) {
+            int acc = 0;
+            bool valid = true;
+
+            for (int c = 0; c < k; c++) {
+                int value = PInfo[o].ON_set[r * ninputs + tempk[c]];
+                if (value == 0) {
+                    valid = false;
+                    break;
+                }
+                acc += value * mbase[c];
+            }
+
+            decpos[r] = valid ? acc : 0;
         }
 
         // calculate decimal numbers, using mbase, fills in decpos and decneg
@@ -888,46 +916,29 @@ void process_task(
         int found = 0;
 
         for (int r = 0; r < ON_minterms; r++) {
-            bool valid_row = true;
-            int acc = 0;
-            for (int c = 0; c < k; c++) {
-                int value = PInfo[o].ON_set[r * ninputs + tempk[c]];
-                if (value == 0) {
-                    valid_row = false;
-                    break;
-                }
-                acc += value * mbase[c];
-            }
-            decpos[r] = acc;
-
-            if (!valid_row) continue;
+            if (found >= space_size) break; // Early stop: all potential PIs already found
+            if (decpos[r] == 0) continue;   // invalid row (has DC in selected inputs)
 
             int prev = 0;
-            // check if the row is unique
-            while (prev < found && valid_row) {
-                valid_row = decpos[possible_rows[prev]] != decpos[r];
+            // check if the row is unique among those already found
+            while (prev < found && decpos[possible_rows[prev]] != decpos[r]) {
                 prev++;
             }
-
-            if (!valid_row) continue;
+            if (prev < found) continue; // duplicate pattern
 
             // check if the row is different from any OFF-set row
+            bool valid_row = true;
             for (int roff = 0; roff < off_count; roff++) {
                 bool different = false;
                 if (dc_off_rows[unique_off_rows[roff]]) {
                     for (int c = 0; c < k; c++) {
                         int v_ON = PInfo[o].ON_set[r * ninputs + tempk[c]];
                         int v_OFF = PInfo[o].OFF_set[unique_off_rows[roff] * ninputs + tempk[c]];
-
-                        if (v_OFF != 0 && v_OFF != v_ON) {
-                            different = true;
-                            break;
-                        }
+                        if (v_OFF != 0 && v_OFF != v_ON) { different = true; break; }
                     }
                 } else {
                     different = decpos[r] != decneg[unique_off_rows[roff]];
                 }
-
                 if (!different) {
                     valid_row = false;
                     break;
@@ -936,9 +947,9 @@ void process_task(
 
             if (!valid_row) continue;
 
-            possible_rows[found] = r;
-            found++;
+            possible_rows[found++] = r;
             max_found++;
+            if (found >= space_size) break; // Guard also after increment
         }
 
         for (int f = 0; f < found; f++) {
@@ -1019,6 +1030,9 @@ void process_task(
             (*task_found)++;
 
         } // end of found loop
+
+        free(decpos);
+        free(decneg);
     } // end of outputs loop
 
     // Identify unique PIs across all outputs, and determine which are shared
@@ -1249,4 +1263,6 @@ void process_task(
         // Only reset the logical count; we overwrite used slots on the next iteration.
         buffer[tid][o].found = 0;
     }
+
+    return 0;
 }

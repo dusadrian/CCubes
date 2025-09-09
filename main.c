@@ -703,7 +703,7 @@ int main(int argc, char *argv[]) {
             }
 
             //------------------ BEGIN TASK PROCESSING ------------------
-            process_task(
+            int error = process_task(
                 task,
                 k,
                 ninputs,
@@ -720,6 +720,18 @@ int main(int argc, char *argv[]) {
                 increase,
                 &multiplier
             );
+
+            if (error) {
+                // Handle error
+                fprintf(stderr, "Error: process_task failed for task %lld at k=%d\n", task, k);
+                #ifdef _OPENMP
+                    #pragma omp critical
+                #endif
+                {
+                    time_up = true; // signal other threads to stop
+                }
+                continue;
+            }
             //------------------- END TASK PROCESSING -------------------
 
         } // end of tasks loop
