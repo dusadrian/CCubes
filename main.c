@@ -73,7 +73,9 @@ int main(int argc, char *argv[]) {
     char *RESUME_PATH = NULL;
     char *INFO_PATH = NULL; // -i: inspect checkpoint file
     int RESUME_K = -1;
-    bool RESUME_READY_FOR_COVERAGE = false;
+    // resume progress for current k
+    uint64_t RESUME_LAST_TASK = 0ull;
+    bool HAS_RESUME_LAST_TASK = false;
 
     if (argc < 2) {
         help();
@@ -236,20 +238,20 @@ int main(int argc, char *argv[]) {
     PIstorage *PInfo = NULL;
     int *nofvalues = NULL;
     int ninputs = 0, noutputs = 0, max_value = 0;
-    int *loaded_stopc = NULL; // resume: stop counters per output
+    int *chk_stop_counter = NULL; // resume: stop counters per output
     // Keep loaded bit parameters accessible outside the resume block
-    int loaded_value_bit_width_saved = 0;
-    int loaded_implicant_words_saved = 0;
+    int chk_value_bit_width_saved = 0;
+    int chk_implicant_words_saved = 0;
 
     // If resuming, load checkpoint before reading PLA
     if (RESUME_PATH) {
 
-        int loaded_bits = 0, loaded_value_bit_width = 0, loaded_implicant_words = 0;
-        int loaded_MAX_LEVELS=0, loaded_WEIGHT_PIC=0, loaded_SCP_TYPE=0, loaded_POOL_MAX=0, loaded_START_LEVEL=0;
-        char *loaded_src_path = NULL;
-        char *loaded_dst_path = NULL;
-        double _ck_elapsed_total = 0.0, _ck_elapsed_scp = 0.0;
-        uint64_t _ck_last_task = 0ull;
+        int chk_bits = 0, chk_value_bit_width = 0, chk_implicant_words = 0;
+        int chk_MAX_LEVELS=0, chk_WEIGHT_PIC=0, chk_SCP_TYPE=0, chk_POOL_MAX=0, chk_START_LEVEL=0;
+        char *chk_src_path = NULL;
+        char *chk_dst_path = NULL;
+        double chk_elapsed_total = 0.0, chk_elapsed_scp = 0.0;
+        uint64_t chk_last_task = 0ull;
 
         if (
             load_checkpoint(
@@ -257,22 +259,22 @@ int main(int argc, char *argv[]) {
                 &PInfo,
                 &ninputs,
                 &noutputs,
-                &loaded_bits,
-                &loaded_value_bit_width,
-                &loaded_implicant_words,
+                &chk_bits,
+                &chk_value_bit_width,
+                &chk_implicant_words,
                 &RESUME_K,
-                &loaded_stopc,
-                &loaded_MAX_LEVELS,
-                &loaded_WEIGHT_PIC,
-                &loaded_SCP_TYPE,
-                &loaded_POOL_MAX,
-                &loaded_START_LEVEL,
+                &chk_stop_counter,
+                &chk_MAX_LEVELS,
+                &chk_WEIGHT_PIC,
+                &chk_SCP_TYPE,
+                &chk_POOL_MAX,
+                &chk_START_LEVEL,
                 &nofvalues,
-                &loaded_src_path,
-                &loaded_dst_path,
-                &_ck_elapsed_total,
-                &_ck_elapsed_scp,
-                &_ck_last_task
+                &chk_src_path,
+                &chk_dst_path,
+                &chk_elapsed_total,
+                &chk_elapsed_scp,
+                &chk_last_task
             ) != 0
         ) {
             fprintf(stderr, "Error: failed to load checkpoint from %s\n", RESUME_PATH);
@@ -280,44 +282,46 @@ int main(int argc, char *argv[]) {
         }
 
         // If not overridden on CLI, adopt saved paths
-        if (!SRC_FILE && loaded_src_path) {
-            SRC_FILE = loaded_src_path; /* keep for later */
+        if (!SRC_FILE && chk_src_path) {
+            SRC_FILE = chk_src_path; /* keep for later */
         } else {
-            if (loaded_src_path) free(loaded_src_path);
+            if (chk_src_path) free(chk_src_path);
         }
 
-        if (!DST_FILE && loaded_dst_path) {
-            DST_FILE = loaded_dst_path;
+        if (!DST_FILE && chk_dst_path) {
+            DST_FILE = chk_dst_path;
         } else {
-            if (loaded_dst_path) free(loaded_dst_path);
+            if (chk_dst_path) free(chk_dst_path);
         }
 
-        BITS_PER_WORD = loaded_bits;
-        MAX_LEVELS = loaded_MAX_LEVELS;
-        WEIGHT_PIC = loaded_WEIGHT_PIC;
-        SCP_TYPE = loaded_SCP_TYPE;
-        POOL_MAX = loaded_POOL_MAX;
-        loaded_value_bit_width_saved = loaded_value_bit_width;
-        loaded_implicant_words_saved = loaded_implicant_words;
+        BITS_PER_WORD = chk_bits;
+        MAX_LEVELS = chk_MAX_LEVELS;
+        WEIGHT_PIC = chk_WEIGHT_PIC;
+        SCP_TYPE = chk_SCP_TYPE;
+        POOL_MAX = chk_POOL_MAX;
+        chk_value_bit_width_saved = chk_value_bit_width;
+        chk_implicant_words_saved = chk_implicant_words;
 
         // Resume timing bases
-        BASE_ELAPSED = _ck_elapsed_total;
-        BASE_SCP = _ck_elapsed_scp;
+        BASE_ELAPSED = chk_elapsed_total;
+        BASE_SCP = chk_elapsed_scp;
 
-        // Resume will start at the saved k (coverage stage)
+        // Resume will start at the saved k
         START_LEVEL = RESUME_K;
-        RESUME_READY_FOR_COVERAGE = true;
-        // Persist loaded widths for later use
-        // We'll set value_bit_width and implicant_words to these after computing max_value for non-resume
-        // loaded_stopc will be applied after stop_counter allocation below
-        // (do not free here)
-        // Store in temporary globals via static locals is not needed; we'll assign below
-        // To do so, we'll place them in file-scope variables here with shadowless names via statements below
-        // We'll encode them into placeholders for later assignment by duplicating code blocks
-        // (actual assignment is performed after PLA read below)
-        // We cannot assign to undeclared value_bit_width yet, so remember via local variables in this block scope
-        // We'll use them immediately below when deciding widths
-        // To achieve that we will declare and set dedicated flags outside this block
+        // carry forward last_task information for this k
+        RESUME_LAST_TASK = chk_last_task;
+        HAS_RESUME_LAST_TASK = true;
+
+        // Loaded widths are kept for later use
+	    // value_bit_width and implicant_words are set after computing max_value in non-resume mode
+	    // chk_stop_counter is applied after stop_counter allocation (not to be freed here)
+	    // No need to store in temporary globals or static locals; assignment occurs later
+	    // Variables are placed at file scope under names that do not conflict with others
+	    // Values are kept in placeholders for later assignment through duplicated code blocks
+        // (actual assignment happens after PLA read)
+	    // Since value_bit_width is not yet declared, values are stored in local variables within this block
+	    // These local values are used immediately when determining widths
+	    // Dedicated flags are declared and set outside this block to support this process
     }
 
 
@@ -340,7 +344,13 @@ int main(int argc, char *argv[]) {
     // Determine value bit width and implicant words
     int value_bit_width = 1; // default minimum
     int implicant_words = 0;
-    if (!RESUME_PATH) {
+
+    if (RESUME_PATH) {
+        // Use exactly the saved widths from the checkpoint
+        value_bit_width = chk_value_bit_width_saved;
+        implicant_words = chk_implicant_words_saved;
+        // BITS_PER_WORD was already set from the checkpoint above
+    } else {
         // Compute from input domain: values are encoded as 0..max_value, inclusive
         int bits_needed = (int)ceil(log2((double)(max_value + 1)));
         if (bits_needed < 1) bits_needed = 1;
@@ -351,11 +361,6 @@ int main(int argc, char *argv[]) {
             BITS_PER_WORD = value_bit_width; // Adjust the bits per word
         }
         implicant_words = (ninputs * value_bit_width + BITS_PER_WORD - 1) / BITS_PER_WORD;
-    } else {
-        // Use exactly the saved widths from the checkpoint
-        value_bit_width = loaded_value_bit_width_saved;
-        implicant_words = loaded_implicant_words_saved;
-        // BITS_PER_WORD was already set from the checkpoint above
     }
 
     uint64_t VALUE_BIT_MASK = (1ULL << value_bit_width) - 1ULL;
@@ -514,8 +519,8 @@ int main(int argc, char *argv[]) {
         }
 
         // If resuming, restore stop counter from checkpoint
-        if (loaded_stopc) {
-            stop_counter[o] = loaded_stopc[o];
+        if (chk_stop_counter) {
+            stop_counter[o] = chk_stop_counter[o];
         } else {
             stop_counter[o] = 0;
         }
@@ -541,10 +546,12 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
-
     }
 
-    if (loaded_stopc) { free(loaded_stopc); loaded_stopc = NULL; }
+    if (chk_stop_counter) {
+        free(chk_stop_counter);
+        chk_stop_counter = NULL;
+    }
 
     // allocate memory buffer for each thread
     for (int t = 0; t < THREADS; t++) {
@@ -616,6 +623,16 @@ int main(int argc, char *argv[]) {
         volatile bool time_up = false;
         double time_up_elapsed = 0.0;
         uint64_t last_task_reached = 0ull;
+        uint64_t resume_last_task_local = 0ull;
+        uint64_t start_task = 0ull;
+
+        if (RESUME_PATH && HAS_RESUME_LAST_TASK && RESUME_K == k) {
+            resume_last_task_local = RESUME_LAST_TASK;
+            last_task_reached = resume_last_task_local;
+            start_task = resume_last_task_local + 1ull;
+            if (start_task > maxtasks) start_task = maxtasks; // safety
+        }
+
         if (maxtasks == 0) {
             // overflow, too many tasks
             cleanup(PInfo, buffer);
@@ -629,17 +646,16 @@ int main(int argc, char *argv[]) {
         }
 
         // Parallelize tasks loop with thread-local buffer buffers (see buffer[tid][o])
-        if (!(RESUME_READY_FOR_COVERAGE && RESUME_K == k)) {
         #ifdef _OPENMP
             #pragma omp parallel for if(THREADS > 1) schedule(static, 1) shared(time_up, time_up_elapsed, last_task_reached)
         #endif
-        for (uint64_t task = 0; task < maxtasks; task++) {
+        for (uint64_t task = start_task; task < maxtasks; task++) {
 
             #ifdef _OPENMP
-            if (time_up) {
-                #pragma omp cancellation point for
-                continue;
-            }
+                if (time_up) {
+                    #pragma omp cancellation point for
+                    continue;
+                }
             #endif
 
             int tid = 0;
@@ -666,7 +682,7 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         #ifdef _OPENMP
-                        #pragma omp cancel for
+                            #pragma omp cancel for
                         #endif
                     }
                 }
@@ -1170,9 +1186,8 @@ int main(int argc, char *argv[]) {
             }
 
         } // end of tasks loop
-        RESUME_READY_FOR_COVERAGE = false; // only skip once
-        }
 
+        HAS_RESUME_LAST_TASK = false; // reset for the next k-level
 
         // Time-limit checkpoint (post-loop or early-cancel)
         if (TIME_LIMIT_SEC > 0 && time_up) {

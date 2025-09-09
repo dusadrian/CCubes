@@ -24,7 +24,9 @@ There is a minimal help system integrated into CCubes. Users can enable debug ou
 
 The debug levels are preliminary, and more detailed logging functionality will be added in the future.
 
-For very large problem instances, CCubes can save its state into a binary checkpoint file and exit, when a certain `-t` time limit is reached. The process can be resumed later from the checkpoint file, allowing users to continue the minimization process without re-specifying the input and output files. Even when `-r` resuming from a checkpoint, a further successive time limit can be specified to save another intermediate checkpoint. If the binary checkpoint file is not specified, it will default to `chk_<basename(source)>.bin`.Preliminary tests show that creating intermediate checkpoints more than double the performance in execution time, likely because of memory allocations.
+For very large problem instances, CCubes can save its state into a binary checkpoint file and exit, when a certain `-t` time limit is reached. The process can be resumed later from the checkpoint file, allowing users to continue the minimization process without re-specifying the input and output files. If the binary checkpoint file is not specified, it will default to `chk_<basename(source)>.bin`. Even when `-r`esuming from a checkpoint, a further time limit can be specified to save another intermediate checkpoint, and the binary checkpoint file will be overwritten unless specifying a different one.
+
+The binary checkpoint file can be inspected using the `-i` option with various progress information in the metadata.
 
 Compile the binary according to your system using `make`, with various options and customization indicated in the Makefile.
 
