@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <stdalign.h> // For alignof
 
+#include "debug.h"
+
 void error_message(const char *msg);
 
 // Readable type identifiers
@@ -85,7 +87,9 @@ void resize(
     int nrows
 );
 
-void trim_whitespace(char *str);
+void trim_whitespace(
+    char *str
+);
 
 void read_pla_file(
     const char *filename,
@@ -96,12 +100,42 @@ void read_pla_file(
     int *max_value
 );
 
-void write_pla_file(const char *filename, PIstorage *PInfo);
+void write_pla_file(
+    const char *filename,
+    PIstorage *PInfo
+);
 
-void cleanup(PIstorage *PInfo, ThreadBuffer **buffer);
+void cleanup(
+    PIstorage *PInfo,
+    ThreadBuffer **buffer
+);
 
-char *prefix_basename(const char *filepath, const char *prefix);
+char *prefix_basename(
+    const char *filepath,
+    const char *prefix
+);
 
-void print_info(const char *path);
+void print_info(
+    const char *path,
+    const int info_level
+);
+
+void process_task(
+    uint64_t task,
+    int k,
+    int ninputs,
+    int noutputs,
+    int *nofvalues,
+    int *bit_index,
+    int *word_index,
+    uint64_t *shifted_mask,
+    int implicant_words,
+    PIstorage *PInfo,
+    ThreadBuffer **buffer,
+    int tid,
+    int *max_shared,
+    int increase,
+    int *multiplier
+);
 
 #endif // UTILS_H
