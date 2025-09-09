@@ -527,14 +527,27 @@ int main(int argc, char *argv[]) {
         }
 
         // store the number of PIs at each level of complexity k
-        PInfo[o].nofpi = (int *) calloc(ninputs, sizeof(int));
         if (!PInfo[o].nofpi) {
-            fprintf(stderr, "Error: Memory allocation failed for nofpi array\n");
-            cleanup(PInfo, buffer);
-            return 1;
+            PInfo[o].nofpi = (int *) calloc(ninputs, sizeof(int));
+            if (!PInfo[o].nofpi) {
+                fprintf(stderr, "Error: Memory allocation failed for nofpi array\n");
+                cleanup(PInfo, buffer);
+                return 1;
+            }
         }
 
-        PInfo[o].stop_search = ON_minterms == 0; // if there are no ON-set minterms, then stop searching for PIs
+        // Preserve stop status when resuming; otherwise initialize based on ON-set emptiness
+        if (!RESUME_PATH) {
+            PInfo[o].stop_search = ON_minterms == 0; // if there are no ON-set minterms, then stop searching for PIs
+        } else {
+            // Derive from stop_counter if available; otherwise keep loaded value
+            bool derived_stop = false;
+            // stop_counter[] is set above from chk_stop_counter if present
+            if (o >= 0 && o < noutputs) {
+                derived_stop = (stop_counter[o] >= MAX_LEVELS);
+            }
+            if (derived_stop) PInfo[o].stop_search = true;
+        }
 
         PInfo[o].solution = NULL;
         PInfo[o].pool_count = 0;

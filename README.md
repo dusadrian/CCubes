@@ -55,6 +55,8 @@ Options:
                           2 everything (trace)
   -t<sec>[=<file>]    : time limit after which a checkpoint will be saved to <file>
   -r=<file>           : resume from checkpoint file
-  -i=<file>           : inspect checkpoint (print progress and metadata)
+  -i<level>=<file>    : inspect checkpoint (print progress and metadata)
+                          0 (default) progress report
+                          1 complete metadata about each output
   -h, --help          : show this help message
 ```
