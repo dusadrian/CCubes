@@ -1762,8 +1762,6 @@ int main(int argc, char *argv[]) {
     }
 
     write_pla_file(DST_FILE, PInfo);
-    fprintf(stderr, "Output written to %s\n", DST_FILE);
-
 
     // Free allocated memory
     cleanup(PInfo, buffer);
