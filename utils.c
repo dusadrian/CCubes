@@ -318,8 +318,8 @@ void read_pla_file(
     *ninputs = inputs;
     *noutputs = outputs;
 
-    // Allocate ON_sets and OFF_sets
-    *PInfo = malloc(outputs * sizeof(PIstorage));
+    // Allocate and zero-initialize PIstorage array to ensure all fields start as NULL/0
+    *PInfo = (PIstorage *)calloc((size_t)outputs, sizeof(PIstorage));
     if (!*PInfo) {
         printf("Error: Memory allocation failed for PInfo\n");
         free(ON_minterms);
@@ -328,7 +328,7 @@ void read_pla_file(
         return;
     }
 
-    // Initialize all pointers to NULL for safe cleanup
+    // Pointers are already NULL due to calloc; explicitly set only those we immediately use below
     for (int o = 0; o < outputs; o++) {
         (*PInfo)[o].ON_set = NULL;
         (*PInfo)[o].OFF_set = NULL;
@@ -857,7 +857,14 @@ int process_task(
         }
         if (space_size < 1) space_size = 1;
 
+        // Sum of mixed-radix bases (for normalizing decpos to 0..T-1 when values are 1..v)
+        int mbase_sum = 0;
+        for (int i = 0; i < k; i++) {
+            mbase_sum += mbase[i];
+        }
+
         // First pass: compute decpos for all ON rows (0 means invalid due to DC on selected inputs)
+        // TODO: explore the potential of DC values compared to the OFF-set rows
         for (int r = 0; r < ON_minterms; r++) {
             int acc = 0;
             bool valid = true;
@@ -885,6 +892,10 @@ int process_task(
             dc_off_rows[r] = false;
         }
 
+        // OFF-set O(1) dedup using the same mbase and space_size as ON-set
+        bool *off_seen = (bool*)calloc((size_t)space_size, sizeof(bool));
+        bool use_off_seen = (off_seen != NULL);
+
         for (int r = 0; r < OFF_minterms; r++) {
             int acc = 0;
             bool has_dc = false;
@@ -898,33 +909,64 @@ int process_task(
             decneg[r] = acc;
             dc_off_rows[r] = has_dc;
 
-            // uniqueness check
-            bool unique = true;
-            for (int prev = 0; prev < off_count; prev++) {
-                if (decneg[unique_off_rows[prev]] == acc) {
-                    unique = false;
-                    break;
+            size_t off_index = (size_t)acc; // normalized index in 0..space_size-1
+
+            // O(1) uniqueness check using off_index; fallback to O(n) if allocation failed
+            if (use_off_seen && off_index < (size_t)space_size) {
+                if (off_seen[off_index]) {
+                    continue; // duplicate OFF row pattern
+                }
+
+                off_seen[off_index] = true;
+                unique_off_rows[off_count++] = r;
+            } else {
+                bool unique = true;
+                for (int prev = 0; prev < off_count; prev++) {
+                    if (decneg[unique_off_rows[prev]] == acc) {
+                        unique = false;
+                        break;
+                    }
+                }
+
+                if (unique) {
+                    unique_off_rows[off_count++] = r;
                 }
             }
-            if (unique) {
-                unique_off_rows[off_count++] = r;
-            }
         }
+
+        if (off_seen) free(off_seen);
 
 
         int possible_rows[ON_minterms];
         int found = 0;
 
+        // Use a visited set keyed by normalized decpos (0..space_size - 1) to skip duplicates
+        bool *pos_seen = (bool*)calloc((size_t)space_size, sizeof(bool));
+        // If allocation fails, we fallback to scanning duplicates (unlikely and still safe)
+        bool use_seen = (pos_seen != NULL);
+
         for (int r = 0; r < ON_minterms; r++) {
             if (found >= space_size) break; // Early stop: all potential PIs already found
             if (decpos[r] == 0) continue;   // invalid row (has DC in selected inputs)
 
-            int prev = 0;
-            // check if the row is unique among those already found
-            while (prev < found && decpos[possible_rows[prev]] != decpos[r]) {
-                prev++;
+            int dec_norm = decpos[r] - mbase_sum;
+            if (use_seen && dec_norm >= 0 && dec_norm < space_size && pos_seen[dec_norm]) {
+                continue; // duplicate pattern already seen
             }
-            if (prev < found) continue; // duplicate pattern
+
+            if (!use_seen) {
+                // O(n) fallback: check previously selected rows for duplicate decpos
+                bool duplicate = false;
+
+                for (int prev = 0; prev < found; prev++) {
+                    if (decpos[possible_rows[prev]] == decpos[r]) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+
+                if (duplicate) continue;
+            }
 
             // check if the row is different from any OFF-set row
             bool valid_row = true;
@@ -933,8 +975,13 @@ int process_task(
                 if (dc_off_rows[unique_off_rows[roff]]) {
                     for (int c = 0; c < k; c++) {
                         int v_ON = PInfo[o].ON_set[r * ninputs + tempk[c]];
+
                         int v_OFF = PInfo[o].OFF_set[unique_off_rows[roff] * ninputs + tempk[c]];
-                        if (v_OFF != 0 && v_OFF != v_ON) { different = true; break; }
+
+                        if (v_OFF != 0 && v_OFF != v_ON) {
+                            different = true;
+                            break;
+                        }
                     }
                 } else {
                     different = decpos[r] != decneg[unique_off_rows[roff]];
@@ -949,8 +996,17 @@ int process_task(
 
             possible_rows[found++] = r;
             max_found++;
-            if (found >= space_size) break; // Guard also after increment
+
+            if (use_seen && dec_norm >= 0 && dec_norm < space_size) {
+                pos_seen[dec_norm] = true;
+            }
+
+            if (found >= space_size) {
+                break; // Guard also after increment
+            }
         }
+
+        if (pos_seen) free(pos_seen);
 
         for (int f = 0; f < found; f++) {
             // using bit shifting, store the fixed bits and value bits
