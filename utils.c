@@ -8,6 +8,7 @@
 
 #include "utils.h"
 #include "checkpoint.h"
+#include <assert.h>
 
 void error_message(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -897,6 +898,8 @@ int process_task(
         bool use_off_seen = (off_seen != NULL);
 
         for (int r = 0; r < OFF_minterms; r++) {
+            if (off_count >= space_size) break;
+
             int acc = 0;
             bool has_dc = false;
 
@@ -910,6 +913,7 @@ int process_task(
             dc_off_rows[r] = has_dc;
 
             size_t off_index = (size_t)acc; // normalized index in 0..space_size-1
+            assert(off_index < (size_t)space_size);
 
             // O(1) uniqueness check using off_index; fallback to O(n) if allocation failed
             if (use_off_seen && off_index < (size_t)space_size) {
@@ -936,6 +940,12 @@ int process_task(
 
         if (off_seen) free(off_seen);
 
+        // If the OFF-set already spans the entire space, no ON row can be valid
+        if (off_count >= space_size) {
+            free(decpos);
+            free(decneg);
+            continue; // next output
+        }
 
         int possible_rows[ON_minterms];
         int found = 0;
@@ -949,12 +959,13 @@ int process_task(
             if (found >= space_size) break; // Early stop: all potential PIs already found
             if (decpos[r] == 0) continue;   // invalid row (has DC in selected inputs)
 
-            int dec_norm = decpos[r] - mbase_sum;
-            if (use_seen && dec_norm >= 0 && dec_norm < space_size && pos_seen[dec_norm]) {
+            size_t on_index = (size_t)(decpos[r] - mbase_sum);
+            assert(on_index < (size_t)space_size);
+
+            if (use_seen && on_index < (size_t)space_size && pos_seen[on_index]) {
                 continue; // duplicate pattern already seen
             }
-
-            if (!use_seen) {
+            if (!use_seen || on_index >= (size_t)space_size) {
                 // O(n) fallback: check previously selected rows for duplicate decpos
                 bool duplicate = false;
 
@@ -997,12 +1008,12 @@ int process_task(
             possible_rows[found++] = r;
             max_found++;
 
-            if (use_seen && dec_norm >= 0 && dec_norm < space_size) {
-                pos_seen[dec_norm] = true;
+            if (use_seen && on_index < (size_t)space_size) {
+                pos_seen[on_index] = true;
             }
 
             if (found >= space_size) {
-                break; // Guard also after increment
+                break; // also guard after increment
             }
         }
 
