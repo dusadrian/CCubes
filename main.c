@@ -1,10 +1,10 @@
 /*
- * Copyright (c) 2016–2025, Adrian Dusa
- * All rights reserved.
- *
- * License: Academic Non-Commercial License (see LICENSE file for details).
- * SPDX-License-Identifier: LicenseRef-ANCL-AdrianDusa
- */
+    Copyright (c) 2016–2025, Adrian Dusa
+    All rights reserved.
+
+    License: Academic Non-Commercial License (see LICENSE file for details).
+    SPDX-License-Identifier: LicenseRef-ANCL-AdrianDusa
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +38,10 @@ void help() {
     printf("                         1 errors + warnings + info\n");
     printf("                         2 everything (trace)\n");
     printf("  -p<number>         : decide from a pool of up to <number> equally optimal solutions\n");
-    printf("  -t<sec>[=<file>]   : time limit; save checkpoint and exit; when resuming, defaults to overwriting the -r file\\n");
+    printf("  -f[level]          : (experimental) fast filtering of prime implicants during generation\n");
+    printf("                         0 (default) disabled\n");
+    printf("                         1..3 increasing aggressiveness\n");
+    printf("  -t<sec>[=<file>]   : time limit to save a checkpoint in the <file>\n");
     printf("  -r=<file>          : resume from checkpoint file\n");
     printf("  -i<level>=<file>   : inspect checkpoint (print progress and metadata)\n");
     printf("                         0 (default) progress report\n");
@@ -65,9 +68,11 @@ int main(int argc, char *argv[]) {
     int MAX_LEVELS = 1;
     int BITS_PER_WORD = 64;
     int THREADS = 0; // max by default, if OpenMP enabled
+    bool THREADS_FORCED = false; // set to true if -c is provided
     int WEIGHT_PIC = 1;
     int SCP_TYPE = 0;
     int POOL_MAX = 1; // collect up to this many solutions
+    int FAST_FILTER_LEVEL = 0; // 0 disabled; 1..3 increasing aggressiveness
     char *SRC_FILE = NULL;
     char *DST_FILE = NULL;
     // resume timing bases
@@ -120,6 +125,7 @@ int main(int argc, char *argv[]) {
         } else if (strncmp(argv[i], "-c", 2) == 0) {
             THREADS = atoi(argv[i] + 2);
             if (THREADS < 0) THREADS = 0;
+            THREADS_FORCED = true;
         } else if (strncmp(argv[i], "-d", 2) == 0) {
             char *opt = argv[i] + 2;  // string after "-d"
             char *eq  = strchr(opt, '=');
@@ -147,6 +153,19 @@ int main(int argc, char *argv[]) {
         } else if (strncmp(argv[i], "-p", 2) == 0) {
             POOL_MAX = atoi(argv[i] + 2);
             if (POOL_MAX < 1) POOL_MAX = 1;
+        } else if (strncmp(argv[i], "-f", 2) == 0) {
+            // Fast preselection of PIs; optional level after -f
+            if (argv[i][2] == '\0') {
+                FAST_FILTER_LEVEL = 1; // default
+            } else {
+                FAST_FILTER_LEVEL = atoi(argv[i] + 2);
+            }
+
+            if (FAST_FILTER_LEVEL < 1 || FAST_FILTER_LEVEL > 3) {
+                fprintf(stderr, "Invalid fast filter level: %d (must be 1, 2, or 3)\n", FAST_FILTER_LEVEL);
+                help();
+                return 1;
+            }
         } else if (strncmp(argv[i], "-t", 2) == 0) {
             char *opt = argv[i] + 2;  // string after "-t"
             char *eq  = strchr(opt, '=');
@@ -387,16 +406,24 @@ int main(int argc, char *argv[]) {
 
     #ifdef _OPENMP
         int num_procs = omp_get_num_procs();
-        // In debug mode, force single-thread for safety
-        // if (debug_enabled) { // set in debug.c
-        //     THREADS = 1;
-        // }
-        if (THREADS <= 0 || THREADS > num_procs) {
-            THREADS = num_procs; // default to max available threads
+        // Disable dynamic adjustment so requested thread count is honored
+        omp_set_dynamic(0);
+
+        if (THREADS_FORCED) {
+            if (THREADS < 1) THREADS = 1;          // minimum 1 when forced
+            if (THREADS > num_procs) THREADS = num_procs; // cap to available cores
+            omp_set_num_threads(THREADS);
+            // Do NOT override THREADS with omp_get_max_threads(); respect user request
+        } else {
+            // Auto mode: use max available if not specified or out of range
+            if (THREADS <= 0 || THREADS > num_procs) {
+                THREADS = num_procs;
+            }
+            omp_set_num_threads(THREADS);
+            // Reflect runtime decision (some runtimes clamp values); informational only
+            int rt_threads = omp_get_max_threads();
+            if (rt_threads > 0) THREADS = rt_threads;
         }
-        omp_set_num_threads(THREADS);// honor runtime decisions; ensure we size buffers to actual threads
-        int rt_threads = omp_get_max_threads();
-        if (rt_threads > 0) THREADS = rt_threads;
     #endif
 
     if (THREADS == 0) { // which means OpenMP was not detected
@@ -718,7 +745,8 @@ int main(int argc, char *argv[]) {
                 tid,
                 &max_shared,
                 increase,
-                &multiplier
+                &multiplier,
+                FAST_FILTER_LEVEL
             );
 
             if (error) {

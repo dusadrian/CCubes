@@ -1,10 +1,10 @@
 /*
- * Copyright (c) 2016–2025, Adrian Dusa
- * All rights reserved.
- *
- * License: Academic Non-Commercial License (see LICENSE file for details).
- * SPDX-License-Identifier: LicenseRef-ANCL-AdrianDusa
- */
+    Copyright (c) 2016–2025, Adrian Dusa
+    All rights reserved.
+
+    License: Academic Non-Commercial License (see LICENSE file for details).
+    SPDX-License-Identifier: LicenseRef-ANCL-AdrianDusa
+*/
 
 #include "lagrangian.h"
 #ifdef _OPENMP
@@ -740,11 +740,39 @@ void solve_scp_lagrangian(
     }
 
     /* Heuristic and subgradient parameters (tunable) */
-    const int max_iter = 5000;           /* total iterations of subgradient */
-    const int heur_every = 3;            /* construct a feasible solution every N iterations */
-    double step_coef = 1.5;              /* initial step coefficient */
-    const double step_min = 0.005;       /* minimal step coefficient */
-    const int halve_period = 8;          /* halve step if no progress for this many iterations */
+    int max_iter = 5000;            /* total iterations of subgradient */
+    int heur_every = 2;             /* construct a feasible solution every N iterations (tuned default) */
+    double step_coef = 1.5;         /* initial step coefficient */
+    double step_min = 0.005;        /* minimal step coefficient */
+    int halve_period = 8;           /* halve step if no progress for this many iterations */
+
+    /* Environment overrides (for tuning/experiments) */
+    const char *s_env = NULL;
+    s_env = getenv("CCUBES_LAGR_MAX_ITER");
+    if (s_env) {
+        long v = strtol(s_env, NULL, 10);
+        if (v > 10 && v < 50000000) max_iter = (int)v;
+    }
+    s_env = getenv("CCUBES_LAGR_HEUR_EVERY");
+    if (s_env) {
+        long v = strtol(s_env, NULL, 10);
+        if (v >= 1 && v < 10000) heur_every = (int)v;
+    }
+    s_env = getenv("CCUBES_LAGR_STEP_COEF");
+    if (s_env) {
+        double v = strtod(s_env, NULL);
+        if (v > 0.0 && v < 1000.0) step_coef = v;
+    }
+    s_env = getenv("CCUBES_LAGR_STEP_MIN");
+    if (s_env) {
+        double v = strtod(s_env, NULL);
+        if (v > 0.0 && v < step_coef) step_min = v;
+    }
+    s_env = getenv("CCUBES_LAGR_HALVE_PERIOD");
+    if (s_env) {
+        long v = strtol(s_env, NULL, 10);
+        if (v >= 1 && v < 10000) halve_period = (int)v;
+    }
 
     /* Initialize multipliers to unit cost */
     for (int i = 0; i < rows; ++i) {

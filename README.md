@@ -16,6 +16,8 @@ Two weighting options are available, for instance the default `-w1` for weight b
 
 The option `-p` aims to spend additional time collecting a pool of possible solutions from the solver and decide which solution is best by comparing their shared prime implicants with those from the other outputs. Activating this parameter to more than 1 solutions will automatically set the weighting to `-w2`. Its rationale is that the solver may select different shared prime implicants, even though all have an equal (weighted) contribution to optimality.
 
+An experimental switch `-f` enables some filtering of prime implicants during their generation, by quickly discarding those that are less likely to contribute to the final solution. This can significantly speed up the minimization process, especially for large problem instances with many variables and outputs. However, it may also lead to suboptimal solutions in some cases, as some potentially useful prime implicants might be filtered out. Users should experiment with different levels of filtering (1 to 3) to find a balance between speed and solution quality that suits their specific needs.
+
 Unlike other minimizers like Espresso (usually single threaded), CCubes is scalable and can handle larger problem instances more efficiently. Where possible, it will use a parallel search process using available CPU cores. Theoretically, its scalability can be extended to distributed computing environments, allowing it to tackle even larger instances by using multiple machines.
 
 For parallel search it uses OpenMP, which users need to make sure it is installed and linked at compile time.
@@ -48,12 +50,15 @@ Options:
   -s<number>          : how to solve the covering problem:
                           0 (default) Lagrangian relaxation heuristic
                           1 Gurobi exact
-  -p<number>          : decide from a pool of up to <number> equally optimal solutions
   -d<level>[=<file>]  : incremental debug information
                           0 (default) errors + warnings
                           1 errors + warnings + info
                           2 everything (trace)
-  -t<sec>[=<file>]    : time limit after which a checkpoint will be saved to <file>
+  -p<number>          : decide from a pool of up to <number> equally optimal solutions
+  -f[level]           : (experimental) fast filtering of prime implicants during generation
+                          0 (default) disabled
+                          1..3 increasing aggressiveness
+  -t<sec>[=<file>]    : time limit to save a checkpoint in the <file>
   -r=<file>           : resume from checkpoint file
   -i<level>=<file>    : inspect checkpoint (print progress and metadata)
                           0 (default) progress report
