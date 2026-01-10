@@ -626,6 +626,296 @@ static double solution_total_weight(const int *sol, int sol_len, const double *w
     return s;
 }
 
+static int lagr_local_passes_from_env(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    int def = 10;
+    const char *env = getenv("CCUBES_LAGR_LOCAL_PASSES");
+    if (env) {
+        long v = strtol(env, NULL, 10);
+        if (v >= 0 && v < 100000000) {
+            cached = (int)v;
+            return cached;
+        }
+    }
+    cached = def;
+    return cached;
+}
+
+/* Proxy for acceptance: if weights exist, use their sum; else use coverage volume as a cheap heuristic */
+static double solution_proxy_value(
+    const int *sol,
+    int sol_len,
+    const double *weights,
+    const int *rowsCoveredCount
+) {
+    if (!sol || sol_len <= 0) return 0.0;
+    double v = 0.0;
+    if (weights) {
+        for (int i = 0; i < sol_len; ++i) v += weights[sol[i]];
+    } else if (rowsCoveredCount) {
+        for (int i = 0; i < sol_len; ++i) v += (double)rowsCoveredCount[sol[i]];
+    }
+    return v;
+}
+
+/* Local search: try drop-1 + greedy repair + prune; accept only if shorter */
+static void local_search_drop1_repair(
+    int rows,
+    int cols,
+    int **rowsCovered,
+    int *rowsCoveredCount,
+    int **colsCovering,
+    int *colsCoveringCount,
+    const double *lagr_score,
+    const double *weights,
+    int *sol,
+    int *sol_len,
+    int max_passes
+) {
+    if (!sol || !sol_len || *sol_len <= 1) return;
+    if (max_passes <= 0) return;
+
+    const double PROXY_EPS = 1e-12;
+    double curr_proxy = solution_proxy_value(sol, *sol_len, weights, rowsCoveredCount);
+
+    bool *rowCovered = (bool*)malloc((size_t)rows * sizeof(bool));
+    unsigned char *colSelected = (unsigned char*)calloc((size_t)cols, 1);
+    int *cand = (int*)malloc((size_t)cols * sizeof(int));
+    if (!rowCovered || !colSelected || !cand) {
+        free(rowCovered);
+        free(colSelected);
+        free(cand);
+        return;
+    }
+
+    for (int pass = 0; pass < max_passes; ++pass) {
+        int improved = 0;
+
+        for (int drop_idx = 0; drop_idx < *sol_len; ++drop_idx) {
+            int cand_len = 0;
+            memset(colSelected, 0, (size_t)cols);
+
+            for (int i = 0; i < *sol_len; ++i) {
+                if (i == drop_idx) continue;
+                int c = sol[i];
+                cand[cand_len++] = c;
+                colSelected[c] = 1;
+            }
+
+            memset(rowCovered, 0, (size_t)rows * sizeof(bool));
+            int covered = 0;
+            for (int i = 0; i < cand_len; ++i) {
+                int c = cand[i];
+                for (int k = 0; k < rowsCoveredCount[c]; ++k) {
+                    int r = rowsCovered[c][k];
+                    if (!rowCovered[r]) { rowCovered[r] = true; covered++; }
+                }
+            }
+
+            while (covered < rows) {
+                int r0 = -1;
+                for (int r = 0; r < rows; ++r) {
+                    if (!rowCovered[r]) { r0 = r; break; }
+                }
+                if (r0 < 0) break;
+
+                int best = -1, bestNew = -1;
+                double bestLS = DBL_MAX, bestW = -DBL_MAX;
+
+                for (int kk = 0; kk < colsCoveringCount[r0]; ++kk) {
+                    int c = colsCovering[r0][kk];
+                    if (colSelected[c]) continue;
+
+                    int newCover = 0;
+                    for (int k = 0; k < rowsCoveredCount[c]; ++k) {
+                        int rr = rowsCovered[c][k];
+                        if (!rowCovered[rr]) newCover++;
+                    }
+                    if (newCover <= 0) continue;
+
+                    double ls = lagr_score ? lagr_score[c] : 0.0;
+                    double w  = weights ? weights[c] : 0.0;
+
+                    bool better = false;
+                    if (newCover > bestNew) better = true;
+                    else if (newCover == bestNew) {
+                        if (ls < bestLS) better = true;
+                        else if (fabs(ls - bestLS) <= EPS) {
+                            if (w > bestW) better = true;
+                            else if (fabs(w - bestW) <= EPS) {
+                                if (best == -1 || c < best) better = true;
+                            }
+                        }
+                    }
+
+                    if (better) {
+                        best = c; bestNew = newCover; bestLS = ls; bestW = w;
+                    }
+                }
+
+                if (best < 0) { cand_len = -1; break; }
+
+                colSelected[best] = 1;
+                cand[cand_len++] = best;
+                for (int k = 0; k < rowsCoveredCount[best]; ++k) {
+                    int rr = rowsCovered[best][k];
+                    if (!rowCovered[rr]) { rowCovered[rr] = true; covered++; }
+                }
+            }
+
+            if (cand_len <= 0 || cand_len > *sol_len) continue;
+
+            prune_redundancy(rows, rowsCovered, rowsCoveredCount, cand, &cand_len);
+
+            if (cand_len > 0 && cand_len <= *sol_len) {
+                double cand_proxy = solution_proxy_value(cand, cand_len, weights, rowsCoveredCount);
+                /* Accept if proxy strictly improves, even for equal length (swap), or for shorter */
+                if (cand_proxy > curr_proxy + PROXY_EPS) {
+                    memcpy(sol, cand, (size_t)cand_len * sizeof(int));
+                    *sol_len = cand_len;
+                    curr_proxy = cand_proxy;
+                    improved = 1;
+                    break; /* restart after improvement */
+                }
+            }
+        }
+
+        if (!improved) break;
+    }
+
+    free(rowCovered);
+    free(colSelected);
+    free(cand);
+}
+
+/* Local search: drop-2 + greedy repair + prune; accept only if shorter */
+static void local_search_drop2_repair(
+    int rows,
+    int cols,
+    int **rowsCovered,
+    int *rowsCoveredCount,
+    int **colsCovering,
+    int *colsCoveringCount,
+    const double *lagr_score,
+    const double *weights,
+    int *sol,
+    int *sol_len,
+    int max_passes
+) {
+    if (!sol || !sol_len || *sol_len <= 2) return;
+    if (max_passes <= 0) return;
+
+    bool *rowCovered = (bool*)malloc((size_t)rows * sizeof(bool));
+    unsigned char *colSelected = (unsigned char*)calloc((size_t)cols, 1);
+    int *cand = (int*)malloc((size_t)cols * sizeof(int));
+    if (!rowCovered || !colSelected || !cand) {
+        free(rowCovered);
+        free(colSelected);
+        free(cand);
+        return;
+    }
+
+    for (int pass = 0; pass < max_passes; ++pass) {
+        int improved = 0;
+
+        for (int drop_i = 0; drop_i < *sol_len; ++drop_i) {
+            for (int drop_j = drop_i + 1; drop_j < *sol_len; ++drop_j) {
+                int cand_len = 0;
+                memset(colSelected, 0, (size_t)cols);
+
+                for (int i = 0; i < *sol_len; ++i) {
+                    if (i == drop_i || i == drop_j) continue;
+                    int c = sol[i];
+                    cand[cand_len++] = c;
+                    colSelected[c] = 1;
+                }
+
+                memset(rowCovered, 0, (size_t)rows * sizeof(bool));
+                int covered = 0;
+                for (int i = 0; i < cand_len; ++i) {
+                    int c = cand[i];
+                    for (int k = 0; k < rowsCoveredCount[c]; ++k) {
+                        int r = rowsCovered[c][k];
+                        if (!rowCovered[r]) { rowCovered[r] = true; covered++; }
+                    }
+                }
+
+                while (covered < rows) {
+                    int r0 = -1;
+                    for (int r = 0; r < rows; ++r) {
+                        if (!rowCovered[r]) { r0 = r; break; }
+                    }
+                    if (r0 < 0) break;
+
+                    int best = -1, bestNew = -1;
+                    double bestLS = DBL_MAX, bestW = -DBL_MAX;
+
+                    for (int kk = 0; kk < colsCoveringCount[r0]; ++kk) {
+                        int c = colsCovering[r0][kk];
+                        if (colSelected[c]) continue;
+
+                        int newCover = 0;
+                        for (int k = 0; k < rowsCoveredCount[c]; ++k) {
+                            int rr = rowsCovered[c][k];
+                            if (!rowCovered[rr]) newCover++;
+                        }
+                        if (newCover <= 0) continue;
+
+                        double ls = lagr_score ? lagr_score[c] : 0.0;
+                        double w  = weights ? weights[c] : 0.0;
+
+                        bool better = false;
+                        if (newCover > bestNew) better = true;
+                        else if (newCover == bestNew) {
+                            if (ls < bestLS) better = true;
+                            else if (fabs(ls - bestLS) <= EPS) {
+                                if (w > bestW) better = true;
+                                else if (fabs(w - bestW) <= EPS) {
+                                    if (best == -1 || c < best) better = true;
+                                }
+                            }
+                        }
+
+                        if (better) {
+                            best = c; bestNew = newCover; bestLS = ls; bestW = w;
+                        }
+                    }
+
+                    if (best < 0) { cand_len = -1; break; }
+
+                    colSelected[best] = 1;
+                    cand[cand_len++] = best;
+                    for (int k = 0; k < rowsCoveredCount[best]; ++k) {
+                        int rr = rowsCovered[best][k];
+                        if (!rowCovered[rr]) { rowCovered[rr] = true; covered++; }
+                    }
+                }
+
+                if (cand_len <= 0 || cand_len >= *sol_len) continue;
+
+                prune_redundancy(rows, rowsCovered, rowsCoveredCount, cand, &cand_len);
+
+                if (cand_len > 0 && cand_len < *sol_len) {
+                    memcpy(sol, cand, (size_t)cand_len * sizeof(int));
+                    *sol_len = cand_len;
+                    improved = 1;
+                    break; /* restart after improvement */
+                }
+            }
+
+            if (improved) break;
+        }
+
+        if (!improved) break;
+    }
+
+    free(rowCovered);
+    free(colSelected);
+    free(cand);
+}
+
 
 /* ---------- Solution pool helpers ---------- */
 static int pool_cmp_int_asc(const void *a, const void *b) {
@@ -712,6 +1002,7 @@ void solve_scp_lagrangian(
     }
 
     int rows = ON_minterms, cols = foundPI;
+    int local_passes = lagr_local_passes_from_env();
 
     double *t = (double*)calloc((size_t)rows, sizeof(double));
     double *ls = (double*)malloc((size_t)cols * sizeof(double));
@@ -740,9 +1031,9 @@ void solve_scp_lagrangian(
     }
 
     /* Heuristic and subgradient parameters (tunable) */
-    int max_iter = 5000;            /* total iterations of subgradient */
-    int heur_every = 2;             /* construct a feasible solution every N iterations (tuned default) */
-    double step_coef = 1.5;         /* initial step coefficient */
+    int max_iter = 20000;           /* total iterations of subgradient */
+    int heur_every = 1;             /* construct a feasible solution every N iterations (tuned default) */
+    double step_coef = 2;           /* initial step coefficient */
     double step_min = 0.005;        /* minimal step coefficient */
     int halve_period = 8;           /* halve step if no progress for this many iterations */
 
@@ -818,6 +1109,70 @@ void solve_scp_lagrangian(
         sol_tmp2,
         &sol_size2
     );
+
+    /* Optional deeper search: disabled by default */
+    if (local_passes > 0) {
+        if (sol_size > 0) {
+            local_search_drop1_repair(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                ls,
+                weights,
+                sol_tmp,
+                &sol_size,
+                local_passes
+            );
+
+            local_search_drop2_repair(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                ls,
+                weights,
+                sol_tmp,
+                &sol_size,
+                local_passes
+            );
+
+        }
+
+        if (sol_size2 > 0) {
+            local_search_drop1_repair(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                ls,
+                weights,
+                sol_tmp2,
+                &sol_size2,
+                local_passes
+            );
+
+            local_search_drop2_repair(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                ls,
+                weights,
+                sol_tmp2,
+                &sol_size2,
+                local_passes
+            );
+        }
+    }
 
     if (sol_size == -1 && sol_size2 == -1) {
         free(t);
@@ -916,6 +1271,68 @@ void solve_scp_lagrangian(
                 &sol_size2
             );
 
+            if (local_passes > 0) {
+                if (sol_size > 0) {
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        sol_tmp,
+                        &sol_size,
+                        local_passes
+                    );
+
+                    local_search_drop2_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        sol_tmp,
+                        &sol_size,
+                        local_passes
+                    );
+                }
+
+                if (sol_size2 > 0) {
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        sol_tmp2,
+                        &sol_size2,
+                        local_passes
+                    );
+
+                    local_search_drop2_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        sol_tmp2,
+                        &sol_size2,
+                        local_passes
+                    );
+                }
+            }
+
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
             double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
 
@@ -999,6 +1416,68 @@ void solve_scp_lagrangian(
                 sol_tmp2,
                 &sol_size2
             );
+
+            if (local_passes > 0) {
+                if (sol_size > 0) {
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        sol_tmp,
+                        &sol_size,
+                        local_passes
+                    );
+
+                    local_search_drop2_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        sol_tmp,
+                        &sol_size,
+                        local_passes
+                    );
+                }
+
+                if (sol_size2 > 0) {
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        sol_tmp2,
+                        &sol_size2,
+                        local_passes
+                    );
+
+                    local_search_drop2_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        sol_tmp2,
+                        &sol_size2,
+                        local_passes
+                    );
+                }
+            }
 
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
             double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
@@ -1122,6 +1601,8 @@ void solve_scp_lagrangian_pool(
     int pool_count = 0;
     int pool_min_len = INT_MAX; /* track minimal len seen, pool only stores solutions with this len */
 
+    int local_passes = lagr_local_passes_from_env();
+
     if (!(max_pool > 1 && out_pool_count && pool_solutions)) {
         max_pool = 1;
     }
@@ -1170,6 +1651,68 @@ void solve_scp_lagrangian_pool(
         sol_tmp2,
         &sol_size2
     );
+
+    if (local_passes > 0) {
+        if (sol_size > 0) {
+            local_search_drop1_repair(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                rc,
+                weights,
+                sol_tmp,
+                &sol_size,
+                local_passes
+            );
+
+            local_search_drop2_repair(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                rc,
+                weights,
+                sol_tmp,
+                &sol_size,
+                local_passes
+            );
+        }
+
+        if (sol_size2 > 0) {
+            local_search_drop1_repair(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                rc,
+                weights,
+                sol_tmp2,
+                &sol_size2,
+                local_passes
+            );
+
+            local_search_drop2_repair(
+                rows,
+                cols,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                rc,
+                weights,
+                sol_tmp2,
+                &sol_size2,
+                local_passes
+            );
+        }
+    }
 
     if (sol_size == -1 && sol_size2 == -1) {
         free(t);
@@ -1295,6 +1838,68 @@ void solve_scp_lagrangian_pool(
                 sol_tmp2,
                 &sol_size2
             );
+
+            if (local_passes > 0) {
+                if (sol_size > 0) {
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        rc,
+                        weights,
+                        sol_tmp,
+                        &sol_size,
+                        local_passes
+                    );
+
+                    local_search_drop2_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        rc,
+                        weights,
+                        sol_tmp,
+                        &sol_size,
+                        local_passes
+                    );
+                }
+
+                if (sol_size2 > 0) {
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        rc,
+                        weights,
+                        sol_tmp2,
+                        &sol_size2,
+                        local_passes
+                    );
+
+                    local_search_drop2_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        rc,
+                        weights,
+                        sol_tmp2,
+                        &sol_size2,
+                        local_passes
+                    );
+                }
+            }
 
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
             double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
@@ -1442,6 +2047,68 @@ void solve_scp_lagrangian_pool(
                 sol_tmp2,
                 &sol_size2
             );
+
+            if (local_passes > 0) {
+                if (sol_size > 0) {
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        rc,
+                        weights,
+                        sol_tmp,
+                        &sol_size,
+                        local_passes
+                    );
+
+                    local_search_drop2_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        rc,
+                        weights,
+                        sol_tmp,
+                        &sol_size,
+                        local_passes
+                    );
+                }
+
+                if (sol_size2 > 0) {
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        rc,
+                        weights,
+                        sol_tmp2,
+                        &sol_size2,
+                        local_passes
+                    );
+
+                    local_search_drop2_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        rc,
+                        weights,
+                        sol_tmp2,
+                        &sol_size2,
+                        local_passes
+                    );
+                }
+            }
 
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
             double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
