@@ -7,11 +7,240 @@
 */
 
 #include "lagrangian.h"
-#ifdef _OPENMP
-    #include <omp.h>
-#endif
+#include "ccubes_threads.h"
 
 #define EPS 1e-12
+
+typedef struct {
+    const int *pichart;
+    int rows;
+    int cols;
+    int *counts;
+} lagr_count_context;
+
+static void lagr_count_col_rows_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_id;
+    (void)worker_count;
+    lagr_count_context *ctx = (lagr_count_context *)data;
+    for (uint64_t c0 = start; c0 < end; c0 += stride) {
+        int c = (int)c0;
+        int cnt = 0;
+        for (int r = 0; r < ctx->rows; ++r) {
+            cnt += ctx->pichart[c * ctx->rows + r];
+        }
+        ctx->counts[c] = cnt;
+    }
+}
+
+static void lagr_count_row_cols_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_id;
+    (void)worker_count;
+    lagr_count_context *ctx = (lagr_count_context *)data;
+    for (uint64_t r0 = start; r0 < end; r0 += stride) {
+        int r = (int)r0;
+        int cnt = 0;
+        for (int c = 0; c < ctx->cols; ++c) {
+            cnt += ctx->pichart[c * ctx->rows + r];
+        }
+        ctx->counts[r] = cnt;
+    }
+}
+
+typedef struct {
+    const int *pichart;
+    int rows;
+    int cols;
+    int **out;
+} lagr_fill_context;
+
+static void lagr_fill_rows_covered_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_id;
+    (void)worker_count;
+    lagr_fill_context *ctx = (lagr_fill_context *)data;
+    for (uint64_t c0 = start; c0 < end; c0 += stride) {
+        int c = (int)c0;
+        int k = 0;
+        for (int r = 0; r < ctx->rows; ++r) {
+            if (ctx->pichart[c * ctx->rows + r] != 0) {
+                ctx->out[c][k++] = r;
+            }
+        }
+    }
+}
+
+static void lagr_fill_cols_covering_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_id;
+    (void)worker_count;
+    lagr_fill_context *ctx = (lagr_fill_context *)data;
+    for (uint64_t r0 = start; r0 < end; r0 += stride) {
+        int r = (int)r0;
+        int k = 0;
+        for (int c = 0; c < ctx->cols; ++c) {
+            if (ctx->pichart[c * ctx->rows + r] != 0) {
+                ctx->out[r][k++] = c;
+            }
+        }
+    }
+}
+
+typedef struct {
+    const double *t;
+    double *partials;
+} lagr_sum_t_context;
+
+static void lagr_sum_t_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_count;
+    lagr_sum_t_context *ctx = (lagr_sum_t_context *)data;
+    double sum = 0.0;
+    for (uint64_t i = start; i < end; i += stride) {
+        sum += ctx->t[i];
+    }
+    ctx->partials[worker_id] = sum;
+}
+
+typedef struct {
+    int **rowsCovered;
+    int *rowsCoveredCount;
+    const double *t;
+    double *ls;
+    double *partials;
+} lagr_reduced_context;
+
+static void lagr_reduced_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_count;
+    lagr_reduced_context *ctx = (lagr_reduced_context *)data;
+    double neg = 0.0;
+    for (uint64_t c0 = start; c0 < end; c0 += stride) {
+        int c = (int)c0;
+        double sum = 0.0;
+        for (int k = 0; k < ctx->rowsCoveredCount[c]; ++k) {
+            int r = ctx->rowsCovered[c][k];
+            sum += ctx->t[r];
+        }
+        ctx->ls[c] = 1.0 - sum;
+        if (ctx->ls[c] < 0.0) neg += ctx->ls[c];
+    }
+    ctx->partials[worker_id] = neg;
+}
+
+typedef struct {
+    const double *ls;
+    unsigned char *x;
+} lagr_x_context;
+
+static void lagr_x_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_id;
+    (void)worker_count;
+    lagr_x_context *ctx = (lagr_x_context *)data;
+    for (uint64_t c = start; c < end; c += stride) {
+        ctx->x[c] = (ctx->ls[c] < 0.0) ? 1 : 0;
+    }
+}
+
+typedef struct {
+    int **colsCovering;
+    int *colsCoveringCount;
+    const unsigned char *x;
+    double *slack;
+    double *partials;
+} lagr_slack_context;
+
+static void lagr_slack_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_count;
+    lagr_slack_context *ctx = (lagr_slack_context *)data;
+    double sum_s2 = 0.0;
+    for (uint64_t i0 = start; i0 < end; i0 += stride) {
+        int i = (int)i0;
+        int covered = 0;
+        for (int k = 0; k < ctx->colsCoveringCount[i]; ++k) {
+            int c = ctx->colsCovering[i][k];
+            covered += ctx->x[c];
+        }
+        double s = 1.0 - (double)covered;
+        ctx->slack[i] = s;
+        sum_s2 += s * s;
+    }
+    ctx->partials[worker_id] = sum_s2;
+}
+
+typedef struct {
+    double *t;
+    const double *slack;
+    double step;
+} lagr_update_t_context;
+
+static void lagr_update_t_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_id;
+    (void)worker_count;
+    lagr_update_t_context *ctx = (lagr_update_t_context *)data;
+    for (uint64_t i = start; i < end; i += stride) {
+        double val = ctx->t[i] + ctx->step * ctx->slack[i];
+        ctx->t[i] = (val > 0.0) ? val : 0.0;
+    }
+}
 
 /*
 Build adjacency:
@@ -38,26 +267,24 @@ static int build_adjacency(
     crc = (int*)calloc((size_t)rows, sizeof(int));
     if (!rcc || !crc) goto oom;
 
-    #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-    #endif
-    for (int c = 0; c < cols; ++c) {
-        int cnt = 0;
-        for (int r = 0; r < rows; ++r) {
-            cnt += pichart[c * rows + r];
-        }
-        rcc[c] = cnt;
+    lagr_count_context count_cols = {
+        .pichart = pichart,
+        .rows = rows,
+        .cols = cols,
+        .counts = rcc
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)cols, ccubes_thread_count(), false, lagr_count_col_rows_worker, &count_cols)) {
+        goto oom;
     }
 
-    #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-    #endif
-    for (int r = 0; r < rows; ++r) {
-        int cnt = 0;
-        for (int c = 0; c < cols; ++c) {
-            cnt += pichart[c * rows + r];
-        }
-        crc[r] = cnt;
+    lagr_count_context count_rows = {
+        .pichart = pichart,
+        .rows = rows,
+        .cols = cols,
+        .counts = crc
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)rows, ccubes_thread_count(), false, lagr_count_row_cols_worker, &count_rows)) {
+        goto oom;
     }
 
     for (int r = 0; r < rows; ++r) {
@@ -81,28 +308,24 @@ static int build_adjacency(
         if (crc[r] > 0 && !cr[r]) goto oom;
     }
 
-    #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-    #endif
-    for (int c = 0; c < cols; ++c) {
-        int k = 0;
-        for (int r = 0; r < rows; ++r) {
-            if (pichart[c * rows + r] != 0) {
-                rc[c][k++] = r;
-            }
-        }
+    lagr_fill_context fill_rows = {
+        .pichart = pichart,
+        .rows = rows,
+        .cols = cols,
+        .out = rc
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)cols, ccubes_thread_count(), false, lagr_fill_rows_covered_worker, &fill_rows)) {
+        goto oom;
     }
 
-    #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-    #endif
-    for (int r = 0; r < rows; ++r) {
-        int k = 0;
-        for (int c = 0; c < cols; ++c) {
-            if (pichart[c * rows + r] != 0) {
-                cr[r][k++] = c;
-            }
-        }
+    lagr_fill_context fill_cols = {
+        .pichart = pichart,
+        .rows = rows,
+        .cols = cols,
+        .out = cr
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)rows, ccubes_thread_count(), false, lagr_fill_cols_covering_worker, &fill_cols)) {
+        goto oom;
     }
 
     *rowsCovered = rc;
@@ -320,26 +543,39 @@ static double compute_reduced_and_lb(
     double ZLB_rows = 0.0;
     double ZLB_neg = 0.0;
 
-    #ifdef _OPENMP
-        #pragma omp parallel for reduction(+:ZLB_rows) schedule(static)
-    #endif
-    for (int i = 0; i < rows; ++i) {
-        ZLB_rows += t[i];
+    int threads = ccubes_thread_count();
+    double *partials = (double*)calloc((size_t)threads, sizeof(double));
+    if (!partials) return 0.0;
+
+    lagr_sum_t_context sum_ctx = {
+        .t = t,
+        .partials = partials
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)rows, threads, false, lagr_sum_t_worker, &sum_ctx)) {
+        free(partials);
+        return 0.0;
+    }
+    for (int i = 0; i < threads; ++i) {
+        ZLB_rows += partials[i];
+        partials[i] = 0.0;
     }
 
-    #ifdef _OPENMP
-        #pragma omp parallel for reduction(+:ZLB_neg) schedule(static)
-    #endif
-    for (int c = 0; c < cols; ++c) {
-        double sum = 0.0;
-        for (int k = 0; k < rowsCoveredCount[c]; ++k) {
-            int r = rowsCovered[c][k];
-            sum += t[r];
-        }
-        double cc = 1.0;
-        ls[c] = cc - sum;
-        if (ls[c] < 0.0) ZLB_neg += ls[c];
+    lagr_reduced_context reduced_ctx = {
+        .rowsCovered = rowsCovered,
+        .rowsCoveredCount = rowsCoveredCount,
+        .t = t,
+        .ls = ls,
+        .partials = partials
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)cols, threads, false, lagr_reduced_worker, &reduced_ctx)) {
+        free(partials);
+        return 0.0;
     }
+    for (int i = 0; i < threads; ++i) {
+        ZLB_neg += partials[i];
+    }
+    free(partials);
+
     ZLB = ZLB_rows + ZLB_neg;
     return ZLB;
 }
@@ -383,11 +619,14 @@ static int subgradient_update(
     unsigned char *x = (unsigned char*)malloc((size_t)cols);
     if (!x) return 0;
 
-    #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-    #endif
-    for (int c = 0; c < cols; ++c) {
-        x[c] = (ls[c] < 0.0) ? 1 : 0;
+    int threads = ccubes_thread_count();
+    lagr_x_context x_ctx = {
+        .ls = ls,
+        .x = x
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)cols, threads, false, lagr_x_worker, &x_ctx)) {
+        free(x);
+        return 0;
     }
 
     double *slack = (double*)malloc((size_t)rows * sizeof(double));
@@ -398,19 +637,30 @@ static int subgradient_update(
 
     double sum_s2 = 0.0;
 
-    #ifdef _OPENMP
-        #pragma omp parallel for reduction(+:sum_s2) schedule(static)
-    #endif
-    for (int i = 0; i < rows; ++i) {
-        int covered = 0;
-        for (int k = 0; k < colsCoveringCount[i]; ++k) {
-            int c = colsCovering[i][k];
-            covered += x[c];
-        }
-        double s = 1.0 - (double)covered;
-        slack[i] = s;
-        sum_s2 += s * s;
+    double *partials = (double*)calloc((size_t)threads, sizeof(double));
+    if (!partials) {
+        free(x);
+        free(slack);
+        return 0;
     }
+
+    lagr_slack_context slack_ctx = {
+        .colsCovering = colsCovering,
+        .colsCoveringCount = colsCoveringCount,
+        .x = x,
+        .slack = slack,
+        .partials = partials
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)rows, threads, false, lagr_slack_worker, &slack_ctx)) {
+        free(x);
+        free(slack);
+        free(partials);
+        return 0;
+    }
+    for (int i = 0; i < threads; ++i) {
+        sum_s2 += partials[i];
+    }
+    free(partials);
 
     free(x);
 
@@ -431,12 +681,14 @@ static int subgradient_update(
         return 0;
     }
 
-    #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-    #endif
-    for (int i = 0; i < rows; ++i) {
-        double val = t[i] + step * slack[i];
-        t[i] = (val > 0.0) ? val : 0.0;
+    lagr_update_t_context update_ctx = {
+        .t = t,
+        .slack = slack,
+        .step = step
+    };
+    if (!ccubes_parallel_for(0, (uint64_t)rows, threads, false, lagr_update_t_worker, &update_ctx)) {
+        free(slack);
+        return 0;
     }
 
     (*stuck_iter)++;

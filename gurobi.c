@@ -8,6 +8,8 @@
 
 #include "gurobi.h"
 
+#ifdef HAVE_GUROBI
+
 bool gurobi_license_is_valid(void) {
     GRBenv *env = NULL;
     int error;
@@ -467,3 +469,47 @@ void gurobi_solution_pool(
     if (model) GRBfreemodel(model);
     if (env) GRBfreeenv(env);
 }
+
+#else
+
+bool gurobi_license_is_valid(void) {
+    return false;
+}
+
+void gurobi_multiobjective(
+    int pichart[],
+    const int foundPI,
+    const int ON_minterms,
+    double weights[],
+    int *indices,
+    int *solmin
+) {
+    (void)pichart;
+    (void)foundPI;
+    (void)ON_minterms;
+    (void)weights;
+    (void)indices;
+    if (solmin) *solmin = 0;
+}
+
+void gurobi_solution_pool(
+    int pichart[],
+    const int foundPI,
+    const int ON_minterms,
+    const int max_pool,
+    double weights[],
+    int *pool_count,
+    int **pool_solutions,
+    int *solmin
+) {
+    (void)pichart;
+    (void)foundPI;
+    (void)ON_minterms;
+    (void)max_pool;
+    (void)weights;
+    (void)pool_solutions;
+    if (pool_count) *pool_count = 0;
+    if (solmin) *solmin = 0;
+}
+
+#endif

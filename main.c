@@ -12,12 +12,119 @@
 #include <stdbool.h>
 #include <math.h>
 #include <time.h>
+#include <stdatomic.h>
 #include "main.h"
 #include "checkpoint.h"
+#include "ccubes_threads.h"
 
-#ifdef _OPENMP
-    #include <omp.h>
-#endif
+typedef struct {
+    int k;
+    int ninputs;
+    int noutputs;
+    int *nofvalues;
+    int *bit_index;
+    int *word_index;
+    uint64_t *shifted_mask;
+    int implicant_words;
+    PIstorage *PInfo;
+    ThreadBuffer **buffer;
+    ccubes_mutex *output_locks;
+    int *max_shared;
+    int increase;
+    int *multiplier;
+    int fast_filter_level;
+    double time_limit_sec;
+    double base_elapsed;
+    struct timespec start_time;
+    atomic_bool *time_up;
+    double *time_up_elapsed;
+    atomic_uint_fast64_t *last_task_reached;
+    ccubes_mutex *state_lock;
+} PIWorkerContext;
+
+static void destroy_output_locks(ccubes_mutex *locks, int noutputs) {
+    if (!locks) return;
+    for (int o = 0; o < noutputs; o++) {
+        ccubes_mutex_destroy(&locks[o]);
+    }
+    free(locks);
+}
+
+static void pi_search_range_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_count;
+    PIWorkerContext *ctx = (PIWorkerContext *)data;
+
+    for (uint64_t task = start; task < end; task += stride) {
+        if (atomic_load_explicit(ctx->time_up, memory_order_acquire)) {
+            break;
+        }
+
+        if (ctx->time_limit_sec > 0.0 && (task & 0x3FFull) == 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed =
+                (now.tv_sec - ctx->start_time.tv_sec) +
+                (now.tv_nsec - ctx->start_time.tv_nsec) / 1e9;
+
+            if (elapsed >= ctx->time_limit_sec) {
+                bool expected = false;
+                if (
+                    atomic_compare_exchange_strong_explicit(
+                        ctx->time_up,
+                        &expected,
+                        true,
+                        memory_order_acq_rel,
+                        memory_order_acquire
+                    )
+                ) {
+                    ccubes_mutex_lock(ctx->state_lock);
+                    *ctx->time_up_elapsed = ctx->base_elapsed + elapsed;
+                    atomic_store_explicit(ctx->last_task_reached, task, memory_order_release);
+                    ccubes_mutex_unlock(ctx->state_lock);
+                }
+                break;
+            }
+        }
+
+        int error = process_task(
+            task,
+            ctx->k,
+            ctx->ninputs,
+            ctx->noutputs,
+            ctx->nofvalues,
+            ctx->bit_index,
+            ctx->word_index,
+            ctx->shifted_mask,
+            ctx->implicant_words,
+            ctx->PInfo,
+            ctx->buffer,
+            worker_id,
+            ctx->output_locks,
+            ctx->max_shared,
+            ctx->increase,
+            ctx->multiplier,
+            ctx->fast_filter_level
+        );
+
+        if (error) {
+            fprintf(
+                stderr,
+                "Error: process_task failed for task %llu at k=%d\n",
+                (unsigned long long)task,
+                ctx->k
+            );
+            atomic_store_explicit(ctx->time_up, true, memory_order_release);
+            break;
+        }
+    }
+}
 
 void help() {
     printf("Usage: ccubes [options] source.pla [dest.pla]\n");
@@ -25,7 +132,7 @@ void help() {
     printf("  -k<number>         : start searching from level k\n");
     printf("  -e<number>         : end criterion (default +1 level with the same minima)\n");
     printf("  -b<number>         : bits per word, either 8, 16, 32, 64 (default) or 128\n");
-    printf("  -c<number>         : number of CPU cores / threads to use, if OpenMP available\n");
+    printf("  -c<number>         : number of CPU worker threads to use\n");
     printf("  -w<number>         : weights applied to the prime implicants:\n");
     printf("                         0 no weight\n");
     printf("                         1 (default) weight based on complexity levels k\n");
@@ -67,7 +174,7 @@ int main(int argc, char *argv[]) {
     int START_LEVEL = 1;
     int MAX_LEVELS = 1;
     int BITS_PER_WORD = 64;
-    int THREADS = 0; // max by default, if OpenMP enabled
+    int THREADS = 0; // max by default
     bool THREADS_FORCED = false; // set to true if -c is provided
     int WEIGHT_PIC = 1;
     int SCP_TYPE = 0;
@@ -404,31 +511,15 @@ int main(int argc, char *argv[]) {
     layer_weights[0] = 0; // k basically starts with 1, so its k-layer weight will start on position 1
 
 
-    #ifdef _OPENMP
-        int num_procs = omp_get_num_procs();
-        // Disable dynamic adjustment so requested thread count is honored
-        omp_set_dynamic(0);
-
-        if (THREADS_FORCED) {
-            if (THREADS < 1) THREADS = 1;          // minimum 1 when forced
-            if (THREADS > num_procs) THREADS = num_procs; // cap to available cores
-            omp_set_num_threads(THREADS);
-            // Do NOT override THREADS with omp_get_max_threads(); respect user request
-        } else {
-            // Auto mode: use max available if not specified or out of range
-            if (THREADS <= 0 || THREADS > num_procs) {
-                THREADS = num_procs;
-            }
-            omp_set_num_threads(THREADS);
-            // Reflect runtime decision (some runtimes clamp values); informational only
-            int rt_threads = omp_get_max_threads();
-            if (rt_threads > 0) THREADS = rt_threads;
-        }
-    #endif
-
-    if (THREADS == 0) { // which means OpenMP was not detected
-        THREADS = 1;
+    int available_threads = ccubes_default_thread_count();
+    if (THREADS_FORCED) {
+        if (THREADS < 1) THREADS = 1;
+        if (THREADS > available_threads) THREADS = available_threads;
+    } else {
+        THREADS = available_threads;
     }
+    THREADS = ccubes_effective_thread_count(THREADS);
+    ccubes_set_thread_count(THREADS);
 
     // Implement thread-private buffer space
     ThreadBuffer **buffer = (ThreadBuffer**)calloc(THREADS, sizeof(ThreadBuffer*));
@@ -594,11 +685,27 @@ int main(int argc, char *argv[]) {
         chk_stop_counter = NULL;
     }
 
+    ccubes_mutex *output_locks = (ccubes_mutex *)calloc((size_t)noutputs, sizeof(ccubes_mutex));
+    if (!output_locks) {
+        fprintf(stderr, "Error: output lock allocation failed\n");
+        cleanup(PInfo, buffer);
+        return 1;
+    }
+    for (int o = 0; o < noutputs; o++) {
+        if (!ccubes_mutex_init(&output_locks[o])) {
+            fprintf(stderr, "Error: output lock initialization failed\n");
+            destroy_output_locks(output_locks, o);
+            cleanup(PInfo, buffer);
+            return 1;
+        }
+    }
+
     // allocate memory buffer for each thread
     for (int t = 0; t < THREADS; t++) {
         buffer[t] = (ThreadBuffer*)calloc(noutputs, sizeof(ThreadBuffer));
         if (!buffer[t]) {
             fprintf(stderr, "Error: buffer[%d] allocation failed\n", t);
+            destroy_output_locks(output_locks, noutputs);
             cleanup(PInfo, buffer);
             return 1;
         }
@@ -622,6 +729,7 @@ int main(int argc, char *argv[]) {
                 !buffer[t][o].fixed_bits || !buffer[t][o].value_bits
             ) {
                 fprintf(stderr, "Error: buffer per-output alloc failed\n");
+                destroy_output_locks(output_locks, noutputs);
                 cleanup(PInfo, buffer);
                 return 1;
             }
@@ -636,9 +744,7 @@ int main(int argc, char *argv[]) {
         // fprintf(debug_out, "value bit mask: %lld\n", VALUE_BIT_MASK);
         fprintf(debug_out, "ON-set minterms: %d\n", PInfo[0].ON_minterms);
         fprintf(debug_out, "threads: %d\n", THREADS);
-        #ifdef _OPENMP
-            fprintf(debug_out, "OpenMP enabled, %d workers\n", omp_get_max_threads());
-        #endif
+        fprintf(debug_out, "thread backend: %s\n", ccubes_thread_backend());
     }
 
 
@@ -661,21 +767,32 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &startk);
 
         uint64_t maxtasks = nchoosek(ninputs, k);
-        volatile bool time_up = false;
+        atomic_bool time_up;
+        atomic_init(&time_up, false);
         double time_up_elapsed = 0.0;
-        uint64_t last_task_reached = 0ull;
+        atomic_uint_fast64_t last_task_reached;
+        atomic_init(&last_task_reached, 0ull);
         uint64_t resume_last_task_local = 0ull;
         uint64_t start_task = 0ull;
+        ccubes_mutex state_lock;
+        if (!ccubes_mutex_init(&state_lock)) {
+            fprintf(stderr, "Error: state lock initialization failed\n");
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            return 1;
+        }
 
         if (RESUME_PATH && HAS_RESUME_LAST_TASK && RESUME_K == k) {
             resume_last_task_local = RESUME_LAST_TASK;
-            last_task_reached = resume_last_task_local;
+            atomic_store_explicit(&last_task_reached, resume_last_task_local, memory_order_release);
             start_task = resume_last_task_local + 1ull;
             if (start_task > maxtasks) start_task = maxtasks; // safety
         }
 
         if (maxtasks == 0) {
             // overflow, too many tasks
+            ccubes_mutex_destroy(&state_lock);
+            destroy_output_locks(output_locks, noutputs);
             cleanup(PInfo, buffer);
             // exit(EXIT_FAILURE);
             return(1);
@@ -686,88 +803,59 @@ int main(int argc, char *argv[]) {
             fprintf(debug_out, "maxtasks: %lld\n", maxtasks);
         }
 
-        // Parallelize tasks loop with thread-local buffer buffers (see buffer[tid][o])
-        #ifdef _OPENMP
-            #pragma omp parallel for if(THREADS > 1) schedule(static, 1) shared(time_up, time_up_elapsed, last_task_reached)
-        #endif
-        for (uint64_t task = start_task; task < maxtasks; task++) {
+        PIWorkerContext pi_ctx = {
+            .k = k,
+            .ninputs = ninputs,
+            .noutputs = noutputs,
+            .nofvalues = nofvalues,
+            .bit_index = bit_index,
+            .word_index = word_index,
+            .shifted_mask = shifted_mask,
+            .implicant_words = implicant_words,
+            .PInfo = PInfo,
+            .buffer = buffer,
+            .output_locks = output_locks,
+            .max_shared = &max_shared,
+            .increase = increase,
+            .multiplier = &multiplier,
+            .fast_filter_level = FAST_FILTER_LEVEL,
+            .time_limit_sec = TIME_LIMIT_SEC,
+            .base_elapsed = BASE_ELAPSED,
+            .start_time = start,
+            .time_up = &time_up,
+            .time_up_elapsed = &time_up_elapsed,
+            .last_task_reached = &last_task_reached,
+            .state_lock = &state_lock
+        };
 
-            #ifdef _OPENMP
-                if (time_up) {
-                    #pragma omp cancellation point for
-                    continue;
-                }
-            #endif
-
-            int tid = 0;
-
-            #ifdef _OPENMP
-                tid = omp_get_thread_num();
-            #endif
-
-            // Periodically check time limit
-            if (TIME_LIMIT_SEC > 0 &&  (task & 0x3FFull) == 0) { // every 1024 tasks
-                struct timespec now;
-                clock_gettime(CLOCK_MONOTONIC, &now);
-                double elapsed = (now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) / 1e9;
-
-                if (elapsed >= TIME_LIMIT_SEC) {
-                    // record last task seen
-                    #ifdef _OPENMP
-                        #pragma omp critical
-                    #endif
-                    {
-                        if (!time_up) {
-                            time_up = true;
-                            time_up_elapsed = BASE_ELAPSED + elapsed;
-                            if (task > last_task_reached) last_task_reached = task;
-                        }
-                    }
-                    #ifdef _OPENMP
-                        #pragma omp cancel for
-                    #endif
-                }
-            }
-
-            //------------------ BEGIN TASK PROCESSING ------------------
-            int error = process_task(
-                task,
-                k,
-                ninputs,
-                noutputs,
-                nofvalues,
-                bit_index,
-                word_index,
-                shifted_mask,
-                implicant_words,
-                PInfo,
-                buffer,
-                tid,
-                &max_shared,
-                increase,
-                &multiplier,
-                FAST_FILTER_LEVEL
-            );
-
-            if (error) {
-                // Handle error
-                fprintf(stderr, "Error: process_task failed for task %lld at k=%d\n", task, k);
-                #ifdef _OPENMP
-                    #pragma omp critical
-                #endif
-                {
-                    time_up = true; // signal other threads to stop
-                }
-                continue;
-            }
-            //------------------- END TASK PROCESSING -------------------
-
-        } // end of tasks loop
+        if (
+            !ccubes_parallel_for(
+                start_task,
+                maxtasks,
+                THREADS,
+                true,
+                pi_search_range_worker,
+                &pi_ctx
+            )
+        ) {
+            fprintf(stderr, "Error: failed to start workers for PI search\n");
+            ccubes_mutex_destroy(&state_lock);
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            return 1;
+        }
 
         HAS_RESUME_LAST_TASK = false; // reset for the next k-level
 
         // Time-limit checkpoint (post-loop or early-cancel)
-        if (TIME_LIMIT_SEC > 0 && time_up) {
+        bool level_time_up = atomic_load_explicit(&time_up, memory_order_acquire);
+        uint64_t last_task_reached_value = atomic_load_explicit(
+            &last_task_reached,
+            memory_order_acquire
+        );
+        ccubes_mutex_destroy(&state_lock);
+
+        if (TIME_LIMIT_SEC > 0 && level_time_up) {
             if (!CHK_SAVE_PATH) {
                 if (RESUME_PATH) {
                     CHK_SAVE_PATH = RESUME_PATH; // overwrite the same checkpoint when resuming
@@ -806,10 +894,10 @@ int main(int argc, char *argv[]) {
                     dst_to_save,
                     time_up_elapsed,
                     BASE_SCP + scp_time,
-                    last_task_reached
+                    last_task_reached_value
                 ) == 0
             ) {
-                double pct = (double)last_task_reached * 100.0 / (double)maxtasks;
+                double pct = (double)last_task_reached_value * 100.0 / (double)maxtasks;
 
                 fprintf(
                     stderr,
@@ -824,6 +912,7 @@ int main(int argc, char *argv[]) {
                 );
             }
             if (tmp_dst_alloc) free(tmp_dst_alloc);
+            destroy_output_locks(output_locks, noutputs);
             cleanup(PInfo, buffer);
             return 0;
         }
@@ -919,6 +1008,7 @@ int main(int argc, char *argv[]) {
                         DBG_ERROR_BLOCK {
                             fprintf(debug_out, "Error: solving the minterm coverage failed.\n");
                         }
+                        destroy_output_locks(output_locks, noutputs);
                         cleanup(PInfo, buffer);
                         return 1;
                     }
@@ -1118,6 +1208,7 @@ int main(int argc, char *argv[]) {
                         DBG_ERROR_BLOCK {
                             fprintf(debug_out, "Error: solving the minterm coverage failed.\n");
                         }
+                        destroy_output_locks(output_locks, noutputs);
                         cleanup(PInfo, buffer);
                         return 1;
                     }
@@ -1150,6 +1241,7 @@ int main(int argc, char *argv[]) {
             int *chosen_idx = (int*)calloc((size_t)noutputs, sizeof(int));
             if (!chosen_idx) {
                 fprintf(stderr, "Error: Memory allocation failed for chosen_idx\n");
+                destroy_output_locks(output_locks, noutputs);
                 cleanup(PInfo, buffer);
                 return 1;
             }
@@ -1360,6 +1452,7 @@ int main(int argc, char *argv[]) {
 
     if (DST_FILE == NULL) {
         fprintf(stderr, "Error: failed to determine destination .pla filename.\n");
+        destroy_output_locks(output_locks, noutputs);
         cleanup(PInfo, buffer);
         debug_close();
         return 1;
@@ -1368,6 +1461,7 @@ int main(int argc, char *argv[]) {
     write_pla_file(DST_FILE, PInfo);
 
     // Free allocated memory
+    destroy_output_locks(output_locks, noutputs);
     cleanup(PInfo, buffer);
 
     // Calculate and log execution time (accumulated across resumes)

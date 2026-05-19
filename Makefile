@@ -47,20 +47,35 @@ SRC  := $(wildcard *.c)
 OBJ  := $(SRC:.c=.o)
 BIN  := ccubes
 
-# try OpenMP
-# Allow disabling OpenMP with DISABLE_OMP=1 if needed for debugging
+# Try OpenMP first, then pthreads, then serial fallback.
+# Disable OpenMP with DISABLE_OMP=1; disable pthread fallback with USE_PTHREAD=0.
 DISABLE_OMP ?= 0
+USE_PTHREAD ?= 1
 ifneq ($(shell test $(DISABLE_OMP) -eq 1; echo $$?),0)
   ifneq ($(shell $(CC) -fopenmp -dM -E - < /dev/null 2>/dev/null | grep _OPENMP),)
-    CFLAGS   += -fopenmp
+    CFLAGS   += -DHAVE_OPENMP -fopenmp
     CXXFLAGS += -fopenmp
     LDFLAGS  += -fopenmp
     $(info OpenMP found -> enabling)
   else
-    $(info OpenMP not found -> disabling)
+    ifeq ($(USE_PTHREAD),1)
+      CFLAGS  += -DHAVE_PTHREAD -pthread
+      CXXFLAGS += -pthread
+      LDFLAGS += -pthread
+      $(info OpenMP not found -> enabling pthread fallback)
+    else
+      $(info OpenMP not found and pthread disabled -> serial fallback)
+    endif
   endif
 else
-  $(info OpenMP disabled by user -> DISABLE_OMP=$(DISABLE_OMP))
+  ifeq ($(USE_PTHREAD),1)
+    CFLAGS  += -DHAVE_PTHREAD -pthread
+    CXXFLAGS += -pthread
+    LDFLAGS += -pthread
+    $(info OpenMP disabled -> enabling pthread fallback)
+  else
+    $(info OpenMP and pthread disabled -> serial fallback)
+  endif
 endif
 
 # try Gurobi (hardcoded path for now)

@@ -777,6 +777,7 @@ int process_task(
     PIstorage *PInfo,
     ThreadBuffer **buffer,
     int tid,
+    ccubes_mutex *output_locks,
     int *max_shared,
     int increase,
     int *multiplier,
@@ -1352,10 +1353,7 @@ int process_task(
                 if (u_covsum < 1) u_covsum = 1;
                 if (u_covsum > ON_minterms) u_covsum = ON_minterms;
 
-                #ifdef _OPENMP
-                    #pragma omp critical
-                #endif
-                {
+                if (output_locks) ccubes_mutex_lock(&output_locks[o]);
 
                     // Ensure capacity before writing the next PI
                     if ((*foundPI + 1) > *estimPI) {
@@ -1422,7 +1420,8 @@ int process_task(
                     }
 
                     (*foundPI)++;
-                }
+
+                if (output_locks) ccubes_mutex_unlock(&output_locks[o]);
             }
         }
 

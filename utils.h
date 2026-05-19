@@ -11,6 +11,7 @@
 #include <stdalign.h> // For alignof
 
 #include "debug.h"
+#include "ccubes_threads.h"
 
 void error_message(const char *msg);
 
@@ -133,6 +134,7 @@ int process_task(
     PIstorage *PInfo,
     ThreadBuffer **buffer,
     int tid,
+    ccubes_mutex *output_locks,
     int *max_shared,
     int increase,
     int *multiplier,
