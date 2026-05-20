@@ -33,6 +33,7 @@ typedef struct {
     int increase;
     int *multiplier;
     int fast_filter_level;
+    bool deterministic_order;
     double time_limit_sec;
     double base_elapsed;
     struct timespec start_time;
@@ -48,6 +49,19 @@ static void destroy_output_locks(ccubes_mutex *locks, int noutputs) {
         ccubes_mutex_destroy(&locks[o]);
     }
     free(locks);
+}
+
+static bool env_flag_enabled(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !*value) return false;
+
+    return (
+        strcmp(value, "0") != 0 &&
+        strcmp(value, "false") != 0 &&
+        strcmp(value, "FALSE") != 0 &&
+        strcmp(value, "no") != 0 &&
+        strcmp(value, "NO") != 0
+    );
 }
 
 static void pi_search_range_worker(
@@ -110,7 +124,8 @@ static void pi_search_range_worker(
             ctx->max_shared,
             ctx->increase,
             ctx->multiplier,
-            ctx->fast_filter_level
+            ctx->fast_filter_level,
+            ctx->deterministic_order
         );
 
         if (error) {
@@ -153,6 +168,7 @@ void help() {
     printf("  -i<level>=<file>   : inspect checkpoint (print progress and metadata)\n");
     printf("                         0 (default) progress report\n");
     printf("                         1 complete metadata about each output\n");
+    printf("  --deterministic    : canonicalize PI order before solving for reproducible benchmarks\n");
     printf("  -h, --help         : show this help message\n");
 }
 
@@ -180,6 +196,7 @@ int main(int argc, char *argv[]) {
     int SCP_TYPE = 0;
     int POOL_MAX = 1; // collect up to this many solutions
     int FAST_FILTER_LEVEL = 0; // 0 disabled; 1..3 increasing aggressiveness
+    bool DETERMINISTIC_PI_ORDER = env_flag_enabled("CCUBES_DETERMINISTIC");
     char *SRC_FILE = NULL;
     char *DST_FILE = NULL;
     // resume timing bases
@@ -200,7 +217,11 @@ int main(int argc, char *argv[]) {
 
     // parse arguments
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "-k", 2) == 0) {
+        if (strcmp(argv[i], "--deterministic") == 0) {
+            DETERMINISTIC_PI_ORDER = true;
+        } else if (strcmp(argv[i], "--no-deterministic") == 0) {
+            DETERMINISTIC_PI_ORDER = false;
+        } else if (strncmp(argv[i], "-k", 2) == 0) {
             START_LEVEL = atoi(argv[i] + 2);
         } else if (strncmp(argv[i], "-e", 2) == 0) {
             MAX_LEVELS = atoi(argv[i] + 2);
@@ -745,6 +766,7 @@ int main(int argc, char *argv[]) {
         fprintf(debug_out, "ON-set minterms: %d\n", PInfo[0].ON_minterms);
         fprintf(debug_out, "threads: %d\n", THREADS);
         fprintf(debug_out, "thread backend: %s\n", ccubes_thread_backend());
+        fprintf(debug_out, "deterministic PI order: %s\n", DETERMINISTIC_PI_ORDER ? "yes" : "no");
     }
 
 
@@ -762,6 +784,14 @@ int main(int argc, char *argv[]) {
 
     int k;
     for (k = START_LEVEL; k <= ninputs; k++) {
+        int level_start[noutputs];
+        for (int o = 0; o < noutputs; ++o) {
+            int start_pi = (k > 1 && PInfo[o].nofpi) ? PInfo[o].nofpi[k - 2] : 0;
+            if (start_pi < 0 || start_pi > PInfo[o].foundPI) {
+                start_pi = PInfo[o].foundPI;
+            }
+            level_start[o] = start_pi;
+        }
 
         k_scp_time = 0.0; // reset time for this level
         clock_gettime(CLOCK_MONOTONIC, &startk);
@@ -819,6 +849,7 @@ int main(int argc, char *argv[]) {
             .increase = increase,
             .multiplier = &multiplier,
             .fast_filter_level = FAST_FILTER_LEVEL,
+            .deterministic_order = DETERMINISTIC_PI_ORDER,
             .time_limit_sec = TIME_LIMIT_SEC,
             .base_elapsed = BASE_ELAPSED,
             .start_time = start,
@@ -854,6 +885,17 @@ int main(int argc, char *argv[]) {
             memory_order_acquire
         );
         ccubes_mutex_destroy(&state_lock);
+
+        if (DETERMINISTIC_PI_ORDER) {
+            for (int o = 0; o < noutputs; ++o) {
+                if (!canonicalize_pi_order(&PInfo[o], implicant_words, level_start[o])) {
+                    fprintf(stderr, "Error: failed to canonicalize PI order for output %d\n", o + 1);
+                    destroy_output_locks(output_locks, noutputs);
+                    cleanup(PInfo, buffer);
+                    return 1;
+                }
+            }
+        }
 
         if (TIME_LIMIT_SEC > 0 && level_time_up) {
             if (!CHK_SAVE_PATH) {

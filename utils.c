@@ -30,6 +30,414 @@ static int cmp_pair_desc(
     return (pa->idx - pb->idx); // stable tie-breaker
 }
 
+typedef struct {
+    PIstorage *pi;
+    int implicant_words;
+} PICanonicalSortContext;
+
+static PICanonicalSortContext pi_canonical_sort_ctx;
+
+static int cmp_u64_words(
+    const uint64_t *a,
+    const uint64_t *b,
+    int n
+) {
+    for (int i = 0; i < n; ++i) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return 1;
+    }
+
+    return 0;
+}
+
+static int first_covered_row(
+    PIstorage *pi,
+    int idx
+) {
+    int rows = pi->ON_minterms;
+    for (int r = 0; r < rows; ++r) {
+        if (pi->pichart[(size_t)idx * (size_t)rows + (size_t)r]) return r;
+    }
+
+    return rows;
+}
+
+static int cmp_pi_canonical(
+    const void *a,
+    const void *b
+) {
+    const int ia = *(const int *)a;
+    const int ib = *(const int *)b;
+    PIstorage *pi = pi_canonical_sort_ctx.pi;
+    int ipw = pi_canonical_sort_ctx.implicant_words;
+
+    int cmp = cmp_u64_words(
+        &pi->implicants_pos[(size_t)ia * (size_t)ipw],
+        &pi->implicants_pos[(size_t)ib * (size_t)ipw],
+        ipw
+    );
+    if (cmp != 0) return cmp;
+
+    int first_a = first_covered_row(pi, ia);
+    int first_b = first_covered_row(pi, ib);
+    if (first_a != first_b) return first_a - first_b;
+
+    cmp = cmp_u64_words(
+        &pi->implicants_val[(size_t)ia * (size_t)ipw],
+        &pi->implicants_val[(size_t)ib * (size_t)ipw],
+        ipw
+    );
+    if (cmp != 0) return cmp;
+
+    cmp = cmp_u64_words(
+        &pi->pichart_pos[(size_t)ia * (size_t)pi->pichart_words],
+        &pi->pichart_pos[(size_t)ib * (size_t)pi->pichart_words],
+        pi->pichart_words
+    );
+    if (cmp != 0) return cmp;
+
+    if (pi->covsum[ia] != pi->covsum[ib]) {
+        return pi->covsum[ib] - pi->covsum[ia];
+    }
+
+    if (pi->shared[ia] != pi->shared[ib]) {
+        return pi->shared[ib] - pi->shared[ia];
+    }
+
+    return 0;
+}
+
+static uint64_t pi_coverage_hash(
+    PIstorage *pi,
+    int idx
+) {
+    const uint64_t FNV_OFFSET = 1469598103934665603ULL;
+    const uint64_t FNV_PRIME = 1099511628211ULL;
+    uint64_t hash = FNV_OFFSET;
+    uint64_t *coverage = &pi->pichart_pos[(size_t)idx * (size_t)pi->pichart_words];
+
+    for (int w = 0; w < pi->pichart_words; ++w) {
+        hash ^= coverage[w];
+        hash *= FNV_PRIME;
+    }
+
+    return hash;
+}
+
+static bool pi_coverage_equal(
+    PIstorage *pi,
+    int a,
+    int b
+) {
+    return cmp_u64_words(
+        &pi->pichart_pos[(size_t)a * (size_t)pi->pichart_words],
+        &pi->pichart_pos[(size_t)b * (size_t)pi->pichart_words],
+        pi->pichart_words
+    ) == 0;
+}
+
+static int pi_coverage_lookup(
+    PIstorage *pi,
+    int *slots,
+    size_t table_size,
+    int idx
+) {
+    size_t mask = table_size - 1u;
+    size_t pos = (size_t)(pi_coverage_hash(pi, idx) & (uint64_t)mask);
+
+    while (slots[pos] >= 0) {
+        if (pi_coverage_equal(pi, slots[pos], idx)) return slots[pos];
+        pos = (pos + 1u) & mask;
+    }
+
+    return -1;
+}
+
+static void pi_coverage_insert(
+    PIstorage *pi,
+    int *slots,
+    size_t table_size,
+    int idx
+) {
+    size_t mask = table_size - 1u;
+    size_t pos = (size_t)(pi_coverage_hash(pi, idx) & (uint64_t)mask);
+
+    while (slots[pos] >= 0) {
+        if (pi_coverage_equal(pi, slots[pos], idx)) return;
+        pos = (pos + 1u) & mask;
+    }
+
+    slots[pos] = idx;
+}
+
+static void copy_pi_record(
+    PIstorage *pi,
+    int dst,
+    int src,
+    int implicant_words
+) {
+    if (dst == src) return;
+
+    memmove(
+        &pi->pichart[(size_t)dst * (size_t)pi->ON_minterms],
+        &pi->pichart[(size_t)src * (size_t)pi->ON_minterms],
+        (size_t)pi->ON_minterms * sizeof(int)
+    );
+    memmove(
+        &pi->pichart_pos[(size_t)dst * (size_t)pi->pichart_words],
+        &pi->pichart_pos[(size_t)src * (size_t)pi->pichart_words],
+        (size_t)pi->pichart_words * sizeof(uint64_t)
+    );
+    memmove(
+        &pi->implicants_pos[(size_t)dst * (size_t)implicant_words],
+        &pi->implicants_pos[(size_t)src * (size_t)implicant_words],
+        (size_t)implicant_words * sizeof(uint64_t)
+    );
+    memmove(
+        &pi->implicants_val[(size_t)dst * (size_t)implicant_words],
+        &pi->implicants_val[(size_t)src * (size_t)implicant_words],
+        (size_t)implicant_words * sizeof(uint64_t)
+    );
+
+    pi->shared[dst] = pi->shared[src];
+    pi->covsum[dst] = pi->covsum[src];
+}
+
+static int prune_duplicate_coverage_in_level(
+    PIstorage *pi,
+    int implicant_words,
+    int level_start
+) {
+    int found = pi->foundPI;
+    size_t table_size = 1u;
+    while (table_size < (size_t)found * 2u) {
+        table_size <<= 1u;
+    }
+
+    int *slots = (int *)malloc(table_size * sizeof(int));
+    if (!slots) return 0;
+
+    for (size_t i = 0; i < table_size; ++i) {
+        slots[i] = -1;
+    }
+
+    for (int i = 0; i < level_start; ++i) {
+        pi_coverage_insert(pi, slots, table_size, i);
+    }
+
+    int write = level_start;
+    for (int read = level_start; read < found; ++read) {
+        if (pi_coverage_lookup(pi, slots, table_size, read) >= 0) {
+            continue;
+        }
+
+        copy_pi_record(pi, write, read, implicant_words);
+        pi_coverage_insert(pi, slots, table_size, write);
+        write++;
+    }
+
+    pi->foundPI = write;
+    free(slots);
+    return 1;
+}
+
+static int sanitize_covsum(
+    int covsum,
+    int rows
+) {
+    if (covsum < 1) return 1;
+    if (covsum > rows) return rows;
+    return covsum;
+}
+
+static int rebuild_pi_buckets(
+    PIstorage *pi,
+    int level_start
+) {
+    int rows = pi->ON_minterms;
+    int found = pi->foundPI;
+
+    int *prev_counts = (int *)calloc((size_t)rows, sizeof(int));
+    int *all_counts = (int *)calloc((size_t)rows, sizeof(int));
+    int *next_prev = (int *)calloc((size_t)rows, sizeof(int));
+    int *next_curr = (int *)calloc((size_t)rows, sizeof(int));
+
+    if (!prev_counts || !all_counts || !next_prev || !next_curr) {
+        free(prev_counts);
+        free(all_counts);
+        free(next_prev);
+        free(next_curr);
+        return 0;
+    }
+
+    for (int i = 0; i < found; ++i) {
+        int bucket = sanitize_covsum(pi->covsum[i], rows) - 1;
+        all_counts[bucket]++;
+        if (i < level_start) {
+            prev_counts[bucket]++;
+        }
+    }
+
+    int total = 0;
+    int prev_total = 0;
+    for (int bucket = 0; bucket < rows; ++bucket) {
+        next_prev[bucket] = total;
+        next_curr[bucket] = total + prev_counts[bucket];
+
+        prev_total += prev_counts[bucket];
+        total += all_counts[bucket];
+
+        pi->last_index[bucket] = prev_total;
+        pi->k_last_index[bucket] = total;
+    }
+
+    for (int i = 0; i < level_start; ++i) {
+        int bucket = sanitize_covsum(pi->covsum[i], rows) - 1;
+        pi->covered[next_prev[bucket]++] = i;
+    }
+
+    for (int i = level_start; i < found; ++i) {
+        int bucket = sanitize_covsum(pi->covsum[i], rows) - 1;
+        pi->covered[next_curr[bucket]++] = i;
+    }
+
+    free(prev_counts);
+    free(all_counts);
+    free(next_prev);
+    free(next_curr);
+    return 1;
+}
+
+int canonicalize_pi_order(
+    PIstorage *pi,
+    int implicant_words,
+    int level_start
+) {
+    if (!pi || pi->foundPI <= 0 || pi->ON_minterms <= 0) return 1;
+
+    if (level_start < 0) level_start = 0;
+    if (level_start > pi->foundPI) level_start = pi->foundPI;
+
+    int n = pi->foundPI - level_start;
+    if (n <= 1) {
+        if (n == 1 && !prune_duplicate_coverage_in_level(pi, implicant_words, level_start)) {
+            return 0;
+        }
+        return rebuild_pi_buckets(pi, level_start);
+    }
+
+    int rows = pi->ON_minterms;
+    int pichart_words = pi->pichart_words;
+
+    int *order = (int *)malloc((size_t)n * sizeof(int));
+    int *tmp_pichart = (int *)malloc((size_t)n * (size_t)rows * sizeof(int));
+    uint64_t *tmp_pichart_pos = (uint64_t *)malloc((size_t)n * (size_t)pichart_words * sizeof(uint64_t));
+    uint64_t *tmp_implicants_pos = (uint64_t *)malloc((size_t)n * (size_t)implicant_words * sizeof(uint64_t));
+    uint64_t *tmp_implicants_val = (uint64_t *)malloc((size_t)n * (size_t)implicant_words * sizeof(uint64_t));
+    int *tmp_shared = (int *)malloc((size_t)n * sizeof(int));
+    int *tmp_covsum = (int *)malloc((size_t)n * sizeof(int));
+
+    if (
+        !order ||
+        !tmp_pichart ||
+        !tmp_pichart_pos ||
+        !tmp_implicants_pos ||
+        !tmp_implicants_val ||
+        !tmp_shared ||
+        !tmp_covsum
+    ) {
+        free(order);
+        free(tmp_pichart);
+        free(tmp_pichart_pos);
+        free(tmp_implicants_pos);
+        free(tmp_implicants_val);
+        free(tmp_shared);
+        free(tmp_covsum);
+        return 0;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        order[i] = level_start + i;
+    }
+
+    pi_canonical_sort_ctx.pi = pi;
+    pi_canonical_sort_ctx.implicant_words = implicant_words;
+    qsort(order, (size_t)n, sizeof(int), cmp_pi_canonical);
+
+    for (int dst = 0; dst < n; ++dst) {
+        int src = order[dst];
+
+        memcpy(
+            &tmp_pichart[(size_t)dst * (size_t)rows],
+            &pi->pichart[(size_t)src * (size_t)rows],
+            (size_t)rows * sizeof(int)
+        );
+        memcpy(
+            &tmp_pichart_pos[(size_t)dst * (size_t)pichart_words],
+            &pi->pichart_pos[(size_t)src * (size_t)pichart_words],
+            (size_t)pichart_words * sizeof(uint64_t)
+        );
+        memcpy(
+            &tmp_implicants_pos[(size_t)dst * (size_t)implicant_words],
+            &pi->implicants_pos[(size_t)src * (size_t)implicant_words],
+            (size_t)implicant_words * sizeof(uint64_t)
+        );
+        memcpy(
+            &tmp_implicants_val[(size_t)dst * (size_t)implicant_words],
+            &pi->implicants_val[(size_t)src * (size_t)implicant_words],
+            (size_t)implicant_words * sizeof(uint64_t)
+        );
+
+        tmp_shared[dst] = pi->shared[src];
+        tmp_covsum[dst] = pi->covsum[src];
+    }
+
+    memcpy(
+        &pi->pichart[(size_t)level_start * (size_t)rows],
+        tmp_pichart,
+        (size_t)n * (size_t)rows * sizeof(int)
+    );
+    memcpy(
+        &pi->pichart_pos[(size_t)level_start * (size_t)pichart_words],
+        tmp_pichart_pos,
+        (size_t)n * (size_t)pichart_words * sizeof(uint64_t)
+    );
+    memcpy(
+        &pi->implicants_pos[(size_t)level_start * (size_t)implicant_words],
+        tmp_implicants_pos,
+        (size_t)n * (size_t)implicant_words * sizeof(uint64_t)
+    );
+    memcpy(
+        &pi->implicants_val[(size_t)level_start * (size_t)implicant_words],
+        tmp_implicants_val,
+        (size_t)n * (size_t)implicant_words * sizeof(uint64_t)
+    );
+    memcpy(
+        &pi->shared[level_start],
+        tmp_shared,
+        (size_t)n * sizeof(int)
+    );
+    memcpy(
+        &pi->covsum[level_start],
+        tmp_covsum,
+        (size_t)n * sizeof(int)
+    );
+
+    free(order);
+    free(tmp_pichart);
+    free(tmp_pichart_pos);
+    free(tmp_implicants_pos);
+    free(tmp_implicants_val);
+    free(tmp_shared);
+    free(tmp_covsum);
+
+    if (!prune_duplicate_coverage_in_level(pi, implicant_words, level_start)) {
+        return 0;
+    }
+
+    return rebuild_pi_buckets(pi, level_start);
+}
+
 void error_message(const char *msg) {
     fprintf(stderr, "%s\n", msg);
     exit(EXIT_FAILURE);
@@ -781,7 +1189,8 @@ int process_task(
     int *max_shared,
     int increase,
     int *multiplier,
-    int fast_filter_level
+    int fast_filter_level,
+    bool deterministic_order
 ) {
     int tempk[k];
     uint64_t combination = task;
@@ -1332,18 +1741,20 @@ int process_task(
 
                 int start_index = (k == 1 || u_covsum <= 1) ? 0 : last_index[u_covsum - 1];
 
-                for (int rd = start_index; rd < ((u_covsum <= 1) ? 0 : k_last_index[u_covsum - 1]); rd++) {
-                    bool dominated = true;
-                    for (int w = 0; w < pichart_words; w++) {
-                        if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
-                            dominated = false;
+                if (!deterministic_order) {
+                    for (int rd = start_index; rd < ((u_covsum <= 1) ? 0 : k_last_index[u_covsum - 1]); rd++) {
+                        bool dominated = true;
+                        for (int w = 0; w < pichart_words; w++) {
+                            if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
+                                dominated = false;
+                                break;
+                            }
+                        }
+
+                        if (dominated) {
+                            redundant = true;
                             break;
                         }
-                    }
-
-                    if (dominated) {
-                        redundant = true;
-                        break;
                     }
                 }
 

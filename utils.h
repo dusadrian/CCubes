@@ -138,7 +138,14 @@ int process_task(
     int *max_shared,
     int increase,
     int *multiplier,
-    int fast_filter_level // 0 = disabled; 1..3 increasing aggressiveness
+    int fast_filter_level, // 0 = disabled; 1..3 increasing aggressiveness
+    bool deterministic_order
+);
+
+int canonicalize_pi_order(
+    PIstorage *PInfo,
+    int implicant_words,
+    int level_start
 );
 
 #endif // UTILS_H
