@@ -78,16 +78,22 @@ else
   endif
 endif
 
-# try Gurobi (hardcoded path for now)
-GUROBI_HOME ?= /Library/gurobi1202/macos_universal2
-GUROBI_LIC  ?= $(HOME)/gurobi.lic
+# Try Gurobi. Override GUROBI_HOME/GUROBI_LIC/GUROBI_LIBNAME when needed.
+GUROBI_HOME ?= $(shell ls -d /Library/gurobi*/macos_universal2 2>/dev/null | sort | tail -n 1)
+GUROBI_LIC  ?= $(if $(GRB_LICENSE_FILE),$(GRB_LICENSE_FILE),$(HOME)/gurobi.lic)
+GUROBI_LIB  ?= $(shell if [ -n "$(GUROBI_HOME)" ] && [ -d "$(GUROBI_HOME)/lib" ]; then ls "$(GUROBI_HOME)"/lib/libgurobi[0-9]*.dylib 2>/dev/null | grep -E '/libgurobi[0-9]+\.dylib$$' | head -n 1; fi)
+GUROBI_LIBNAME ?= $(patsubst lib%.dylib,%,$(notdir $(GUROBI_LIB)))
 
 ifneq ("$(wildcard $(GUROBI_HOME))","")
   ifneq ("$(wildcard $(GUROBI_LIC))","")
-    CFLAGS   += -I$(GUROBI_HOME)/include -DHAVE_GUROBI
-    CXXFLAGS += -I$(GUROBI_HOME)/include -DHAVE_GUROBI
-    LDFLAGS  += -L$(GUROBI_HOME)/lib -lgurobi120
-    $(info Gurobi found at $(GUROBI_HOME) and license $(GUROBI_LIC) -> enabling)
+    ifneq ($(GUROBI_LIBNAME),)
+      CFLAGS   += -I$(GUROBI_HOME)/include -DHAVE_GUROBI
+      CXXFLAGS += -I$(GUROBI_HOME)/include -DHAVE_GUROBI
+      LDFLAGS  += -L$(GUROBI_HOME)/lib -l$(GUROBI_LIBNAME)
+      $(info Gurobi found at $(GUROBI_HOME), library $(GUROBI_LIBNAME), license $(GUROBI_LIC) -> enabling)
+    else
+      $(warning Gurobi found at $(GUROBI_HOME) but no libgurobi*.dylib was detected -> disabling)
+    endif
   else
     $(warning Gurobi found at $(GUROBI_HOME) but no license at $(GUROBI_LIC) -> disabling)
   endif
