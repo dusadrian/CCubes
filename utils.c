@@ -1719,52 +1719,56 @@ int process_task(
                 int o = output_map[u * noutputs + s];
 
                 int ON_minterms = PInfo[o].ON_minterms;
-                int *covered = PInfo[o].covered;
                 int *last_index = PInfo[o].last_index;
-                int *k_last_index = PInfo[o].k_last_index;
                 int pichart_words = PInfo[o].pichart_words;
-                uint64_t *pichart_pos = PInfo[o].pichart_pos;
-                int *pichart = PInfo[o].pichart;
-                uint64_t *implicants_pos = PInfo[o].implicants_pos;
-                uint64_t *implicants_val = PInfo[o].implicants_val;
-                int *estimPI = &PInfo[o].estimPI;
-                int *foundPI = &PInfo[o].foundPI;
-                int *shared = PInfo[o].shared;
-                int *covsum = PInfo[o].covsum;
 
                 uint64_t *task_pichart_values = buffer[tid][o].pichart_values;
-
-                bool redundant = false;
-
-                // check if the PI is redundant by row dominance
-                // but now against the previous PIs from the SAME complexity level k
-
-                int start_index = (k == 1 || u_covsum <= 1) ? 0 : last_index[u_covsum - 1];
-
-                if (!deterministic_order) {
-                    for (int rd = start_index; rd < ((u_covsum <= 1) ? 0 : k_last_index[u_covsum - 1]); rd++) {
-                        bool dominated = true;
-                        for (int w = 0; w < pichart_words; w++) {
-                            if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
-                                dominated = false;
-                                break;
-                            }
-                        }
-
-                        if (dominated) {
-                            redundant = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (redundant) continue;
 
                 // Sanitize covsum bounds to avoid OOB on k_last_index
                 if (u_covsum < 1) u_covsum = 1;
                 if (u_covsum > ON_minterms) u_covsum = ON_minterms;
 
                 if (output_locks) ccubes_mutex_lock(&output_locks[o]);
+
+                    int *covered = PInfo[o].covered;
+                    int *k_last_index = PInfo[o].k_last_index;
+                    uint64_t *pichart_pos = PInfo[o].pichart_pos;
+                    int *pichart = PInfo[o].pichart;
+                    uint64_t *implicants_pos = PInfo[o].implicants_pos;
+                    uint64_t *implicants_val = PInfo[o].implicants_val;
+                    int *estimPI = &PInfo[o].estimPI;
+                    int *foundPI = &PInfo[o].foundPI;
+                    int *shared = PInfo[o].shared;
+                    int *covsum = PInfo[o].covsum;
+
+                    bool redundant = false;
+
+                    // check if the PI is redundant by row dominance
+                    // but now against the previous PIs from the SAME complexity level k
+
+                    int start_index = (k == 1 || u_covsum <= 1) ? 0 : last_index[u_covsum - 1];
+
+                    if (!deterministic_order) {
+                        for (int rd = start_index; rd < ((u_covsum <= 1) ? 0 : k_last_index[u_covsum - 1]); rd++) {
+                            bool dominated = true;
+                            for (int w = 0; w < pichart_words; w++) {
+                                if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
+                                    dominated = false;
+                                    break;
+                                }
+                            }
+
+                            if (dominated) {
+                                redundant = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (redundant) {
+                        if (output_locks) ccubes_mutex_unlock(&output_locks[o]);
+                        continue;
+                    }
 
                     // Ensure capacity before writing the next PI
                     if ((*foundPI + 1) > *estimPI) {
