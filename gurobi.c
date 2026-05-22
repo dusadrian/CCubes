@@ -183,14 +183,6 @@ void gurobi_multiobjective(
     error = GRBoptimize(model);
     if (error) goto QUIT;
 
-    double objval;
-    error = GRBgetdblattr(model, GRB_DBL_ATTR_OBJVAL, &objval);
-    if (error) goto QUIT;
-
-    // printf("Objective value: %.2f\n", objval);
-
-    *solmin = (int)(objval);
-
     /* extract solution */
     error = GRBgetdblattrarray(model, GRB_DBL_ATTR_X, 0, foundPI, gurobi_sol);
     if (error) goto QUIT;
@@ -204,6 +196,7 @@ void gurobi_multiobjective(
             // printf("%d ", j+1);
         }
     }
+    *solmin = pos;
 
     QUIT:
 

@@ -11,6 +11,8 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
+#include <errno.h>
+#include <limits.h>
 #include <time.h>
 #include <stdatomic.h>
 #include "main.h"
@@ -62,6 +64,64 @@ static bool env_flag_enabled(const char *name) {
         strcmp(value, "no") != 0 &&
         strcmp(value, "NO") != 0
     );
+}
+
+static bool parse_int_strict(const char *text, int *value) {
+    if (!text || !*text || !value) return false;
+
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') return false;
+    if (parsed < INT_MIN || parsed > INT_MAX) return false;
+
+    *value = (int)parsed;
+    return true;
+}
+
+static bool parse_lagrangian_level(const char *text, int *level) {
+    int parsed = 0;
+    if (!parse_int_strict(text, &parsed)) return false;
+    if (parsed < 0 || parsed > 2) return false;
+    *level = parsed;
+    return true;
+}
+
+static void debug_print_lagrangian_stats(int output_index) {
+    DBG_INFO_BLOCK {
+        const LagrangianStats *stats = lagrangian_last_stats();
+        if (!stats || stats->stop_reason == LAGR_STOP_NOT_RUN) return;
+
+        fprintf(
+            debug_out,
+            "Lagrangian output %d: rows=%d cols=%d UB=%d ",
+            output_index + 1,
+            stats->rows,
+            stats->cols,
+            stats->best_ub
+        );
+
+        if (stats->best_lb == INT_MIN) {
+            fprintf(debug_out, "LB=- gap=- ");
+        } else {
+            fprintf(
+                debug_out,
+                "LB=%d gap=%d ",
+                stats->best_lb,
+                stats->gap
+            );
+        }
+
+        fprintf(
+            debug_out,
+            "bestZLB=%.6f lastZLB=%.6f iterations=%d stop=%s%s\n",
+            stats->best_zlb,
+            stats->last_zlb,
+            stats->iterations,
+            lagrangian_stop_reason_name(stats->stop_reason),
+            stats->pool_mode ? " pool" : ""
+        );
+    }
 }
 
 static void pi_search_range_worker(
@@ -155,6 +215,10 @@ void help() {
     printf("  -s<number>         : how to solve the covering problem:\n");
     printf("                         0 (default) Lagrangian relaxation heuristic\n");
     printf("                         1 Gurobi exact\n");
+    printf("  -l<number>         : Lagrangian effort level:\n");
+    printf("                         0 (default) fastest\n");
+    printf("                         1 stronger bounds, more time\n");
+    printf("                         2 best bound mode, adaptive bundle portfolio with bounded strong finish\n");
     printf("  -d<level>[=<file>] : incremental debug information\n");
     printf("                         0 (default) errors + warnings\n");
     printf("                         1 errors + warnings + info\n");
@@ -194,6 +258,7 @@ int main(int argc, char *argv[]) {
     bool THREADS_FORCED = false; // set to true if -c is provided
     int WEIGHT_PIC = 1;
     int SCP_TYPE = 0;
+    int LAGRANGIAN_LEVEL = 0;
     int POOL_MAX = 1; // collect up to this many solutions
     int FAST_FILTER_LEVEL = 0; // 0 disabled; 1..3 increasing aggressiveness
     bool DETERMINISTIC_PI_ORDER = env_flag_enabled("CCUBES_DETERMINISTIC");
@@ -247,6 +312,22 @@ int main(int argc, char *argv[]) {
             SCP_TYPE = atoi(argv[i] + 2);
             if (SCP_TYPE != 0 && SCP_TYPE != 1) {
                 fprintf(stderr, "Invalid SCP solver: %d (must be 0 or 1)\n", SCP_TYPE);
+                help();
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-l") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: -l requires a level (0, 1, or 2)\n");
+                return 1;
+            }
+            if (!parse_lagrangian_level(argv[++i], &LAGRANGIAN_LEVEL)) {
+                fprintf(stderr, "Invalid Lagrangian effort level: %s (must be 0, 1, or 2)\n", argv[i]);
+                help();
+                return 1;
+            }
+        } else if (strncmp(argv[i], "-l", 2) == 0) {
+            if (!parse_lagrangian_level(argv[i] + 2, &LAGRANGIAN_LEVEL)) {
+                fprintf(stderr, "Invalid Lagrangian effort level: %s (must be 0, 1, or 2)\n", argv[i] + 2);
                 help();
                 return 1;
             }
@@ -336,6 +417,10 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             help();
             return 0;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            help();
+            return 1;
         } else if (!SRC_FILE) {
             SRC_FILE = argv[i];
         } else if (!DST_FILE) {
@@ -383,6 +468,7 @@ int main(int argc, char *argv[]) {
     DBG_INFO_BLOCK {
         fprintf(debug_out, "--- START ---\n");
         fprintf(debug_out, "SCP_TYPE: %d\n", SCP_TYPE);
+        fprintf(debug_out, "LAGRANGIAN_LEVEL: %d\n", LAGRANGIAN_LEVEL);
     }
 
     PIstorage *PInfo = NULL;
@@ -1031,8 +1117,10 @@ int main(int argc, char *argv[]) {
                             ON_minterms,
                             weights,
                             indices,
-                            solmin
+                            solmin,
+                            LAGRANGIAN_LEVEL
                         );
+                        debug_print_lagrangian_stats(o);
                     }
 
                     if (SCP_TYPE == 1) { // Gurobi: blended multi-objective
@@ -1228,8 +1316,10 @@ int main(int argc, char *argv[]) {
                             POOL_MAX,
                             pool_count,
                             pool_solutions,
-                            solmin
+                            solmin,
+                            LAGRANGIAN_LEVEL
                         );
+                        debug_print_lagrangian_stats(o);
                     }
 
                     if (SCP_TYPE == 1) { // Gurobi: solution pool
