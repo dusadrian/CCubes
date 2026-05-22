@@ -1,3 +1,11 @@
+/*
+    Copyright (c) 2016–2026, Adrian Dusa
+    All rights reserved.
+
+    License: Academic Non-Commercial License (see LICENSE file for details).
+    SPDX-License-Identifier: LicenseRef-ANCL-AdrianDusa
+*/
+
 #include "ccubes_threads.h"
 
 #include <stdlib.h>
