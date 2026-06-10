@@ -1897,19 +1897,19 @@ static int lagr_normalize_effort_level(int effort_level) {
 static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     effort_level = lagr_normalize_effort_level(effort_level);
 
-    cfg->max_iter = 20000;        /* total iterations of subgradient */
-    cfg->heur_every = 1;          /* construct a feasible solution every N iterations */
-    cfg->step_coef = 2.0;         /* initial step coefficient */
-    cfg->step_min = 0.005;        /* minimal step coefficient */
+    cfg->max_iter = 5000;          /* total iterations of subgradient */
+    cfg->heur_every = 3;           /* construct a feasible solution every N iterations */
+    cfg->step_coef = 1.5;          /* initial step coefficient */
+    cfg->step_min = 0.005;         /* minimal step coefficient */
     cfg->step_contract = 0.5;      /* current CCubes behavior: halve after stagnation */
     cfg->stabilization_beta = 1.0; /* no damping unless explicitly requested */
-    cfg->halve_period = 8;        /* halve step if no progress for this many iterations */
-    cfg->local_passes = 10;
+    cfg->halve_period = 8;         /* halve step if no progress for this many iterations */
+    cfg->deflection_alpha = 0.0;   /* deflected subgradient direction, disabled by default */
+    cfg->polish_enabled = 0;       /* bounded one-term exact polish when UB-LB is one */
+    cfg->local_passes = 0;
     cfg->small_gap_threshold = 0;
     cfg->small_gap_extra_passes = cfg->local_passes;
     cfg->rarity_init = 0;
-    cfg->deflection_alpha = 0.0;  /* deflected subgradient direction, disabled by default */
-    cfg->polish_enabled = 1;      /* bounded one-term exact polish when UB-LB is one */
     cfg->polish_node_limit = 5000;
     cfg->portfolio_enabled = 0;
     cfg->portfolio_max_profiles = 1;
@@ -1927,15 +1927,21 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     cfg->bundle_serious_tol = 1e-9;
     cfg->bundle_momentum = 0.0;
 
-    if (effort_level == 1) {
+    if (effort_level > 0) {
+        cfg->max_iter = 20000;
+        cfg->heur_every = 1;
+        cfg->step_coef = 2.0;
+        cfg->local_passes = 10;
+        cfg->small_gap_extra_passes = cfg->local_passes;
         cfg->step_contract = 0.95;
+        cfg->polish_enabled = 1;
         cfg->portfolio_enabled = 1;
         cfg->portfolio_max_profiles = 2;
-    } else if (effort_level == 2) {
-        cfg->step_contract = 0.95;
+    }
+
+    if (effort_level > 1) {
         cfg->bundle_interval = 8;
         cfg->bundle_momentum = 0.35;
-        cfg->portfolio_enabled = 1;
         cfg->portfolio_max_profiles = 6;
         cfg->hybrid_bundle_portfolio = 1;
     }
