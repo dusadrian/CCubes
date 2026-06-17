@@ -220,6 +220,7 @@ typedef struct {
     const double *t;
     double *ls;
     double *partials;
+    const double *col_costs;
 } lagr_reduced_context;
 
 static void lagr_reduced_worker(
@@ -240,7 +241,8 @@ static void lagr_reduced_worker(
             int r = ctx->rowsCovered[c][k];
             sum += ctx->t[r];
         }
-        ctx->ls[c] = 1.0 - sum;
+        double cost = ctx->col_costs ? ctx->col_costs[c] : 1.0;
+        ctx->ls[c] = cost - sum;
         if (ctx->ls[c] < 0.0) neg += ctx->ls[c];
     }
     ctx->partials[worker_id] = neg;
@@ -624,6 +626,7 @@ static double compute_reduced_and_lb(
     int **rowsCovered,
     int *rowsCoveredCount,
     const double *t,
+    const double *col_costs, // can be NULL
     double *ls /* out */
 ) {
     double ZLB = 0.0;
@@ -652,7 +655,8 @@ static double compute_reduced_and_lb(
         .rowsCoveredCount = rowsCoveredCount,
         .t = t,
         .ls = ls,
-        .partials = partials
+        .partials = partials,
+        .col_costs = col_costs
     };
     if (!ccubes_parallel_for(0, (uint64_t)cols, threads, false, lagr_reduced_worker, &reduced_ctx)) {
         free(partials);
@@ -1859,6 +1863,7 @@ typedef struct {
     double stabilization_beta;
     int halve_period;
     int local_passes;
+    int drop2_enabled;
     int small_gap_threshold;
     int small_gap_extra_passes;
     int rarity_init;
@@ -1897,7 +1902,7 @@ static int lagr_normalize_effort_level(int effort_level) {
 static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     effort_level = lagr_normalize_effort_level(effort_level);
 
-    cfg->max_iter = 5000;          /* total iterations of subgradient */
+    cfg->max_iter = 200;           /* total iterations of subgradient */
     cfg->heur_every = 3;           /* construct a feasible solution every N iterations */
     cfg->step_coef = 1.5;          /* initial step coefficient */
     cfg->step_min = 0.005;         /* minimal step coefficient */
@@ -1907,6 +1912,7 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     cfg->deflection_alpha = 0.0;   /* deflected subgradient direction, disabled by default */
     cfg->polish_enabled = 0;       /* bounded one-term exact polish when UB-LB is one */
     cfg->local_passes = 0;
+    cfg->drop2_enabled = 0;
     cfg->small_gap_threshold = 0;
     cfg->small_gap_extra_passes = cfg->local_passes;
     cfg->rarity_init = 0;
@@ -1927,11 +1933,12 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     cfg->bundle_serious_tol = 1e-9;
     cfg->bundle_momentum = 0.0;
 
-    if (effort_level > 0) {
-        cfg->max_iter = 20000;
+    if (effort_level == 1) {
+        cfg->max_iter = 1000;
         cfg->heur_every = 1;
         cfg->step_coef = 2.0;
         cfg->local_passes = 10;
+        cfg->drop2_enabled = 0;
         cfg->small_gap_extra_passes = cfg->local_passes;
         cfg->step_contract = 0.95;
         cfg->polish_enabled = 1;
@@ -1939,11 +1946,20 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
         cfg->portfolio_max_profiles = 2;
     }
 
-    if (effort_level > 1) {
-        cfg->bundle_interval = 8;
-        cfg->bundle_momentum = 0.35;
+    if (effort_level == 2) {
+        cfg->max_iter = 5000;
+        cfg->heur_every = 1;
+        cfg->step_coef = 2.0;
+        cfg->local_passes = 10;
+        cfg->drop2_enabled = 1;
+        cfg->small_gap_extra_passes = cfg->local_passes;
+        cfg->step_contract = 0.95;
+        cfg->polish_enabled = 1;
+        cfg->portfolio_enabled = 1;
         cfg->portfolio_max_profiles = 6;
         cfg->hybrid_bundle_portfolio = 1;
+        cfg->bundle_interval = 8;
+        cfg->bundle_momentum = 0.35;
     }
 }
 
@@ -2026,17 +2042,33 @@ static void solve_scp_lagrangian_config(
     double *ls = (double*)malloc((size_t)cols * sizeof(double));
     int *sol_tmp = (int*)malloc((size_t)cols * sizeof(int));
     int *sol_tmp2 = (int*)malloc((size_t)cols * sizeof(int));
+    double *col_costs = (double*)malloc((size_t)cols * sizeof(double));
     int best_sol_size = -1;
     int stuck_iter = 0;
 
-    if (!t || !ls || !sol_tmp || !sol_tmp2) {
+    if (!t || !ls || !sol_tmp || !sol_tmp2 || !col_costs) {
         free(t);
         free(ls);
         free(sol_tmp);
         free(sol_tmp2);
+        free(col_costs);
 
         lagr_stats_finish(-1, -DBL_MAX, -DBL_MAX, -DBL_MAX, 0.0, 0, LAGR_STOP_OOM);
         return;
+    }
+
+    double max_w = 0.0;
+    if (weights) {
+        for (int j = 0; j < cols; ++j) {
+            if (weights[j] > max_w) max_w = weights[j];
+        }
+    }
+    double eps = 0.0;
+    if (max_w > 0.0) {
+        eps = 1e-6 / (max_w + 1.0);
+    }
+    for (int j = 0; j < cols; ++j) {
+        col_costs[j] = 1.0 - eps * (weights ? weights[j] : 0.0);
     }
 
     int local_passes = cfg->local_passes;
@@ -2047,8 +2079,6 @@ static void solve_scp_lagrangian_config(
     double step_contract = cfg->step_contract;
     double stabilization_beta = cfg->stabilization_beta;
     int halve_period = cfg->halve_period;
-    int small_gap_threshold = cfg->small_gap_threshold;
-    int small_gap_extra_passes = cfg->small_gap_extra_passes;
     double deflection_alpha = cfg->deflection_alpha;
     double *prev_direction = NULL;
     LagrangianBundleState bundle_state = {0};
@@ -2060,6 +2090,7 @@ static void solve_scp_lagrangian_config(
             free(ls);
             free(sol_tmp);
             free(sol_tmp2);
+            free(col_costs);
             lagr_stats_finish(-1, -DBL_MAX, -DBL_MAX, -DBL_MAX, 0.0, 0, LAGR_STOP_OOM);
             return;
         }
@@ -2092,6 +2123,7 @@ static void solve_scp_lagrangian_config(
             free(ls);
             free(sol_tmp);
             free(sol_tmp2);
+            free(col_costs);
             lagr_stats_finish(-1, -DBL_MAX, -DBL_MAX, -DBL_MAX, 0.0, 0, LAGR_STOP_OOM);
             return;
         }
@@ -2111,6 +2143,7 @@ static void solve_scp_lagrangian_config(
         rowsCovered,
         rowsCoveredCount,
         t,
+        col_costs,
         ls
     );
     bestZLB = initialZLB;
@@ -2264,6 +2297,7 @@ static void solve_scp_lagrangian_config(
             rowsCovered,
             rowsCoveredCount,
             t,
+            col_costs,
             ls
         );
         lastZLB = ZLB;
@@ -2305,135 +2339,7 @@ static void solve_scp_lagrangian_config(
                 &sol_size2
             );
 
-            if (local_passes > 0) {
-                if (sol_size > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp,
-                        &sol_size,
-                        local_passes
-                    );
-
-                    local_search_drop2_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp,
-                        &sol_size,
-                        local_passes
-                    );
-                }
-
-                if (sol_size2 > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp2,
-                        &sol_size2,
-                        local_passes
-                    );
-
-                    local_search_drop2_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp2,
-                        &sol_size2,
-                        local_passes
-                    );
-                }
-            }
-
-            if (
-                small_gap_extra_passes > local_passes &&
-                small_gap_threshold > 0 &&
-                bestTerms < INT_MAX &&
-                bestTerms - (int)LBint <= small_gap_threshold
-            ) {
-                if (sol_size > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp,
-                        &sol_size,
-                        small_gap_extra_passes
-                    );
-
-                    local_search_drop2_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp,
-                        &sol_size,
-                        small_gap_extra_passes
-                    );
-                }
-
-                if (sol_size2 > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp2,
-                        &sol_size2,
-                        small_gap_extra_passes
-                    );
-
-                    local_search_drop2_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp2,
-                        &sol_size2,
-                        small_gap_extra_passes
-                    );
-                }
-            }
-
+            bool found_new_best = false;
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
             double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
 
@@ -2451,8 +2357,8 @@ static void solve_scp_lagrangian_config(
                 bestTerms = sol_size;
                 bestWeight = candW1;
                 best_sol_size = sol_size;
-
                 memcpy(solution, sol_tmp, (size_t)sol_size * sizeof(int));
+                found_new_best = true;
             }
 
             if (
@@ -2468,8 +2374,61 @@ static void solve_scp_lagrangian_config(
                 bestTerms = sol_size2;
                 bestWeight = candW2;
                 best_sol_size = sol_size2;
-
                 memcpy(solution, sol_tmp2, (size_t)sol_size2 * sizeof(int));
+                found_new_best = true;
+            }
+
+            if (found_new_best && local_passes > 0) {
+                int current_sol_size = best_sol_size;
+                int *current_sol = (int*)malloc((size_t)cols * sizeof(int));
+                if (current_sol) {
+                    memcpy(current_sol, solution, (size_t)current_sol_size * sizeof(int));
+
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        current_sol,
+                        &current_sol_size,
+                        local_passes
+                    );
+
+                    if (cfg->drop2_enabled) {
+                        local_search_drop2_repair(
+                            rows,
+                            cols,
+                            rowsCovered,
+                            rowsCoveredCount,
+                            colsCovering,
+                            colsCoveringCount,
+                            ls,
+                            weights,
+                            current_sol,
+                            &current_sol_size,
+                            local_passes
+                        );
+                    }
+
+                    double polished_weight = solution_total_weight(current_sol, current_sol_size, weights);
+                    if (
+                        current_sol_size < bestTerms ||
+                        (
+                            current_sol_size == bestTerms && polished_weight > bestWeight + EPS
+                        )
+                    ) {
+                        bestUB = (double)current_sol_size;
+                        bestTerms = current_sol_size;
+                        bestWeight = polished_weight;
+                        best_sol_size = current_sol_size;
+                        memcpy(solution, current_sol, (size_t)current_sol_size * sizeof(int));
+                    }
+                    free(current_sol);
+                }
             }
         }
 
@@ -2549,68 +2508,7 @@ static void solve_scp_lagrangian_config(
                 &sol_size2
             );
 
-            if (local_passes > 0) {
-                if (sol_size > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp,
-                        &sol_size,
-                        local_passes
-                    );
-
-                    local_search_drop2_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp,
-                        &sol_size,
-                        local_passes
-                    );
-                }
-
-                if (sol_size2 > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp2,
-                        &sol_size2,
-                        local_passes
-                    );
-
-                    local_search_drop2_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        ls,
-                        weights,
-                        sol_tmp2,
-                        &sol_size2,
-                        local_passes
-                    );
-                }
-            }
-
+            bool found_new_best = false;
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
             double candW2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
 
@@ -2627,8 +2525,8 @@ static void solve_scp_lagrangian_config(
                 bestTerms = sol_size;
                 bestWeight = candW1;
                 best_sol_size = sol_size;
-
                 memcpy(solution, sol_tmp, (size_t)sol_size * sizeof(int));
+                found_new_best = true;
             }
 
             if (
@@ -2644,8 +2542,61 @@ static void solve_scp_lagrangian_config(
                 bestTerms = sol_size2;
                 bestWeight = candW2;
                 best_sol_size = sol_size2;
-
                 memcpy(solution, sol_tmp2, (size_t)sol_size2 * sizeof(int));
+                found_new_best = true;
+            }
+
+            if (found_new_best && local_passes > 0) {
+                int current_sol_size = best_sol_size;
+                int *current_sol = (int*)malloc((size_t)cols * sizeof(int));
+                if (current_sol) {
+                    memcpy(current_sol, solution, (size_t)current_sol_size * sizeof(int));
+
+                    local_search_drop1_repair(
+                        rows,
+                        cols,
+                        rowsCovered,
+                        rowsCoveredCount,
+                        colsCovering,
+                        colsCoveringCount,
+                        ls,
+                        weights,
+                        current_sol,
+                        &current_sol_size,
+                        local_passes
+                    );
+
+                    if (cfg->drop2_enabled) {
+                        local_search_drop2_repair(
+                            rows,
+                            cols,
+                            rowsCovered,
+                            rowsCoveredCount,
+                            colsCovering,
+                            colsCoveringCount,
+                            ls,
+                            weights,
+                            current_sol,
+                            &current_sol_size,
+                            local_passes
+                        );
+                    }
+
+                    double polished_weight = solution_total_weight(current_sol, current_sol_size, weights);
+                    if (
+                        current_sol_size < bestTerms ||
+                        (
+                            current_sol_size == bestTerms && polished_weight > bestWeight + EPS
+                        )
+                    ) {
+                        bestUB = (double)current_sol_size;
+                        bestTerms = current_sol_size;
+                        bestWeight = polished_weight;
+                        best_sol_size = current_sol_size;
+                        memcpy(solution, current_sol, (size_t)current_sol_size * sizeof(int));
+                    }
+                    free(current_sol);
+                }
             }
             break;
         }
@@ -2689,6 +2640,7 @@ static void solve_scp_lagrangian_config(
     free(ls);
     free(sol_tmp);
     free(sol_tmp2);
+    free(col_costs);
     free(prev_direction);
     free(bundle_state.center_t);
     free(bundle_state.prev_center_t);
@@ -2936,13 +2888,15 @@ void solve_scp_lagrangian_pool(
     int *sol_tmp = (int*)malloc((size_t)cols * sizeof(int));
     int *sol_tmp2 = (int*)malloc((size_t)cols * sizeof(int));
     int *norm = (int*)malloc((size_t)cols * sizeof(int));
+    double *col_costs = (double*)malloc((size_t)cols * sizeof(double));
 
-    if (!t || !rc || !sol_tmp || !sol_tmp2 || !norm) {
+    if (!t || !rc || !sol_tmp || !sol_tmp2 || !norm || !col_costs) {
         free(t);
         free(rc);
         free(sol_tmp);
         free(sol_tmp2);
         free(norm);
+        free(col_costs);
         free_adjacency(
             rowsCovered,
             rowsCoveredCount,
@@ -2953,6 +2907,20 @@ void solve_scp_lagrangian_pool(
         );
         lagr_stats_finish(-1, -DBL_MAX, -DBL_MAX, -DBL_MAX, 0.0, 0, LAGR_STOP_OOM);
         return;
+    }
+
+    double max_w = 0.0;
+    if (weights) {
+        for (int j = 0; j < cols; ++j) {
+            if (weights[j] > max_w) max_w = weights[j];
+        }
+    }
+    double eps = 0.0;
+    if (max_w > 0.0) {
+        eps = 1e-6 / (max_w + 1.0);
+    }
+    for (int j = 0; j < cols; ++j) {
+        col_costs[j] = 1.0 - eps * (weights ? weights[j] : 0.0);
     }
 
     int pool_count = 0;
@@ -2997,6 +2965,7 @@ void solve_scp_lagrangian_pool(
             free(sol_tmp);
             free(sol_tmp2);
             free(norm);
+            free(col_costs);
             free_adjacency(
                 rowsCovered,
                 rowsCoveredCount,
@@ -3024,6 +2993,7 @@ void solve_scp_lagrangian_pool(
         rowsCovered,
         rowsCoveredCount,
         t,
+        col_costs,
         rc
     );
     bestZLB = initialZLB;
@@ -3214,6 +3184,7 @@ void solve_scp_lagrangian_pool(
             rowsCovered,
             rowsCoveredCount,
             t,
+            col_costs,
             rc
         );
         lastZLB = ZLB;
@@ -3254,22 +3225,21 @@ void solve_scp_lagrangian_pool(
                 &sol_size2
             );
 
-            if (local_passes > 0) {
-                if (sol_size > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        rc,
-                        weights,
-                        sol_tmp,
-                        &sol_size,
-                        local_passes
-                    );
-
+            if (sol_size != -1 && sol_size <= pool_min_len && local_passes > 0) {
+                local_search_drop1_repair(
+                    rows,
+                    cols,
+                    rowsCovered,
+                    rowsCoveredCount,
+                    colsCovering,
+                    colsCoveringCount,
+                    rc,
+                    weights,
+                    sol_tmp,
+                    &sol_size,
+                    local_passes
+                );
+                if (cfg.drop2_enabled) {
                     local_search_drop2_repair(
                         rows,
                         cols,
@@ -3284,22 +3254,23 @@ void solve_scp_lagrangian_pool(
                         local_passes
                     );
                 }
+            }
 
-                if (sol_size2 > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        rc,
-                        weights,
-                        sol_tmp2,
-                        &sol_size2,
-                        local_passes
-                    );
-
+            if (sol_size2 != -1 && sol_size2 <= pool_min_len && local_passes > 0) {
+                local_search_drop1_repair(
+                    rows,
+                    cols,
+                    rowsCovered,
+                    rowsCoveredCount,
+                    colsCovering,
+                    colsCoveringCount,
+                    rc,
+                    weights,
+                    sol_tmp2,
+                    &sol_size2,
+                    local_passes
+                );
+                if (cfg.drop2_enabled) {
                     local_search_drop2_repair(
                         rows,
                         cols,
@@ -3494,22 +3465,21 @@ void solve_scp_lagrangian_pool(
                 &sol_size2
             );
 
-            if (local_passes > 0) {
-                if (sol_size > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        rc,
-                        weights,
-                        sol_tmp,
-                        &sol_size,
-                        local_passes
-                    );
-
+            if (sol_size != -1 && sol_size <= pool_min_len && local_passes > 0) {
+                local_search_drop1_repair(
+                    rows,
+                    cols,
+                    rowsCovered,
+                    rowsCoveredCount,
+                    colsCovering,
+                    colsCoveringCount,
+                    rc,
+                    weights,
+                    sol_tmp,
+                    &sol_size,
+                    local_passes
+                );
+                if (cfg.drop2_enabled) {
                     local_search_drop2_repair(
                         rows,
                         cols,
@@ -3524,22 +3494,23 @@ void solve_scp_lagrangian_pool(
                         local_passes
                     );
                 }
+            }
 
-                if (sol_size2 > 0) {
-                    local_search_drop1_repair(
-                        rows,
-                        cols,
-                        rowsCovered,
-                        rowsCoveredCount,
-                        colsCovering,
-                        colsCoveringCount,
-                        rc,
-                        weights,
-                        sol_tmp2,
-                        &sol_size2,
-                        local_passes
-                    );
-
+            if (sol_size2 != -1 && sol_size2 <= pool_min_len && local_passes > 0) {
+                local_search_drop1_repair(
+                    rows,
+                    cols,
+                    rowsCovered,
+                    rowsCoveredCount,
+                    colsCovering,
+                    colsCoveringCount,
+                    rc,
+                    weights,
+                    sol_tmp2,
+                    &sol_size2,
+                    local_passes
+                );
+                if (cfg.drop2_enabled) {
                     local_search_drop2_repair(
                         rows,
                         cols,
@@ -3681,6 +3652,7 @@ void solve_scp_lagrangian_pool(
     free(sol_tmp);
     free(sol_tmp2);
     free(norm);
+    free(col_costs);
     free(bundle_state.center_t);
     free(bundle_state.prev_center_t);
     free(bundle_state.cut_alpha);
