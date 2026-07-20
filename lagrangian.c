@@ -193,34 +193,13 @@ static void lagr_fill_cols_covering_worker(
 }
 
 typedef struct {
-    const double *t;
-    double *partials;
-} lagr_sum_t_context;
-
-static void lagr_sum_t_worker(
-    uint64_t start,
-    uint64_t end,
-    uint64_t stride,
-    int worker_id,
-    int worker_count,
-    void *data
-) {
-    (void)worker_count;
-    lagr_sum_t_context *ctx = (lagr_sum_t_context *)data;
-    double sum = 0.0;
-    for (uint64_t i = start; i < end; i += stride) {
-        sum += ctx->t[i];
-    }
-    ctx->partials[worker_id] = sum;
-}
-
-typedef struct {
     int **rowsCovered;
     int *rowsCoveredCount;
     const double *t;
     double *ls;
     double *partials;
     const double *col_costs;
+    unsigned char *x;
 } lagr_reduced_context;
 
 static void lagr_reduced_worker(
@@ -243,30 +222,10 @@ static void lagr_reduced_worker(
         }
         double cost = ctx->col_costs ? ctx->col_costs[c] : 1.0;
         ctx->ls[c] = cost - sum;
+        if (ctx->x) ctx->x[c] = (ctx->ls[c] < 0.0) ? 1 : 0;
         if (ctx->ls[c] < 0.0) neg += ctx->ls[c];
     }
     ctx->partials[worker_id] = neg;
-}
-
-typedef struct {
-    const double *ls;
-    unsigned char *x;
-} lagr_x_context;
-
-static void lagr_x_worker(
-    uint64_t start,
-    uint64_t end,
-    uint64_t stride,
-    int worker_id,
-    int worker_count,
-    void *data
-) {
-    (void)worker_id;
-    (void)worker_count;
-    lagr_x_context *ctx = (lagr_x_context *)data;
-    for (uint64_t c = start; c < end; c += stride) {
-        ctx->x[c] = (ctx->ls[c] < 0.0) ? 1 : 0;
-    }
 }
 
 typedef struct {
@@ -300,35 +259,6 @@ static void lagr_slack_worker(
         sum_s2 += s * s;
     }
     ctx->partials[worker_id] = sum_s2;
-}
-
-typedef struct {
-    double *t;
-    const double *slack;
-    double step;
-    double stabilization_beta;
-} lagr_update_t_context;
-
-static void lagr_update_t_worker(
-    uint64_t start,
-    uint64_t end,
-    uint64_t stride,
-    int worker_id,
-    int worker_count,
-    void *data
-) {
-    (void)worker_id;
-    (void)worker_count;
-    lagr_update_t_context *ctx = (lagr_update_t_context *)data;
-    for (uint64_t i = start; i < end; i += stride) {
-        double trial = ctx->t[i] + ctx->step * ctx->slack[i];
-        if (trial < 0.0) trial = 0.0;
-        double beta = ctx->stabilization_beta;
-        double val = (beta >= 1.0)
-            ? trial
-            : ((1.0 - beta) * ctx->t[i] + beta * trial);
-        ctx->t[i] = (val > 0.0) ? val : 0.0;
-    }
 }
 
 /*
@@ -384,8 +314,8 @@ static int build_adjacency(
         }
     }
 
-    rc = (int**)malloc((size_t)cols * sizeof(int*));
-    cr = (int**)malloc((size_t)rows * sizeof(int*));
+    rc = (int**)calloc((size_t)cols, sizeof(int*));
+    cr = (int**)calloc((size_t)rows, sizeof(int*));
     if (!rc || !cr) goto oom;
 
     for (int c = 0; c < cols; ++c) {
@@ -458,6 +388,117 @@ static void free_adjacency(
     }
 
     free(colsCoveringCount);
+}
+
+/*
+Column presolve (single-solution path only): deactivate any column whose
+coverage is a subset of another column's coverage, provided the dominating
+column has at least equal weight. This preserves both the minimum-size
+objective and the max-weight tie-break, while shrinking the instance for
+the subgradient loop, the heuristics and the bounded finish.
+Deactivated columns get rowsCoveredCount[c] = 0 and are removed from the
+colsCovering lists; column indices remain stable, so solutions still refer
+to the original pichart columns.
+Returns the number of deactivated columns (0 on OOM: presolve is skipped).
+*/
+static int presolve_dominated_columns(
+    int rows,
+    int cols,
+    int **rowsCovered,
+    int *rowsCoveredCount,
+    int **colsCovering,
+    int *colsCoveringCount,
+    const double *weights
+) {
+    if (rows <= 0 || cols <= 1) return 0;
+
+    int words = (rows + 63) / 64;
+    uint64_t *bits = (uint64_t*)calloc((size_t)cols * (size_t)words, sizeof(uint64_t));
+    unsigned char *active = (unsigned char*)malloc((size_t)cols);
+    if (!bits || !active) {
+        free(bits);
+        free(active);
+        return 0;
+    }
+
+    for (int c = 0; c < cols; ++c) {
+        active[c] = 1;
+        uint64_t *bc = bits + (size_t)c * words;
+        for (int k = 0; k < rowsCoveredCount[c]; ++k) {
+            int r = rowsCovered[c][k];
+            bc[r >> 6] |= 1ULL << (r & 63);
+        }
+    }
+
+    int removed = 0;
+    for (int c = 0; c < cols; ++c) {
+        if (!active[c] || rowsCoveredCount[c] <= 0) continue;
+
+        /* rarest row covered by c: smallest candidate list to scan */
+        int rmin = -1;
+        int best = INT_MAX;
+        for (int k = 0; k < rowsCoveredCount[c]; ++k) {
+            int r = rowsCovered[c][k];
+            if (colsCoveringCount[r] < best) {
+                best = colsCoveringCount[r];
+                rmin = r;
+            }
+        }
+        if (rmin < 0) continue;
+
+        double wc = weights ? weights[c] : 0.0;
+        const uint64_t *bc = bits + (size_t)c * words;
+
+        for (int k = 0; k < colsCoveringCount[rmin]; ++k) {
+            int d = colsCovering[rmin][k];
+            if (d == c || !active[d]) continue;
+            if (rowsCoveredCount[d] < rowsCoveredCount[c]) continue;
+
+            double wd = weights ? weights[d] : 0.0;
+            if (wd + EPS < wc) continue; /* keep the heavier column for the tie-break */
+
+            if (rowsCoveredCount[d] == rowsCoveredCount[c] && fabs(wd - wc) <= EPS && d > c) {
+                continue; /* identical coverage and weight: keep the lower index */
+            }
+
+            const uint64_t *bd = bits + (size_t)d * words;
+            int subset = 1;
+            for (int w = 0; w < words; ++w) {
+                if (bc[w] & ~bd[w]) {
+                    subset = 0;
+                    break;
+                }
+            }
+
+            if (subset) {
+                active[c] = 0;
+                ++removed;
+                break;
+            }
+        }
+    }
+
+    if (removed > 0) {
+        for (int c = 0; c < cols; ++c) {
+            if (!active[c]) {
+                free(rowsCovered[c]);
+                rowsCovered[c] = NULL;
+                rowsCoveredCount[c] = 0;
+            }
+        }
+        for (int r = 0; r < rows; ++r) {
+            int w = 0;
+            for (int k = 0; k < colsCoveringCount[r]; ++k) {
+                int cc = colsCovering[r][k];
+                if (active[cc]) colsCovering[r][w++] = cc;
+            }
+            colsCoveringCount[r] = w;
+        }
+    }
+
+    free(bits);
+    free(active);
+    return removed;
 }
 
 /* Redundancy pruning: remove columns that are not needed to keep all rows covered (reverse order) */
@@ -627,7 +668,8 @@ static double compute_reduced_and_lb(
     int *rowsCoveredCount,
     const double *t,
     const double *col_costs, // can be NULL
-    double *ls /* out */
+    double *ls, /* out */
+    unsigned char *x /* optional sign flags for subgradient */
 ) {
     double ZLB = 0.0;
     double ZLB_rows = 0.0;
@@ -637,18 +679,7 @@ static double compute_reduced_and_lb(
     double *partials = (double*)calloc((size_t)threads, sizeof(double));
     if (!partials) return 0.0;
 
-    lagr_sum_t_context sum_ctx = {
-        .t = t,
-        .partials = partials
-    };
-    if (!ccubes_parallel_for(0, (uint64_t)rows, threads, false, lagr_sum_t_worker, &sum_ctx)) {
-        free(partials);
-        return 0.0;
-    }
-    for (int i = 0; i < threads; ++i) {
-        ZLB_rows += partials[i];
-        partials[i] = 0.0;
-    }
+    for (int i = 0; i < rows; ++i) ZLB_rows += t[i];
 
     lagr_reduced_context reduced_ctx = {
         .rowsCovered = rowsCovered,
@@ -656,7 +687,8 @@ static double compute_reduced_and_lb(
         .t = t,
         .ls = ls,
         .partials = partials,
-        .col_costs = col_costs
+        .col_costs = col_costs,
+        .x = x
     };
     if (!ccubes_parallel_for(0, (uint64_t)cols, threads, false, lagr_reduced_worker, &reduced_ctx)) {
         free(partials);
@@ -696,10 +728,9 @@ Returns 1 if step applied, 0 if slacks zero or no progress possible.
 
 static int subgradient_update(
     int rows,
-    int cols,
     int **colsCovering,
     int *colsCoveringCount,
-    const double *ls,
+    const unsigned char *x,
     double UB, double ZLB,
     double *t,
     double *step_coef,
@@ -712,29 +743,15 @@ static int subgradient_update(
     double stabilization_beta
 ) {
     int threads = ccubes_thread_count();
-    unsigned char *x = (unsigned char*)malloc((size_t)cols);
     if (!x) return 0;
 
-    lagr_x_context x_ctx = {
-        .ls = ls,
-        .x = x
-    };
-    if (!ccubes_parallel_for(0, (uint64_t)cols, threads, false, lagr_x_worker, &x_ctx)) {
-        free(x);
-        return 0;
-    }
-
     double *slack = (double*)malloc((size_t)rows * sizeof(double));
-    if (!slack) {
-        free(x);
-        return 0;
-    }
+    if (!slack) return 0;
 
     double sum_s2 = 0.0;
 
     double *partials = (double*)calloc((size_t)threads, sizeof(double));
     if (!partials) {
-        free(x);
         free(slack);
         return 0;
     }
@@ -747,7 +764,6 @@ static int subgradient_update(
         .partials = partials
     };
     if (!ccubes_parallel_for(0, (uint64_t)rows, threads, false, lagr_slack_worker, &slack_ctx)) {
-        free(x);
         free(slack);
         free(partials);
         return 0;
@@ -756,8 +772,6 @@ static int subgradient_update(
         sum_s2 += partials[i];
     }
     free(partials);
-
-    free(x);
 
     if (deflection_alpha > 0.0 && prev_direction) {
         sum_s2 = 0.0;
@@ -784,15 +798,13 @@ static int subgradient_update(
         return 0;
     }
 
-    lagr_update_t_context update_ctx = {
-        .t = t,
-        .slack = slack,
-        .step = step,
-        .stabilization_beta = stabilization_beta
-    };
-    if (!ccubes_parallel_for(0, (uint64_t)rows, threads, false, lagr_update_t_worker, &update_ctx)) {
-        free(slack);
-        return 0;
+    for (int i = 0; i < rows; ++i) {
+        double trial = t[i] + step * slack[i];
+        if (trial < 0.0) trial = 0.0;
+        double val = (stabilization_beta >= 1.0)
+            ? trial
+            : ((1.0 - stabilization_beta) * t[i] + stabilization_beta * trial);
+        t[i] = (val > 0.0) ? val : 0.0;
     }
 
     if (deflection_alpha > 0.0 && prev_direction) {
@@ -877,41 +889,25 @@ static void bundle_project_simplex(double *v, int n) {
 
 static int bundle_update(
     int rows,
-    int cols,
     int **colsCovering,
     int *colsCoveringCount,
-    const double *ls,
+    const unsigned char *x,
     double UB,
     double ZLB,
     double *t,
     LagrangianBundleState *bs
 ) {
-    if (!bs || bs->memory <= 0 || !bs->center_t || !bs->cut_alpha || !bs->cut_slacks) {
+    if (!x || !bs || bs->memory <= 0 || !bs->center_t || !bs->cut_alpha || !bs->cut_slacks) {
         return 0;
     }
 
     int threads = ccubes_thread_count();
-    unsigned char *x = (unsigned char*)malloc((size_t)cols);
-    if (!x) return 0;
-
-    lagr_x_context x_ctx = {
-        .ls = ls,
-        .x = x
-    };
-    if (!ccubes_parallel_for(0, (uint64_t)cols, threads, false, lagr_x_worker, &x_ctx)) {
-        free(x);
-        return 0;
-    }
 
     double *slack = (double*)malloc((size_t)rows * sizeof(double));
-    if (!slack) {
-        free(x);
-        return 0;
-    }
+    if (!slack) return 0;
 
     double *partials = (double*)calloc((size_t)threads, sizeof(double));
     if (!partials) {
-        free(x);
         free(slack);
         return 0;
     }
@@ -924,7 +920,6 @@ static int bundle_update(
         .partials = partials
     };
     if (!ccubes_parallel_for(0, (uint64_t)rows, threads, false, lagr_slack_worker, &slack_ctx)) {
-        free(x);
         free(slack);
         free(partials);
         return 0;
@@ -933,7 +928,6 @@ static int bundle_update(
     double sum_s2 = 0.0;
     for (int i = 0; i < threads; ++i) sum_s2 += partials[i];
     free(partials);
-    free(x);
 
     if (sum_s2 <= 1e-15 || UB - ZLB <= 0.0) {
         free(slack);
@@ -1605,14 +1599,39 @@ typedef struct {
     int *colsCoveringCount;
     const double *lagr_score;
     const double *weights;
-    int target;
+    const unsigned char *allowed; /* NULL = every column usable */
+    const int *forced;            /* columns pre-selected before the search */
+    int forced_len;
+    int target;                   /* free slots available to the search (excludes forced) */
+    int out_stride;               /* forced_len + target */
     long node_limit;
     long nodes;
+    int aborted;                  /* node budget exhausted */
+    int want;                     /* number of distinct covers to collect */
+    int found;                    /* covers collected so far */
     int *coverCount;
     unsigned char *colSelected;
     int *chosen;
-    int *out;
+    int *out;                     /* want * out_stride ints */
+    int *out_lens;                /* want ints */
+    int *scratch;                 /* 2 * out_stride ints, for dedup */
+    PolishCandidate *cand_buf;    /* target * max_row_degree entries */
+    int max_row_degree;
+    int max_cover_static;         /* max rows covered by any usable column */
+    /* bitset fast path (rows <= 64) */
+    const uint64_t *col_mask;     /* per-column row coverage mask, or NULL */
+    uint64_t full_mask;           /* all rows covered */
 } PolishSearch;
+
+static int lagr_popcount64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_popcountll(x);
+#else
+    int n = 0;
+    while (x) { x &= x - 1; ++n; }
+    return n;
+#endif
+}
 
 static bool polish_candidate_better(const PolishCandidate *a, const PolishCandidate *b) {
     if (a->new_cover != b->new_cover) return a->new_cover > b->new_cover;
@@ -1623,6 +1642,27 @@ static bool polish_candidate_better(const PolishCandidate *a, const PolishCandid
 }
 
 static void polish_sort_candidates(PolishCandidate *candidates, int count) {
+    if (count > 32) {
+        /*
+        Wide nodes: a full sort is wasted work — on failure every branch is
+        explored regardless of order, and a successful dive follows the front
+        candidates. Selection-sort just the first few positions in O(8n);
+        the tail keeps its deterministic discovery order.
+        */
+        int front = count < 8 ? count : 8;
+        for (int i = 0; i < front; ++i) {
+            int best = i;
+            for (int j = i + 1; j < count; ++j) {
+                if (polish_candidate_better(&candidates[j], &candidates[best])) best = j;
+            }
+            if (best != i) {
+                PolishCandidate tmp = candidates[i];
+                candidates[i] = candidates[best];
+                candidates[best] = tmp;
+            }
+        }
+        return;
+    }
     for (int i = 1; i < count; ++i) {
         PolishCandidate value = candidates[i];
         int j = i - 1;
@@ -1651,21 +1691,24 @@ static int polish_choose_row(
     int uncovered,
     int slots_left
 ) {
+    /* bound: every column adds at most max_cover_static newly covered rows */
+    if (uncovered > slots_left * search->max_cover_static) return -1;
+
     int best_row = -1;
     int best_count = INT_MAX;
-    int max_new_cover = 0;
 
     for (int row = 0; row < search->rows; ++row) {
         if (search->coverCount[row] > 0) continue;
 
+        /* any unselected usable column covering this (uncovered) row
+           necessarily has new_cover >= 1, so a plain count suffices */
         int viable = 0;
         for (int i = 0; i < search->colsCoveringCount[row]; ++i) {
             int col = search->colsCovering[row][i];
             if (search->colSelected[col]) continue;
-            int new_cover = polish_new_cover(search, col);
-            if (new_cover <= 0) continue;
+            if (search->allowed && !search->allowed[col]) continue;
             ++viable;
-            if (new_cover > max_new_cover) max_new_cover = new_cover;
+            if (viable >= best_count) break; /* cannot become the minimum */
         }
 
         if (viable == 0) return -1;
@@ -1675,10 +1718,18 @@ static int polish_choose_row(
         }
     }
 
-    if (max_new_cover <= 0) return -1;
-    if (uncovered > slots_left * max_new_cover) return -1;
     return best_row;
 }
+
+static int pool_cmp_int_asc(const void *a, const void *b);
+static void pool_clear(int **pool_solutions, int *pool_count);
+static int pool_add_if_new(
+    int **pool_solutions,
+    int *pool_count,
+    int max_pool,
+    const int *sol_sorted,
+    int len
+);
 
 static bool polish_search_rec(
     PolishSearch *search,
@@ -1686,12 +1737,33 @@ static bool polish_search_rec(
     int covered
 ) {
     if (covered >= search->rows) {
-        memcpy(search->out, search->chosen, (size_t)depth * sizeof(int));
-        return true;
+        int len = search->forced_len + depth;
+        int *norm = search->scratch;
+
+        for (int i = 0; i < search->forced_len; ++i) norm[i] = search->forced[i];
+        memcpy(norm + search->forced_len, search->chosen, (size_t)depth * sizeof(int));
+        qsort(norm, (size_t)len, sizeof(int), pool_cmp_int_asc);
+
+        for (int s = 0; s < search->found; ++s) {
+            if (
+                search->out_lens[s] == len &&
+                memcmp(search->out + (size_t)s * search->out_stride, norm, (size_t)len * sizeof(int)) == 0
+            ) {
+                return false; /* duplicate cover: keep searching */
+            }
+        }
+
+        memcpy(search->out + (size_t)search->found * search->out_stride, norm, (size_t)len * sizeof(int));
+        search->out_lens[search->found] = len;
+        search->found++;
+        return search->found >= search->want;
     }
 
     if (depth >= search->target) return false;
-    if (search->nodes++ >= search->node_limit) return false;
+    if (search->nodes++ >= search->node_limit) {
+        search->aborted = 1;
+        return true; /* unwind immediately */
+    }
 
     int slots_left = search->target - depth;
     int uncovered = search->rows - covered;
@@ -1699,13 +1771,13 @@ static bool polish_search_rec(
     if (row < 0) return false;
 
     int raw_count = search->colsCoveringCount[row];
-    PolishCandidate *candidates = (PolishCandidate*)malloc((size_t)raw_count * sizeof(PolishCandidate));
-    if (!candidates) return false;
+    PolishCandidate *candidates = search->cand_buf + (size_t)depth * (size_t)search->max_row_degree;
 
     int candidate_count = 0;
     for (int i = 0; i < raw_count; ++i) {
         int col = search->colsCovering[row][i];
         if (search->colSelected[col]) continue;
+        if (search->allowed && !search->allowed[col]) continue;
 
         int new_cover = polish_new_cover(search, col);
         if (new_cover <= 0) continue;
@@ -1734,10 +1806,7 @@ static bool polish_search_rec(
             ++search->coverCount[covered_row];
         }
 
-        if (polish_search_rec(search, depth + 1, covered + added)) {
-            free(candidates);
-            return true;
-        }
+        bool stop = polish_search_rec(search, depth + 1, covered + added);
 
         for (int j = 0; j < search->rowsCoveredCount[col]; ++j) {
             int covered_row = search->rowsCovered[col][j];
@@ -1745,13 +1814,125 @@ static bool polish_search_rec(
         }
 
         search->colSelected[col] = 0;
+
+        if (stop) return true;
     }
 
-    free(candidates);
     return false;
 }
 
-static int polish_find_smaller_cover(
+/* Bitset variant of polish_search_rec for rows <= 64: coverage is a single
+   uint64_t, new-cover checks are popcounts, undo restores the saved mask. */
+static bool polish_search_rec_bits(
+    PolishSearch *search,
+    int depth,
+    uint64_t covered_mask
+) {
+    if (covered_mask == search->full_mask) {
+        int len = search->forced_len + depth;
+        int *norm = search->scratch;
+
+        for (int i = 0; i < search->forced_len; ++i) norm[i] = search->forced[i];
+        memcpy(norm + search->forced_len, search->chosen, (size_t)depth * sizeof(int));
+        qsort(norm, (size_t)len, sizeof(int), pool_cmp_int_asc);
+
+        for (int s = 0; s < search->found; ++s) {
+            if (
+                search->out_lens[s] == len &&
+                memcmp(search->out + (size_t)s * search->out_stride, norm, (size_t)len * sizeof(int)) == 0
+            ) {
+                return false;
+            }
+        }
+
+        memcpy(search->out + (size_t)search->found * search->out_stride, norm, (size_t)len * sizeof(int));
+        search->out_lens[search->found] = len;
+        search->found++;
+        return search->found >= search->want;
+    }
+
+    if (depth >= search->target) return false;
+    if (search->nodes++ >= search->node_limit) {
+        search->aborted = 1;
+        return true;
+    }
+
+    uint64_t uncovered_mask = search->full_mask & ~covered_mask;
+    int uncovered = lagr_popcount64(uncovered_mask);
+    int slots_left = search->target - depth;
+
+    if (uncovered > slots_left * search->max_cover_static) return false;
+
+    /* MRV row choice: fewest unselected candidates */
+    int best_row = -1;
+    int best_count = INT_MAX;
+    for (uint64_t m = uncovered_mask; m; m &= m - 1) {
+        int row = __builtin_ctzll(m);
+        int viable = 0;
+        for (int i = 0; i < search->colsCoveringCount[row]; ++i) {
+            int col = search->colsCovering[row][i];
+            if (search->colSelected[col]) continue;
+            ++viable;
+            if (viable >= best_count) break;
+        }
+        if (viable == 0) return false;
+        if (viable < best_count) {
+            best_count = viable;
+            best_row = row;
+        }
+    }
+    if (best_row < 0) return false;
+
+    PolishCandidate *candidates = search->cand_buf + (size_t)depth * (size_t)search->max_row_degree;
+    int candidate_count = 0;
+    for (int i = 0; i < search->colsCoveringCount[best_row]; ++i) {
+        int col = search->colsCovering[best_row][i];
+        if (search->colSelected[col]) continue;
+
+        int new_cover = lagr_popcount64(search->col_mask[col] & uncovered_mask);
+        if (new_cover <= 0) continue;
+
+        candidates[candidate_count++] = (PolishCandidate){
+            .col = col,
+            .new_cover = new_cover,
+            .cover_count = search->rowsCoveredCount[col],
+            .lagr_score = search->lagr_score ? search->lagr_score[col] : 0.0,
+            .weight = search->weights ? search->weights[col] : 0.0
+        };
+    }
+
+    polish_sort_candidates(candidates, candidate_count);
+
+    for (int i = 0; i < candidate_count; ++i) {
+        int col = candidates[i].col;
+
+        search->colSelected[col] = 1;
+        search->chosen[depth] = col;
+
+        bool stop = polish_search_rec_bits(
+            search,
+            depth + 1,
+            covered_mask | search->col_mask[col]
+        );
+
+        search->colSelected[col] = 0;
+
+        if (stop) return true;
+    }
+
+    return false;
+}
+
+/*
+Bounded search for covers of size <= target_total.
+- allowed: optional column mask (NULL = all active columns)
+- forced/forced_len: columns fixed into every cover before the search starts
+- want: how many distinct covers to collect (enumeration for pool mode)
+- out: want * target_total ints; out_lens: length of each collected cover
+Returns the number of covers found; *aborted_out is set when the node budget
+was exhausted (in which case a "not found" answer is inconclusive).
+*/
+static int lagr_bounded_cover_search(
     int rows,
     int cols,
     int **rowsCovered,
@@ -1760,21 +1941,80 @@ static int polish_find_smaller_cover(
     int *colsCoveringCount,
     const double *lagr_score,
     const double *weights,
-    int target,
+    const unsigned char *allowed,
+    const int *forced,
+    int forced_len,
+    int target_total,
     long node_limit,
-    int *out
+    int want,
+    int *out,
+    int *out_lens,
+    int *aborted_out
 ) {
-    if (target <= 0 || node_limit <= 0) return 0;
+    if (aborted_out) *aborted_out = 0;
+    if (target_total <= 0 || node_limit <= 0 || want <= 0) return 0;
+    if (forced_len > target_total) return 0;
+
+    int free_slots = target_total - forced_len;
+
+    int max_row_degree = 1;
+    int max_cover_static = 1;
+    for (int r = 0; r < rows; ++r) {
+        if (colsCoveringCount[r] > max_row_degree) max_row_degree = colsCoveringCount[r];
+        for (int i = 0; i < colsCoveringCount[r]; ++i) {
+            int c = colsCovering[r][i];
+            if (rowsCoveredCount[c] > max_cover_static) max_cover_static = rowsCoveredCount[c];
+        }
+    }
+
+    int use_bits = (rows <= 64 && allowed == NULL);
 
     int *coverCount = (int*)calloc((size_t)rows, sizeof(int));
     unsigned char *colSelected = (unsigned char*)calloc((size_t)cols, 1);
-    int *chosen = (int*)malloc((size_t)target * sizeof(int));
+    int *chosen = (int*)malloc((size_t)(free_slots > 0 ? free_slots : 1) * sizeof(int));
+    int *scratch = (int*)malloc((size_t)target_total * 2 * sizeof(int));
+    PolishCandidate *cand_buf = (PolishCandidate*)malloc(
+        (size_t)(free_slots > 0 ? free_slots : 1) * (size_t)max_row_degree * sizeof(PolishCandidate)
+    );
+    uint64_t *col_mask = use_bits
+        ? (uint64_t*)calloc((size_t)cols, sizeof(uint64_t))
+        : NULL;
 
-    if (!coverCount || !colSelected || !chosen) {
+    if (!coverCount || !colSelected || !chosen || !scratch || !cand_buf || (use_bits && !col_mask)) {
         free(coverCount);
         free(colSelected);
         free(chosen);
+        free(scratch);
+        free(cand_buf);
+        free(col_mask);
         return 0;
+    }
+
+    if (use_bits) {
+        /* per-column coverage masks, filled once per core column */
+        for (int r = 0; r < rows; ++r) {
+            for (int i = 0; i < colsCoveringCount[r]; ++i) {
+                int c = colsCovering[r][i];
+                if (col_mask[c] == 0) {
+                    uint64_t m = 0;
+                    for (int j = 0; j < rowsCoveredCount[c]; ++j) {
+                        m |= 1ULL << rowsCovered[c][j];
+                    }
+                    col_mask[c] = m;
+                }
+            }
+        }
+    }
+
+    int covered = 0;
+    for (int i = 0; i < forced_len; ++i) {
+        int c = forced[i];
+        colSelected[c] = 1;
+        for (int j = 0; j < rowsCoveredCount[c]; ++j) {
+            int r = rowsCovered[c][j];
+            if (coverCount[r] == 0) ++covered;
+            ++coverCount[r];
+        }
     }
 
     PolishSearch search = {
@@ -1786,22 +2026,469 @@ static int polish_find_smaller_cover(
         .colsCoveringCount = colsCoveringCount,
         .lagr_score = lagr_score,
         .weights = weights,
-        .target = target,
+        .allowed = allowed,
+        .forced = forced,
+        .forced_len = forced_len,
+        .target = free_slots,
+        .out_stride = target_total,
         .node_limit = node_limit,
         .nodes = 0,
+        .aborted = 0,
+        .want = want,
+        .found = 0,
         .coverCount = coverCount,
         .colSelected = colSelected,
         .chosen = chosen,
-        .out = out
+        .out = out,
+        .out_lens = out_lens,
+        .scratch = scratch,
+        .cand_buf = cand_buf,
+        .max_row_degree = max_row_degree,
+        .max_cover_static = max_cover_static,
+        .col_mask = col_mask,
+        .full_mask = (rows >= 64) ? ~0ULL : ((1ULL << rows) - 1ULL)
     };
 
-    int found = polish_search_rec(&search, 0, 0) ? 1 : 0;
+    if (use_bits) {
+        uint64_t covered_mask = 0;
+        for (int i = 0; i < forced_len; ++i) {
+            covered_mask |= col_mask[forced[i]];
+        }
+        polish_search_rec_bits(&search, 0, covered_mask);
+    } else {
+        polish_search_rec(&search, 0, covered);
+    }
+
+    if (aborted_out) *aborted_out = search.aborted;
 
     free(coverCount);
     free(colSelected);
     free(chosen);
+    free(scratch);
+    free(cand_buf);
+    free(col_mask);
 
-    return found;
+    return search.found;
+}
+
+/*
+Lagrangian bounded finish:
+1. Recompute reduced costs at the best multipliers found (caller passes ls_best/zlb_best).
+2. Reduced-cost variable fixing for a target size T:
+   - exclude column c when zlb + max(0, rc_c) > T (cannot be in any cover of cost <= T)
+   - force column c when rc_c < 0 and zlb - rc_c > T (must be in every such cover)
+3. Search at T = UB-1 within fixed budgets; iterate downward while covers are found.
+   An exhaustive (non-aborted) failure at T proves UB optimal, which also lifts
+   the integer lower bound to UB.
+4. Optional pool enumeration at the final UB.
+*/
+/*
+Build a core-restricted copy of the row -> columns adjacency containing only
+columns that can appear in a cover of cost <= target (reduced-cost fixing at
+the best multipliers). Also collects columns that MUST be in every such cover.
+Returns the core size, or -1 on OOM. *core_covering / *core_counts are
+allocated as one block each; caller frees both.
+*/
+static int lagr_build_core(
+    int rows,
+    int cols,
+    const int *rowsCoveredCount,
+    int **colsCovering,
+    int *colsCoveringCount,
+    const double *ls_best,
+    double zlb_best,
+    int target,
+    unsigned char *allowed,      /* cols scratch, filled */
+    int *forced,                 /* cols scratch, filled */
+    int *forced_len_out,
+    int ***core_covering_out,
+    int **core_counts_out
+) {
+    const double FIXTOL = 1e-7;
+
+    int forced_len = 0;
+    int core_count = 0;
+    for (int c = 0; c < cols; ++c) {
+        double rc_c = ls_best[c];
+        if (rowsCoveredCount[c] <= 0 || zlb_best + (rc_c > 0.0 ? rc_c : 0.0) > (double)target + FIXTOL) {
+            allowed[c] = 0;
+        } else {
+            allowed[c] = 1;
+            ++core_count;
+            if (rc_c < 0.0 && zlb_best - rc_c > (double)target + FIXTOL) {
+                forced[forced_len++] = c;
+            }
+        }
+    }
+    *forced_len_out = forced_len;
+
+    if (!core_covering_out || !core_counts_out) return core_count;
+
+    int **core_covering = (int**)malloc((size_t)rows * sizeof(int*));
+    int *core_counts = (int*)malloc((size_t)rows * sizeof(int));
+    if (!core_covering || !core_counts) {
+        free(core_covering);
+        free(core_counts);
+        return -1;
+    }
+
+    size_t nnz = 0;
+    for (int r = 0; r < rows; ++r) {
+        int cnt = 0;
+        for (int k = 0; k < colsCoveringCount[r]; ++k) {
+            if (allowed[colsCovering[r][k]]) ++cnt;
+        }
+        core_counts[r] = cnt;
+        nnz += (size_t)cnt;
+    }
+
+    int *pool = (int*)malloc((nnz > 0 ? nnz : 1) * sizeof(int));
+    if (!pool) {
+        free(core_covering);
+        free(core_counts);
+        return -1;
+    }
+
+    size_t off = 0;
+    for (int r = 0; r < rows; ++r) {
+        core_covering[r] = pool + off;
+        for (int k = 0; k < colsCoveringCount[r]; ++k) {
+            int c = colsCovering[r][k];
+            if (allowed[c]) pool[off++] = c;
+        }
+    }
+
+    *core_covering_out = core_covering;   /* core_covering[0] owns the pool */
+    *core_counts_out = core_counts;
+    return core_count;
+}
+
+static void lagr_free_core(int **core_covering, int *core_counts, int rows) {
+    if (core_covering) {
+        if (rows > 0 && core_covering[0]) free(core_covering[0]); /* the pool */
+        free(core_covering);
+    }
+    free(core_counts);
+}
+
+/*
+Chvatal-Gomory k-cover bound over a core-restricted chart (all rows
+uncovered): a set S of rows such that every core column covers at most k
+rows of S forces any cover to use at least ceil(|S| / k) columns. Greedy
+separation, rows with the fewest core candidates first. Used as a root
+test before launching a bounded search: a bound above the target proves
+the target unreachable without expanding a single node.
+*/
+static int lagr_kcover_bound(
+    int rows,
+    int cols,
+    int **core_covering,
+    int *core_counts,
+    int k,
+    int *hits,       /* cols scratch */
+    int *rows_order  /* rows scratch */
+) {
+    if (k <= 1 || rows <= 0 || rows > 256) return 0;
+
+    for (int r = 0; r < rows; ++r) rows_order[r] = r;
+
+    /* ascending number of core candidates, ties by row id */
+    for (int i = 1; i < rows; ++i) {
+        int r = rows_order[i];
+        int j = i - 1;
+        while (j >= 0 && (core_counts[rows_order[j]] > core_counts[r] ||
+               (core_counts[rows_order[j]] == core_counts[r] && rows_order[j] > r))) {
+            rows_order[j + 1] = rows_order[j];
+            --j;
+        }
+        rows_order[j + 1] = r;
+    }
+
+    memset(hits, 0, (size_t)cols * sizeof(int));
+
+    int in_s = 0;
+    for (int idx = 0; idx < rows; ++idx) {
+        int r = rows_order[idx];
+        int fits = 1;
+
+        for (int i = 0; i < core_counts[r]; ++i) {
+            if (hits[core_covering[r][i]] >= k) {
+                fits = 0;
+                break;
+            }
+        }
+        if (!fits) continue;
+
+        for (int i = 0; i < core_counts[r]; ++i) {
+            hits[core_covering[r][i]]++;
+        }
+        ++in_s;
+    }
+
+    return (in_s + k - 1) / k;
+}
+
+static void lagr_bounded_finish(
+    int rows,
+    int cols,
+    int **rowsCovered,
+    int *rowsCoveredCount,
+    int **colsCovering,
+    int *colsCoveringCount,
+    const double *weights,
+    const double *ls_best,
+    double zlb_best,
+    long node_limit,
+    int core_cap,
+    int *solution,
+    int *solmin,
+    double *bestLB_io,
+    int *proved_optimal_io,
+    int max_pool,
+    int **pool_solutions,
+    int *pool_count,
+    int *pool_min_len,
+    int *norm_buf
+) {
+    if (!solution || !solmin || *solmin <= 0) return;
+
+    unsigned char *allowed = (unsigned char*)malloc((size_t)cols);
+    int *forced = (int*)malloc((size_t)cols * sizeof(int));
+    int *one = (int*)malloc((size_t)(*solmin) * sizeof(int));
+    int *found_buf = NULL;
+    int *found_lens = NULL;
+    if (!allowed || !forced || !one) {
+        free(allowed);
+        free(forced);
+        free(one);
+        return;
+    }
+
+    int UB = *solmin;
+    int proved = proved_optimal_io ? *proved_optimal_io : 0;
+
+    /*
+    Improvement loop. Searching size <= target only makes sense while
+    target >= LB. When the core at a target is too large (weak fixing),
+    step down to a tighter target instead of burning the node budget:
+    the mask sharpens as the target approaches ZLB.
+    An exhaustive failure at target T proves no cover of size <= T exists,
+    lifting the integer LB to T+1; when T == UB-1 that proves UB optimal.
+    */
+    while (!proved && UB > 1) {
+        int target = UB - 1;
+        int improved = 0;
+
+        while (target >= 1 && (!bestLB_io || (double)target >= *bestLB_io - EPS)) {
+            int forced_len = 0;
+            int **core_covering = NULL;
+            int *core_counts = NULL;
+
+            int core_count = lagr_build_core(
+                rows, cols,
+                rowsCoveredCount,
+                colsCovering, colsCoveringCount,
+                ls_best, zlb_best,
+                target,
+                allowed, forced, &forced_len,
+                NULL, NULL
+            );
+
+            if (forced_len > target) {
+                /* more must-have columns than slots: size <= target impossible */
+                if (bestLB_io && (double)(target + 1) > *bestLB_io) *bestLB_io = (double)(target + 1);
+                if (target == UB - 1) proved = 1;
+                break;
+            }
+
+            if (core_count > core_cap) {
+                --target; /* tighter target, smaller core */
+                continue;
+            }
+
+            core_count = lagr_build_core(
+                rows, cols,
+                rowsCoveredCount,
+                colsCovering, colsCoveringCount,
+                ls_best, zlb_best,
+                target,
+                allowed, forced, &forced_len,
+                &core_covering, &core_counts
+            );
+            if (core_count < 0) break; /* OOM: skip quietly */
+
+            /* root k-cover cut: may prove target unreachable for free */
+            {
+                int *hits = (int*)malloc((size_t)cols * sizeof(int));
+                int *rows_order = (int*)malloc((size_t)rows * sizeof(int));
+                int cut_lb = 0;
+                if (hits && rows_order) {
+                    for (int k = 2; k <= 3; ++k) {
+                        int b = lagr_kcover_bound(
+                            rows, cols, core_covering, core_counts, k, hits, rows_order
+                        );
+                        if (b > cut_lb) cut_lb = b;
+                    }
+                }
+                free(hits);
+                free(rows_order);
+
+                if (cut_lb > target) {
+                    lagr_free_core(core_covering, core_counts, rows);
+                    if (bestLB_io && (double)(target + 1) > *bestLB_io) {
+                        *bestLB_io = (double)(target + 1);
+                    }
+                    if (target == UB - 1) proved = 1;
+                    break;
+                }
+            }
+
+            int found_len_one = 0;
+            int aborted = 0;
+            int n = lagr_bounded_cover_search(
+                rows, cols,
+                rowsCovered, rowsCoveredCount,
+                core_covering, core_counts,
+                ls_best, weights,
+                NULL, /* adjacency already core-restricted */
+                forced, forced_len,
+                target,
+                node_limit,
+                1,
+                one, &found_len_one,
+                &aborted
+            );
+
+            lagr_free_core(core_covering, core_counts, rows);
+
+            if (n > 0) {
+                memcpy(solution, one, (size_t)found_len_one * sizeof(int));
+                *solmin = found_len_one;
+                UB = found_len_one;
+                improved = 1;
+                break;
+            }
+
+            if (aborted) break; /* inconclusive: give up on this and lower targets */
+
+            /* exhaustive failure: no cover of size <= target exists */
+            if (bestLB_io && (double)(target + 1) > *bestLB_io) *bestLB_io = (double)(target + 1);
+            if (target == UB - 1) proved = 1;
+            break;
+        }
+
+        if (!improved) break;
+    }
+
+    if (proved) {
+        if (bestLB_io && (double)UB > *bestLB_io) *bestLB_io = (double)UB;
+        if (proved_optimal_io) *proved_optimal_io = 1;
+    }
+
+    /* ---- pool enumeration at the final size ---- */
+    if (max_pool > 1 && pool_solutions && pool_count && pool_min_len && norm_buf) {
+        if (UB < *pool_min_len) {
+            /* the improvement loop beat every pooled solution: resync the pool */
+            pool_clear(pool_solutions, pool_count);
+            *pool_min_len = UB;
+            memcpy(norm_buf, solution, (size_t)UB * sizeof(int));
+            qsort(norm_buf, (size_t)UB, sizeof(int), pool_cmp_int_asc);
+            pool_add_if_new(pool_solutions, pool_count, max_pool, norm_buf, UB);
+        }
+
+        int restart = 1;
+        int rounds = 0;
+
+        while (restart && rounds < 4) {
+            restart = 0;
+            ++rounds;
+
+            int target = UB;
+            int forced_len = 0;
+            int **core_covering = NULL;
+            int *core_counts = NULL;
+
+            int core_count = lagr_build_core(
+                rows, cols,
+                rowsCoveredCount,
+                colsCovering, colsCoveringCount,
+                ls_best, zlb_best,
+                target,
+                allowed, forced, &forced_len,
+                NULL, NULL
+            );
+            if (forced_len > target) break;
+            if (core_count > core_cap) break; /* enumeration too expensive here */
+
+            core_count = lagr_build_core(
+                rows, cols,
+                rowsCoveredCount,
+                colsCovering, colsCoveringCount,
+                ls_best, zlb_best,
+                target,
+                allowed, forced, &forced_len,
+                &core_covering, &core_counts
+            );
+            if (core_count < 0) break;
+
+            free(found_buf);
+            free(found_lens);
+            found_buf = (int*)malloc((size_t)max_pool * (size_t)target * sizeof(int));
+            found_lens = (int*)malloc((size_t)max_pool * sizeof(int));
+            if (!found_buf || !found_lens) {
+                lagr_free_core(core_covering, core_counts, rows);
+                break;
+            }
+
+            int aborted = 0;
+            int n = lagr_bounded_cover_search(
+                rows, cols,
+                rowsCovered, rowsCoveredCount,
+                core_covering, core_counts,
+                ls_best, weights,
+                NULL,
+                forced, forced_len,
+                target,
+                node_limit,
+                max_pool,
+                found_buf, found_lens,
+                &aborted
+            );
+
+            lagr_free_core(core_covering, core_counts, rows);
+
+            for (int s = 0; s < n; ++s) {
+                int len = found_lens[s];
+                const int *cover = found_buf + (size_t)s * (size_t)target;
+
+                if (len < *pool_min_len || len < UB) {
+                    /* better cover surfaced during enumeration */
+                    memcpy(solution, cover, (size_t)len * sizeof(int));
+                    *solmin = len;
+                    UB = len;
+                    pool_clear(pool_solutions, pool_count);
+                    *pool_min_len = len;
+                    memcpy(norm_buf, cover, (size_t)len * sizeof(int));
+                    qsort(norm_buf, (size_t)len, sizeof(int), pool_cmp_int_asc);
+                    pool_add_if_new(pool_solutions, pool_count, max_pool, norm_buf, len);
+                    restart = 1;
+                    break;
+                }
+
+                if (len == *pool_min_len) {
+                    memcpy(norm_buf, cover, (size_t)len * sizeof(int));
+                    qsort(norm_buf, (size_t)len, sizeof(int), pool_cmp_int_asc);
+                    pool_add_if_new(pool_solutions, pool_count, max_pool, norm_buf, len);
+                }
+            }
+        }
+    }
+
+    free(found_buf);
+    free(found_lens);
+    free(allowed);
+    free(forced);
+    free(one);
 }
 
 
@@ -1870,6 +2557,7 @@ typedef struct {
     double deflection_alpha;
     int polish_enabled;
     long polish_node_limit;
+    int polish_core_cap;
     int portfolio_enabled;
     int portfolio_max_profiles;
     double portfolio_deflection_alpha;
@@ -1888,7 +2576,6 @@ typedef struct {
 } LagrangianConfig;
 
 #define LAGR_PORTFOLIO_PROFILE_COUNT 6
-
 static int lagr_max_int(int a, int b) {
     return a > b ? a : b;
 }
@@ -1910,13 +2597,14 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     cfg->stabilization_beta = 1.0; /* no damping unless explicitly requested */
     cfg->halve_period = 8;         /* halve step if no progress for this many iterations */
     cfg->deflection_alpha = 0.0;   /* deflected subgradient direction, disabled by default */
-    cfg->polish_enabled = 0;       /* bounded one-term exact polish when UB-LB is one */
+    cfg->polish_enabled = 1;       /* reduced-cost fixing + bounded strong finish */
     cfg->local_passes = 0;
     cfg->drop2_enabled = 0;
     cfg->small_gap_threshold = 0;
     cfg->small_gap_extra_passes = cfg->local_passes;
     cfg->rarity_init = 0;
-    cfg->polish_node_limit = 5000;
+    cfg->polish_node_limit = 80000;
+    cfg->polish_core_cap = 1500;
     cfg->portfolio_enabled = 0;
     cfg->portfolio_max_profiles = 1;
     cfg->portfolio_deflection_alpha = 0.75;
@@ -1935,32 +2623,37 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
 
     if (effort_level == 1) {
         cfg->max_iter = 1000;
-        cfg->heur_every = 1;
+        cfg->heur_every = 5;
         cfg->step_coef = 2.0;
         cfg->local_passes = 10;
         cfg->drop2_enabled = 0;
         cfg->small_gap_extra_passes = cfg->local_passes;
         cfg->step_contract = 0.95;
         cfg->polish_enabled = 1;
+        cfg->polish_node_limit = 400000;
+        cfg->polish_core_cap = 8000;
         cfg->portfolio_enabled = 1;
         cfg->portfolio_max_profiles = 2;
     }
 
-    if (effort_level == 2) {
+    if (effort_level >= 2) {
         cfg->max_iter = 5000;
-        cfg->heur_every = 1;
+        cfg->heur_every = 10;
         cfg->step_coef = 2.0;
         cfg->local_passes = 10;
         cfg->drop2_enabled = 1;
         cfg->small_gap_extra_passes = cfg->local_passes;
         cfg->step_contract = 0.95;
         cfg->polish_enabled = 1;
+        cfg->polish_node_limit = 2000000;
+        cfg->polish_core_cap = 30000;
         cfg->portfolio_enabled = 1;
         cfg->portfolio_max_profiles = 6;
         cfg->hybrid_bundle_portfolio = 1;
         cfg->bundle_interval = 8;
         cfg->bundle_momentum = 0.35;
     }
+
 }
 
 static int lagr_build_portfolio_configs(
@@ -2018,8 +2711,11 @@ static void solve_scp_lagrangian_config(
     int *colsCoveringCount,
     const double weights[],
     const LagrangianConfig *cfg,
+    const int *initial_solution,
+    int initial_solmin,
     int *solution,
-    int *solmin
+    int *solmin,
+    double *ls_out /* optional: reduced costs at the best multipliers */
 ) {
     if (solmin) *solmin = -1;
     lagr_stats_begin(rows, cols, 0);
@@ -2039,19 +2735,23 @@ static void solve_scp_lagrangian_config(
     }
 
     double *t = (double*)calloc((size_t)rows, sizeof(double));
+    double *t_best = (double*)calloc((size_t)rows, sizeof(double));
     double *ls = (double*)malloc((size_t)cols * sizeof(double));
     int *sol_tmp = (int*)malloc((size_t)cols * sizeof(int));
     int *sol_tmp2 = (int*)malloc((size_t)cols * sizeof(int));
     double *col_costs = (double*)malloc((size_t)cols * sizeof(double));
+    unsigned char *dual_x = (unsigned char*)malloc((size_t)cols);
     int best_sol_size = -1;
     int stuck_iter = 0;
 
-    if (!t || !ls || !sol_tmp || !sol_tmp2 || !col_costs) {
+    if (!t || !t_best || !ls || !sol_tmp || !sol_tmp2 || !col_costs || !dual_x) {
         free(t);
+        free(t_best);
         free(ls);
         free(sol_tmp);
         free(sol_tmp2);
         free(col_costs);
+        free(dual_x);
 
         lagr_stats_finish(-1, -DBL_MAX, -DBL_MAX, -DBL_MAX, 0.0, 0, LAGR_STOP_OOM);
         return;
@@ -2087,10 +2787,12 @@ static void solve_scp_lagrangian_config(
         prev_direction = (double*)calloc((size_t)rows, sizeof(double));
         if (!prev_direction) {
             free(t);
+            free(t_best);
             free(ls);
             free(sol_tmp);
             free(sol_tmp2);
             free(col_costs);
+            free(dual_x);
             lagr_stats_finish(-1, -DBL_MAX, -DBL_MAX, -DBL_MAX, 0.0, 0, LAGR_STOP_OOM);
             return;
         }
@@ -2120,10 +2822,12 @@ static void solve_scp_lagrangian_config(
             free(bundle_state.cut_slacks);
             free(prev_direction);
             free(t);
+            free(t_best);
             free(ls);
             free(sol_tmp);
             free(sol_tmp2);
             free(col_costs);
+            free(dual_x);
             lagr_stats_finish(-1, -DBL_MAX, -DBL_MAX, -DBL_MAX, 0.0, 0, LAGR_STOP_OOM);
             return;
         }
@@ -2144,10 +2848,12 @@ static void solve_scp_lagrangian_config(
         rowsCoveredCount,
         t,
         col_costs,
-        ls
+        ls,
+        dual_x
     );
     bestZLB = initialZLB;
     lastZLB = initialZLB;
+    memcpy(t_best, t, (size_t)rows * sizeof(double));
 
     int sol_size = -1, sol_size2 = -1;
 
@@ -2241,11 +2947,17 @@ static void solve_scp_lagrangian_config(
         }
     }
 
-    if (sol_size == -1 && sol_size2 == -1) {
+    int have_initial = initial_solution != NULL && initial_solmin > 0 && initial_solmin <= cols;
+
+    if (sol_size == -1 && sol_size2 == -1 && !have_initial) {
         free(t);
+        free(t_best);
         free(ls);
         free(sol_tmp);
         free(sol_tmp2);
+        free(col_costs);
+        free(dual_x);
+        free(prev_direction);
         free(bundle_state.center_t);
         free(bundle_state.prev_center_t);
         free(bundle_state.cut_alpha);
@@ -2257,35 +2969,44 @@ static void solve_scp_lagrangian_config(
     double w1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
     double w2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
 
-    double bestUB; /* UB equals current solution length (unit-cost) */
-    int bestTerms;
-    double bestWeight;
+    double bestUB = DBL_MAX; /* UB equals current solution length (unit-cost) */
+    int bestTerms = INT_MAX;
+    double bestWeight = -DBL_MAX;
 
-    if (
-        sol_size != -1 &&
-        (
-            sol_size2 == -1 ||
-            sol_size < sol_size2 ||
-            (
-                sol_size == sol_size2 && w1 >= w2
-            )
-        )
-    ) {
-
+    if (sol_size != -1) {
         bestUB = (double)sol_size;
         bestTerms = sol_size;
         bestWeight = w1;
         best_sol_size = sol_size;
-
         memcpy(solution, sol_tmp, (size_t)sol_size * sizeof(int));
-    } else {
+    }
 
+    if (
+        sol_size2 != -1 &&
+        (
+            sol_size2 < bestTerms ||
+            (sol_size2 == bestTerms && w2 > bestWeight + EPS)
+        )
+    ) {
         bestUB = (double)sol_size2;
         bestTerms = sol_size2;
         bestWeight = w2;
         best_sol_size = sol_size2;
-
         memcpy(solution, sol_tmp2, (size_t)sol_size2 * sizeof(int));
+    }
+
+    if (have_initial) {
+        double initial_weight = solution_total_weight(initial_solution, initial_solmin, weights);
+        if (
+            initial_solmin < bestTerms ||
+            (initial_solmin == bestTerms && initial_weight > bestWeight + EPS)
+        ) {
+            bestUB = (double)initial_solmin;
+            bestTerms = initial_solmin;
+            bestWeight = initial_weight;
+            best_sol_size = initial_solmin;
+            memcpy(solution, initial_solution, (size_t)initial_solmin * sizeof(int));
+        }
     }
 
     double bestLB = -DBL_MAX;
@@ -2298,11 +3019,13 @@ static void solve_scp_lagrangian_config(
             rowsCoveredCount,
             t,
             col_costs,
-            ls
+            ls,
+            dual_x
         );
         lastZLB = ZLB;
         if (ZLB > bestZLB + EPS) {
             bestZLB = ZLB;
+            memcpy(t_best, t, (size_t)rows * sizeof(double));
         }
 
         double LBint = ceil(ZLB - 1e-12);
@@ -2446,10 +3169,9 @@ static void solve_scp_lagrangian_config(
         if (use_bundle_update) {
             updated = bundle_update(
                 rows,
-                cols,
                 colsCovering,
                 colsCoveringCount,
-                ls,
+                dual_x,
                 bestUB,
                 ZLB,
                 t,
@@ -2460,10 +3182,9 @@ static void solve_scp_lagrangian_config(
         if (!use_bundle_update || !updated) {
             updated = subgradient_update(
                 rows,
-                cols,
                 colsCovering,
                 colsCoveringCount,
-                ls,
+                dual_x,
                 bestUB,
                 ZLB,
                 t,
@@ -2602,45 +3323,79 @@ static void solve_scp_lagrangian_config(
         }
     }
 
-    if (cfg->polish_enabled && best_sol_size > 1) {
-        int polish_target = best_sol_size - 1;
-        if (
-            bestLB >= (double)polish_target - EPS &&
-            bestLB <= (double)polish_target + EPS &&
-            polish_find_smaller_cover(
-                rows,
-                cols,
-                rowsCovered,
-                rowsCoveredCount,
-                colsCovering,
-                colsCoveringCount,
-                ls,
-                weights,
-                polish_target,
-                cfg->polish_node_limit,
-                sol_tmp
-            )
-        ) {
-            best_sol_size = polish_target;
-            bestTerms = polish_target;
-            bestUB = (double)polish_target;
-            bestWeight = solution_total_weight(sol_tmp, polish_target, weights);
-            memcpy(solution, sol_tmp, (size_t)polish_target * sizeof(int));
+    if (
+        cfg->polish_enabled &&
+        best_sol_size > 1 &&
+        stop_reason != LAGR_STOP_OPTIMAL
+    ) {
+        /* reduced costs at the best multipliers found */
+        double zlb_best = compute_reduced_and_lb(
+            rows,
+            cols,
+            rowsCovered,
+            rowsCoveredCount,
+            t_best,
+            col_costs,
+            ls,
+            dual_x
+        );
 
-            if (bestLB >= bestUB - EPS) {
-                stop_reason = LAGR_STOP_OPTIMAL;
-            }
+        int proved = 0;
+        lagr_bounded_finish(
+            rows,
+            cols,
+            rowsCovered,
+            rowsCoveredCount,
+            colsCovering,
+            colsCoveringCount,
+            weights,
+            ls,
+            zlb_best,
+            cfg->polish_node_limit,
+            cfg->polish_core_cap,
+            solution,
+            &best_sol_size,
+            &bestLB,
+            &proved,
+            1, NULL, NULL, NULL, NULL
+        );
+
+        if ((double)best_sol_size < bestUB - EPS) {
+            bestUB = (double)best_sol_size;
+            bestTerms = best_sol_size;
+            bestWeight = solution_total_weight(solution, best_sol_size, weights);
         }
+
+        if (proved) {
+            stop_reason = LAGR_STOP_OPTIMAL;
+        }
+    }
+
+    if (ls_out) {
+        /* reduced costs at the best multipliers, for reuse by the caller
+           (branching priorities of the bounded finish) */
+        compute_reduced_and_lb(
+            rows,
+            cols,
+            rowsCovered,
+            rowsCoveredCount,
+            t_best,
+            col_costs,
+            ls_out,
+            dual_x
+        );
     }
 
     *solmin = best_sol_size;
     lagr_stats_finish(best_sol_size, bestLB, bestZLB, lastZLB, step_coef, iterations, stop_reason);
 
     free(t);
+    free(t_best);
     free(ls);
     free(sol_tmp);
     free(sol_tmp2);
     free(col_costs);
+    free(dual_x);
     free(prev_direction);
     free(bundle_state.center_t);
     free(bundle_state.prev_center_t);
@@ -2686,6 +3441,17 @@ void solve_scp_lagrangian(
         return;
     }
 
+    /* shrink the instance once; benefits every portfolio profile */
+    presolve_dominated_columns(
+        ON_minterms,
+        foundPI,
+        rowsCovered,
+        rowsCoveredCount,
+        colsCovering,
+        colsCoveringCount,
+        weights
+    );
+
     LagrangianConfig baseline;
     lagr_config_for_effort(&baseline, effort_level);
     int portfolio_enabled = baseline.portfolio_enabled;
@@ -2694,6 +3460,8 @@ void solve_scp_lagrangian(
     if (portfolio_enabled) {
         baseline.deflection_alpha = 0.0;
     }
+
+    int *candidate = NULL;
 
     solve_scp_lagrangian_config(
         ON_minterms,
@@ -2704,8 +3472,11 @@ void solve_scp_lagrangian(
         colsCoveringCount,
         weights,
         &baseline,
+        NULL,
+        0,
         solution,
-        solmin
+        solmin,
+        NULL
     );
 
     LagrangianStats merged_stats = *lagrangian_last_stats();
@@ -2720,104 +3491,85 @@ void solve_scp_lagrangian(
             merged_stats.stop_reason == LAGR_STOP_OPTIMAL
         )
     ) {
-        free_adjacency(
-            rowsCovered,
-            rowsCoveredCount,
-            foundPI,
-            colsCovering,
-            colsCoveringCount,
-            ON_minterms
-        );
-        return;
+        goto cleanup;
     }
 
-    LagrangianConfig profiles[LAGR_PORTFOLIO_PROFILE_COUNT];
-    int profile_count = lagr_build_portfolio_configs(&baseline, portfolio_deflection_alpha, profiles);
-    int max_profiles = baseline.portfolio_max_profiles;
-    if (profile_count > max_profiles) profile_count = max_profiles;
+    {
+        LagrangianConfig profiles[LAGR_PORTFOLIO_PROFILE_COUNT];
+        int profile_count = lagr_build_portfolio_configs(&baseline, portfolio_deflection_alpha, profiles);
+        int max_profiles = baseline.portfolio_max_profiles;
+        if (profile_count > max_profiles) profile_count = max_profiles;
 
-    if (profile_count <= 1) {
-        free_adjacency(
-            rowsCovered,
-            rowsCoveredCount,
-            foundPI,
-            colsCovering,
-            colsCoveringCount,
-            ON_minterms
-        );
-        return;
-    }
-
-    int *candidate = (int*)malloc((size_t)foundPI * sizeof(int));
-    if (!candidate) {
-        free_adjacency(
-            rowsCovered,
-            rowsCoveredCount,
-            foundPI,
-            colsCovering,
-            colsCoveringCount,
-            ON_minterms
-        );
-        return;
-    }
-
-    for (int i = 1; i < profile_count; ++i) {
-        int candidate_solmin = -1;
-
-        solve_scp_lagrangian_config(
-            ON_minterms,
-            foundPI,
-            rowsCovered,
-            rowsCoveredCount,
-            colsCovering,
-            colsCoveringCount,
-            weights,
-            &profiles[i],
-            candidate,
-            &candidate_solmin
-        );
-
-        const LagrangianStats *candidate_stats = lagrangian_last_stats();
-        total_iterations += candidate_stats->iterations;
-
-        if (candidate_stats->best_lb > merged_stats.best_lb) {
-            merged_stats.best_lb = candidate_stats->best_lb;
-            merged_stats.last_zlb = candidate_stats->last_zlb;
-            merged_stats.step_coef = candidate_stats->step_coef;
-            merged_stats.stop_reason = candidate_stats->stop_reason;
-        }
-        if (candidate_stats->best_zlb > merged_stats.best_zlb + EPS) {
-            merged_stats.best_zlb = candidate_stats->best_zlb;
-            merged_stats.last_zlb = candidate_stats->last_zlb;
-            merged_stats.step_coef = candidate_stats->step_coef;
+        if (profile_count <= 1) {
+            goto cleanup;
         }
 
-        if (candidate_solmin >= 0 && candidate_solmin < best_solmin) {
-            best_solmin = candidate_solmin;
-            *solmin = candidate_solmin;
-            memcpy(solution, candidate, (size_t)candidate_solmin * sizeof(int));
+        candidate = (int*)malloc((size_t)foundPI * sizeof(int));
+        if (!candidate) {
+            goto cleanup;
         }
 
+        for (int i = 1; i < profile_count; ++i) {
+            int candidate_solmin = -1;
+
+            solve_scp_lagrangian_config(
+                ON_minterms,
+                foundPI,
+                rowsCovered,
+                rowsCoveredCount,
+                colsCovering,
+                colsCoveringCount,
+                weights,
+                &profiles[i],
+                solution,
+                best_solmin,
+                candidate,
+                &candidate_solmin,
+                NULL
+            );
+
+            const LagrangianStats *candidate_stats = lagrangian_last_stats();
+            total_iterations += candidate_stats->iterations;
+
+            if (candidate_stats->best_lb > merged_stats.best_lb) {
+                merged_stats.best_lb = candidate_stats->best_lb;
+                merged_stats.last_zlb = candidate_stats->last_zlb;
+                merged_stats.step_coef = candidate_stats->step_coef;
+                merged_stats.stop_reason = candidate_stats->stop_reason;
+            }
+            if (candidate_stats->best_zlb > merged_stats.best_zlb + EPS) {
+                merged_stats.best_zlb = candidate_stats->best_zlb;
+                merged_stats.last_zlb = candidate_stats->last_zlb;
+                merged_stats.step_coef = candidate_stats->step_coef;
+            }
+            if (candidate_solmin >= 0 && candidate_solmin < best_solmin) {
+                best_solmin = candidate_solmin;
+                *solmin = candidate_solmin;
+                memcpy(solution, candidate, (size_t)candidate_solmin * sizeof(int));
+            }
+
+            if (merged_stats.best_lb != INT_MIN && best_solmin <= merged_stats.best_lb) {
+                break;
+            }
+        }
+
+        LagrangianStopReason final_reason = merged_stats.stop_reason;
         if (merged_stats.best_lb != INT_MIN && best_solmin <= merged_stats.best_lb) {
-            break;
+            final_reason = LAGR_STOP_OPTIMAL;
         }
+
+        lagr_stats_finish(
+            best_solmin,
+            merged_stats.best_lb == INT_MIN ? -DBL_MAX : (double)merged_stats.best_lb,
+            merged_stats.best_zlb,
+            merged_stats.last_zlb,
+            merged_stats.step_coef,
+            total_iterations,
+            final_reason
+        );
     }
 
-    LagrangianStopReason final_reason = merged_stats.stop_reason;
-    if (merged_stats.best_lb != INT_MIN && best_solmin <= merged_stats.best_lb) {
-        final_reason = LAGR_STOP_OPTIMAL;
-    }
-
-    lagr_stats_finish(
-        best_solmin,
-        merged_stats.best_lb == INT_MIN ? -DBL_MAX : (double)merged_stats.best_lb,
-        merged_stats.best_zlb,
-        merged_stats.last_zlb,
-        merged_stats.step_coef,
-        total_iterations,
-        final_reason
-    );
-
+cleanup:
     free(candidate);
     free_adjacency(
         rowsCovered,
@@ -2884,19 +3636,23 @@ void solve_scp_lagrangian_pool(
     int rows = ON_minterms, cols = foundPI;
 
     double *t = (double*)calloc((size_t)rows, sizeof(double));
+    double *t_best = (double*)calloc((size_t)rows, sizeof(double));
     double *rc = (double*)malloc((size_t)cols * sizeof(double));
     int *sol_tmp = (int*)malloc((size_t)cols * sizeof(int));
     int *sol_tmp2 = (int*)malloc((size_t)cols * sizeof(int));
     int *norm = (int*)malloc((size_t)cols * sizeof(int));
     double *col_costs = (double*)malloc((size_t)cols * sizeof(double));
+    unsigned char *dual_x = (unsigned char*)malloc((size_t)cols);
 
-    if (!t || !rc || !sol_tmp || !sol_tmp2 || !norm || !col_costs) {
+    if (!t || !t_best || !rc || !sol_tmp || !sol_tmp2 || !norm || !col_costs || !dual_x) {
         free(t);
+        free(t_best);
         free(rc);
         free(sol_tmp);
         free(sol_tmp2);
         free(norm);
         free(col_costs);
+        free(dual_x);
         free_adjacency(
             rowsCovered,
             rowsCoveredCount,
@@ -2961,11 +3717,13 @@ void solve_scp_lagrangian_pool(
             free(bundle_state.cut_alpha);
             free(bundle_state.cut_slacks);
             free(t);
+            free(t_best);
             free(rc);
             free(sol_tmp);
             free(sol_tmp2);
             free(norm);
             free(col_costs);
+            free(dual_x);
             free_adjacency(
                 rowsCovered,
                 rowsCoveredCount,
@@ -2994,10 +3752,12 @@ void solve_scp_lagrangian_pool(
         rowsCoveredCount,
         t,
         col_costs,
-        rc
+        rc,
+        dual_x
     );
     bestZLB = initialZLB;
     lastZLB = initialZLB;
+    memcpy(t_best, t, (size_t)rows * sizeof(double));
 
     int sol_size = -1, sol_size2 = -1;
 
@@ -3091,10 +3851,13 @@ void solve_scp_lagrangian_pool(
 
     if (sol_size == -1 && sol_size2 == -1) {
         free(t);
+        free(t_best);
         free(rc);
         free(sol_tmp);
         free(sol_tmp2);
         free(norm);
+        free(col_costs);
+        free(dual_x);
         free(bundle_state.center_t);
         free(bundle_state.prev_center_t);
         free(bundle_state.cut_alpha);
@@ -3185,11 +3948,13 @@ void solve_scp_lagrangian_pool(
             rowsCoveredCount,
             t,
             col_costs,
-            rc
+            rc,
+            dual_x
         );
         lastZLB = ZLB;
         if (ZLB > bestZLB + EPS) {
             bestZLB = ZLB;
+            memcpy(t_best, t, (size_t)rows * sizeof(double));
         }
 
         double LBint = ceil(ZLB - EPS);
@@ -3403,10 +4168,9 @@ void solve_scp_lagrangian_pool(
         if (use_bundle_update) {
             updated = bundle_update(
                 rows,
-                cols,
                 colsCovering,
                 colsCoveringCount,
-                rc,
+                dual_x,
                 bestUB,
                 ZLB,
                 t,
@@ -3417,10 +4181,9 @@ void solve_scp_lagrangian_pool(
         if (!use_bundle_update || !updated) {
             updated = subgradient_update(
                 rows,
-                cols,
                 colsCovering,
                 colsCoveringCount,
-                rc,
+                dual_x,
                 bestUB,
                 ZLB,
                 t,
@@ -3630,6 +4393,60 @@ void solve_scp_lagrangian_pool(
         }
     }
 
+    if (cfg.polish_enabled && *solmin > 0) {
+        /* reduced costs at the best multipliers found */
+        double zlb_best = compute_reduced_and_lb(
+            rows,
+            cols,
+            rowsCovered,
+            rowsCoveredCount,
+            t_best,
+            col_costs,
+            rc,
+            dual_x
+        );
+
+        int proved = (stop_reason == LAGR_STOP_OPTIMAL);
+        int solmin_before = *solmin;
+
+        lagr_bounded_finish(
+            rows,
+            cols,
+            rowsCovered,
+            rowsCoveredCount,
+            colsCovering,
+            colsCoveringCount,
+            weights,
+            rc,
+            zlb_best,
+            cfg.polish_node_limit,
+            cfg.polish_core_cap,
+            sol_tmp,
+            solmin,
+            &bestLB,
+            &proved,
+            max_pool,
+            pool_solutions,
+            &pool_count,
+            &pool_min_len,
+            norm
+        );
+
+        if (*solmin < solmin_before) {
+            bestTerms = *solmin;
+            bestUB = (double)*solmin;
+
+            if (max_pool <= 1) {
+                /* no pool to carry the improved cover: keep it in the stats path */
+                pool_min_len = *solmin;
+            }
+        }
+
+        if (proved) {
+            stop_reason = LAGR_STOP_OPTIMAL;
+        }
+    }
+
     lagr_stats_finish(
         (*solmin > 0) ? *solmin : bestTerms,
         bestLB,
@@ -3648,11 +4465,13 @@ void solve_scp_lagrangian_pool(
 
     /* cleanup */
     free(t);
+    free(t_best);
     free(rc);
     free(sol_tmp);
     free(sol_tmp2);
     free(norm);
     free(col_costs);
+    free(dual_x);
     free(bundle_state.center_t);
     free(bundle_state.prev_center_t);
     free(bundle_state.cut_alpha);

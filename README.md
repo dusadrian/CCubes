@@ -8,7 +8,7 @@ It employs a bottom-up search strategy, starting from the simplest combinations 
 
 Solving the minterm matrix coverage is an NP-hard problem beyond the scope of CCubes. Exact solutions are provided by Gurobi, an industry level power optimization solver. For compilation, Gurobi's path is hardcoded in the Makefile and it needs to be changed manually, according to the user's installation and operating system. At runtime, Gurobi will search for a valid license, freely offered for academic research.
 
-The default option, in case Gurobi is not available, is to solve the minterm matrix coverage using a custom implementation of a parallel processing Lagrangian relaxation method, based on the sources of BOOM (courtesy of Petr Fišer). More solving methods will be added.
+The default option, in case Gurobi is not available, is to solve the minterm matrix coverage using a custom implementation of a parallel processing Lagrangian relaxation method, based on the sources of BOOM (courtesy of Petr Fišer). It has since grown into a hybrid solver: a dominance presolve shrinks the chart, the Lagrangian bound drives reduced-cost fixing, and a bounded branch-and-bound finish searches the remaining core. The effort levels `-l0` to `-l2` trade time for stronger bounds within fixed search budgets. They may prove optimality when the bounds meet, but exactness is not guaranteed; use Gurobi when a proven minimum cover is required.
 
 If no weights are applied, the combination of prime implicants that cover the ON set minterms is the quickest exact method, roughly equivalent to `espresso -Dso` type of output, although it produces a much more efficient circuit especially with an exact optimization.
 
@@ -48,8 +48,12 @@ Options:
                           1 (default) weight based on complexity levels k
                           2 additional weight if shared between outputs
   -s<number>          : how to solve the covering problem:
-                          0 (default) Lagrangian relaxation heuristic
+                          0 (default) hybrid Lagrangian relaxation solver
                           1 Gurobi exact
+  -l<number>          : Lagrangian effort level:
+                          0 (default) fastest, bounded strong finish
+                          1 stronger bounds, more time
+                          2 best bound mode, adaptive bundle portfolio
   -d<level>[=<file>]  : incremental debug information
                           0 (default) errors + warnings
                           1 errors + warnings + info

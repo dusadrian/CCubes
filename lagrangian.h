@@ -43,7 +43,8 @@ void solve_scp_lagrangian(
     const double weights[], // can be NULL; higher is better (tie-break inside heuristics)
     int *solution,          // out column indices (0-based)
     int *solmin,            // out size (number of columns); -1 if infeasible
-    int effort_level        // 0 fastest, 1 stronger bound, 2 adaptive bundle portfolio with bounded strong finish
+    int effort_level        // 0 fastest, 1 stronger bound, 2 adaptive bundle portfolio
+                            // with bounded strong finish
 );
 
 void solve_scp_lagrangian_pool(

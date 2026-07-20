@@ -216,7 +216,7 @@ void help() {
     printf("                         0 (default) Lagrangian relaxation heuristic\n");
     printf("                         1 Gurobi exact\n");
     printf("  -l<number>         : Lagrangian effort level:\n");
-    printf("                         0 (default) fastest\n");
+    printf("                         0 (default) fastest, bounded strong finish\n");
     printf("                         1 stronger bounds, more time\n");
     printf("                         2 best bound mode, adaptive bundle portfolio with bounded strong finish\n");
     printf("  -d<level>[=<file>] : incremental debug information\n");
