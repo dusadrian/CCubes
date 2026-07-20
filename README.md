@@ -20,7 +20,7 @@ An experimental switch `-f` enables some filtering of prime implicants during th
 
 Unlike other minimizers like Espresso (usually single threaded), CCubes is scalable and can handle larger problem instances more efficiently. Where possible, it will use a parallel search process using available CPU cores. Theoretically, its scalability can be extended to distributed computing environments, allowing it to tackle even larger instances by using multiple machines.
 
-For parallel search it uses OpenMP, which users need to make sure it is installed and linked at compile time.
+Parallel search supports both OpenMP and pthreads. The build automatically uses OpenMP when it is available; otherwise it uses the pthread backend, which is enabled by default. If neither backend is available or enabled, CCubes falls back to serial execution, so users do not need to install OpenMP specifically.
 
 There is a minimal help system integrated into CCubes. Users can enable debug output by setting the debug level via command line options. This will provide insights into the internal workings of the minimization process and can be useful for troubleshooting and understanding the behavior of the tool.
 
@@ -42,7 +42,7 @@ Options:
   -k<number>          : start searching from level k
   -e<number>          : end criterion (default +1 level with the same minima)
   -b<number>          : bits per word, either 8, 16, 32, 64 (default) or 128
-  -c<number>          : number of CPU cores / threads to use, if OpenMP available
+  -c<number>          : number of CPU cores / threads to use with a parallel backend
   -w<number>          : weights applied to the prime implicants:
                           0 no weight
                           1 (default) weight based on complexity levels k
