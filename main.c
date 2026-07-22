@@ -10,15 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include <math.h>
-#include <errno.h>
-#include <limits.h>
 #include <time.h>
 #include <stdatomic.h>
 #include "main.h"
 #include "certified_stop.h"
 #include "checkpoint.h"
 #include "ccubes_threads.h"
+#include "pool_selection.h"
 
 typedef struct {
     int k;
@@ -44,98 +42,6 @@ typedef struct {
     atomic_uint_fast64_t *last_task_reached;
     ccubes_mutex *state_lock;
 } PIWorkerContext;
-
-static void destroy_output_locks(ccubes_mutex *locks, int noutputs) {
-    if (!locks) return;
-    for (int o = 0; o < noutputs; o++) {
-        ccubes_mutex_destroy(&locks[o]);
-    }
-    free(locks);
-}
-
-static bool env_flag_enabled(const char *name) {
-    const char *value = getenv(name);
-    if (!value || !*value) return false;
-
-    return (
-        strcmp(value, "0") != 0 &&
-        strcmp(value, "false") != 0 &&
-        strcmp(value, "FALSE") != 0 &&
-        strcmp(value, "no") != 0 &&
-        strcmp(value, "NO") != 0
-    );
-}
-
-static bool parse_int_strict(const char *text, int *value) {
-    if (!text || !*text || !value) return false;
-
-    char *end = NULL;
-    errno = 0;
-    long parsed = strtol(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0') return false;
-    if (parsed < INT_MIN || parsed > INT_MAX) return false;
-
-    *value = (int)parsed;
-    return true;
-}
-
-static bool parse_nonnegative_double(const char *text, double *value) {
-    if (!text || !*text || !value) return false;
-
-    char *end = NULL;
-    errno = 0;
-    double parsed = strtod(text, &end);
-    if (errno != 0 || end == text || *end != '\0') return false;
-    if (!isfinite(parsed) || parsed < 0.0) return false;
-
-    *value = parsed;
-    return true;
-}
-
-static bool parse_hybrid_effort_level(const char *text, int *level) {
-    int parsed = 0;
-    if (!parse_int_strict(text, &parsed)) return false;
-    if (parsed < 0 || parsed > 2) return false;
-    *level = parsed;
-    return true;
-}
-
-static void debug_print_lagrangian_stats(int output_index) {
-    DBG_INFO_BLOCK {
-        const LagrangianStats *stats = lagrangian_last_stats();
-        if (!stats || stats->stop_reason == LAGR_STOP_NOT_RUN) return;
-
-        fprintf(
-            debug_out,
-            "Lagrangian output %d: rows=%d cols=%d UB=%d ",
-            output_index + 1,
-            stats->rows,
-            stats->cols,
-            stats->best_ub
-        );
-
-        if (stats->best_lb == INT_MIN) {
-            fprintf(debug_out, "LB=- gap=- ");
-        } else {
-            fprintf(
-                debug_out,
-                "LB=%d gap=%d ",
-                stats->best_lb,
-                stats->gap
-            );
-        }
-
-        fprintf(
-            debug_out,
-            "bestZLB=%.6f lastZLB=%.6f iterations=%d stop=%s%s\n",
-            stats->best_zlb,
-            stats->last_zlb,
-            stats->iterations,
-            lagrangian_stop_reason_name(stats->stop_reason),
-            stats->pool_mode ? " pool" : ""
-        );
-    }
-}
 
 static void pi_search_range_worker(
     uint64_t start,
@@ -677,10 +583,6 @@ int main(int argc, char *argv[]) {
     // the same number of (covered) minterms
     // int last_index[ON_minterms]; // descending order
 
-    int layer_weights[ninputs + 1];
-    layer_weights[0] = 0; // k basically starts with 1, so its k-layer weight will start on position 1
-
-
     int available_threads = ccubes_default_thread_count();
     if (THREADS_FORCED) {
         if (THREADS < 1) THREADS = 1;
@@ -1170,26 +1072,17 @@ int main(int argc, char *argv[]) {
                         fprintf(debug_out, "Output %d, found PIs: %d", o + 1, *foundPI);
                     }
 
-                    double *weights = NULL;
-
-                    if (WEIGHT_PIC > 0) {
-                        weights = calloc(*foundPI, sizeof(double));
-                        layer_weights[k] = 1;
-                        for (int i = k - 1; i > 0; i--) {
-                            layer_weights[i] = layer_weights[i + 1] * 2;
-                        }
-
-                        int counter = 0;
-                        for (int l = 1; l < k; l++) {
-                            int layer_pis = PInfo[o].nofpi[l] - PInfo[o].nofpi[l - 1];
-                            for (int i = 0; i < layer_pis; i++) {
-                                weights[counter] = layer_weights[l];
-                                if (WEIGHT_PIC == 2) {
-                                    weights[counter] += 1 * (PInfo[o].shared[counter] - 1); // additional weight for shared PIs
-                                }
-                                counter++;
-                            }
-                        }
+                    double *weights = build_cover_weights(
+                        &PInfo[o],
+                        *foundPI,
+                        k,
+                        WEIGHT_PIC
+                    );
+                    if (WEIGHT_PIC > 0 && !weights) {
+                        fprintf(stderr, "Error: Memory allocation failed for cover weights\n");
+                        destroy_output_locks(output_locks, noutputs);
+                        cleanup(PInfo, buffer);
+                        return 1;
                     }
 
                     clock_gettime(CLOCK_MONOTONIC, &startg);
@@ -1205,7 +1098,7 @@ int main(int argc, char *argv[]) {
                             HYBRID_EFFORT_LEVEL
                         );
                         boundary_exact = lagrangian_last_run_proved_optimal();
-                        debug_print_lagrangian_stats(o);
+                        print_hybrid_stats(o);
                     }
 
                     if (SCP_TYPE == 1) { // Gurobi: blended multi-objective
@@ -1408,26 +1301,19 @@ int main(int argc, char *argv[]) {
                 );
 
                 if (*ON_set_covered && !PInfo[o].stop_search) {
-                    double *weights = NULL;
+                    clear_output_solution_pool(&PInfo[o]);
 
-                    if (WEIGHT_PIC > 0) {
-                        weights = calloc(*foundPI, sizeof(double));
-                        layer_weights[k] = 1;
-                        for (int i = k - 1; i > 0; i--) {
-                            layer_weights[i] = layer_weights[i + 1] * 2;
-                        }
-
-                        int counter = 0;
-                        for (int l = 1; l < k; l++) {
-                            int layer_pis = PInfo[o].nofpi[l] - PInfo[o].nofpi[l - 1];
-                            for (int i = 0; i < layer_pis; i++) {
-                                weights[counter] = layer_weights[l];
-                                if (WEIGHT_PIC == 2) {
-                                    weights[counter] += 1 * (PInfo[o].shared[counter] - 1); // additional weight for shared PIs
-                                }
-                                counter++;
-                            }
-                        }
+                    double *weights = build_cover_weights(
+                        &PInfo[o],
+                        *foundPI,
+                        k,
+                        WEIGHT_PIC
+                    );
+                    if (WEIGHT_PIC > 0 && !weights) {
+                        fprintf(stderr, "Error: Memory allocation failed for cover weights\n");
+                        destroy_output_locks(output_locks, noutputs);
+                        cleanup(PInfo, buffer);
+                        return 1;
                     }
 
                     clock_gettime(CLOCK_MONOTONIC, &startg);
@@ -1445,7 +1331,7 @@ int main(int argc, char *argv[]) {
                             HYBRID_EFFORT_LEVEL
                         );
                         pool_boundary_exact[o] = lagrangian_last_run_proved_optimal();
-                        debug_print_lagrangian_stats(o);
+                        print_hybrid_stats(o);
                     }
 
                     if (SCP_TYPE == 1) { // Gurobi: solution pool
@@ -1491,11 +1377,7 @@ int main(int argc, char *argv[]) {
             } // end of outputs loop solving SCP
 
 
-            /*
-             * Cross-output selection from solution pools:
-             * For each output, pick the solution in its pool whose PIs are most shared
-             * with the other outputs' pools.
-             */
+            /* Coordinate the per-output pools against their actual joint union. */
             int *chosen_idx = (int*)calloc((size_t)noutputs, sizeof(int));
             if (!chosen_idx) {
                 fprintf(stderr, "Error: Memory allocation failed for chosen_idx\n");
@@ -1503,65 +1385,45 @@ int main(int argc, char *argv[]) {
                 cleanup(PInfo, buffer);
                 return 1;
             }
+            PoolSelectionStats pool_stats;
+            if (
+                !select_joint_pool_solutions(
+                    PInfo,
+                    noutputs,
+                    implicant_words,
+                    chosen_idx,
+                    &pool_stats
+                )
+            ) {
+                fprintf(stderr, "Error: coordinated pool selection failed\n");
+                free(chosen_idx);
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                return 1;
+            }
 
-            for (int o = 0; o < noutputs; ++o) {
-                int pool_count_val = PInfo[o].pool_count;
-                int solmin_o = PInfo[o].solmin;
-
-                if (pool_count_val <= 0 || solmin_o <= 0) {
-                    chosen_idx[o] = -1;
-                    continue;
-                }
-
-                int best_score = -1;
-                int best_p = 0;
-
-                for (int p = 0; p < pool_count_val; ++p) {
-                    int *sol = PInfo[o].pool_solutions[p];
-                    int score = 0;
-
-                    for (int j = 0; j < solmin_o; ++j) {
-                        int col = sol[j];
-                        // For each other output, count at most once per output if this PI appears anywhere in its pool
-                        for (int oo = 0; oo < noutputs; ++oo) {
-                            if (oo == o) continue;
-                            int pc2 = PInfo[oo].pool_count;
-                            int solmin_oo = PInfo[oo].solmin;
-                            if (pc2 <= 0 || solmin_oo <= 0) continue;
-
-                            bool found_in_oo = false;
-                            for (int pp = 0; pp < pc2 && !found_in_oo; ++pp) {
-                                int *sol2 = PInfo[oo].pool_solutions[pp];
-                                for (int jj = 0; jj < solmin_oo; ++jj) {
-                                    int col2 = sol2[jj];
-                                    bool eq = true;
-                                    for (int w = 0; w < implicant_words; ++w) {
-                                        uint64_t pos1 = PInfo[o].implicants_pos[col * implicant_words + w];
-                                        uint64_t val1 = PInfo[o].implicants_val[col * implicant_words + w];
-                                        uint64_t pos2 = PInfo[oo].implicants_pos[col2 * implicant_words + w];
-                                        uint64_t val2 = PInfo[oo].implicants_val[col2 * implicant_words + w];
-                                        if (pos1 != pos2 || val1 != val2) {
-                                            eq = false;
-                                            break;
-                                        }
-                                    }
-                                    if (eq) {
-                                        found_in_oo = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (found_in_oo) score++;
-                        }
-                    }
-
-                    if (score > best_score) {
-                        best_score = score;
-                        best_p = p;
-                    }
-                }
-
-                chosen_idx[o] = best_p;
+            DBG_INFO_BLOCK {
+                pool_stats.retained_shared_cubes = count_retained_shared_cubes(
+                    PInfo,
+                    noutputs,
+                    implicant_words
+                );
+                fprintf(
+                    debug_out,
+                    "CCUBES_POOL level=%d active_outputs=%d candidates=%d "
+                    "retained_shared=%d pool_shared=%d connections=%d "
+                    "selected_rows=%d selected_shared=%d savings=%d selection=%s\n",
+                    k,
+                    pool_stats.active_outputs,
+                    pool_stats.total_pool_solutions,
+                    pool_stats.retained_shared_cubes,
+                    pool_stats.pool_shared_cubes,
+                    pool_stats.output_connections,
+                    pool_stats.selected_distinct_cubes,
+                    pool_stats.selected_shared_cubes,
+                    pool_stats.sharing_savings,
+                    pool_stats.selection_exact ? "exact" : "local"
+                );
             }
 
             // Copy chosen solutions into indices for each output
@@ -1581,6 +1443,10 @@ int main(int argc, char *argv[]) {
                         int *src = PInfo[o].pool_solutions[chosen_idx[o]];
                         for (int i = 0; i < solmin_o; ++i) {
                             indices[i] = src[i];
+                        }
+                    } else if (*prevsolmin == solmin_o) {
+                        for (int i = 0; i < solmin_o; ++i) {
+                            indices[i] = previndices[i];
                         }
                     }
 
@@ -1610,11 +1476,18 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     } else {
-                        for (int i = 0; i < *solmin; i++) {
-                            indices[i] = previndices[i];
+                        if (*solmin == *prevsolmin) {
+                            /* Keep the best coordinated equal-cardinality cover. */
+                            for (int i = 0; i < *solmin; i++) {
+                                previndices[i] = indices[i];
+                            }
+                        } else {
+                            /* A worse boundary incumbent cannot replace the previous one. */
+                            for (int i = 0; i < *prevsolmin; i++) {
+                                indices[i] = previndices[i];
+                            }
+                            *solmin = *prevsolmin;
                         }
-
-                        *solmin = *prevsolmin;
                         stop_counter[o]++;
 
                         DBG_INFO_BLOCK {

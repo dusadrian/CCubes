@@ -122,3 +122,8 @@ $(BIN): $(OBJ)
 
 clean:
 	rm -f $(OBJ) $(BIN)
+
+.PHONY: test-pool-selection
+test-pool-selection:
+	$(CC) -Wall -O2 -I. tests/test_pool_selection.c pool_selection.c -o /tmp/ccubes_test_pool_selection
+	/tmp/ccubes_test_pool_selection

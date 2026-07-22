@@ -21,6 +21,8 @@
 # Keep the examples directory and all its contents
 !examples/
 !examples/**
+!tests/
+!tests/*.c
 
 temp/
 proofs/

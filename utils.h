@@ -15,6 +15,34 @@
 
 void error_message(const char *msg);
 
+void destroy_output_locks(
+    ccubes_mutex *locks,
+    int noutputs
+);
+
+bool env_flag_enabled(
+    const char *name
+);
+
+bool parse_int_strict(
+    const char *text,
+    int *value
+);
+
+bool parse_nonnegative_double(
+    const char *text,
+    double *value
+);
+
+bool parse_hybrid_effort_level(
+    const char *text,
+    int *level
+);
+
+void print_hybrid_stats(
+    int output_index
+);
+
 // Readable type identifiers
 typedef enum {
     TYPE_BOOL,     // bool
@@ -86,6 +114,13 @@ void resize(
     int increase,
     int size,
     int nrows
+);
+
+double *build_cover_weights(
+    const PIstorage *pi,
+    int found_pi,
+    int completed_level,
+    int weight_mode
 );
 
 void trim_whitespace(

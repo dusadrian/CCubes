@@ -8,7 +8,145 @@
 
 #include "utils.h"
 #include "checkpoint.h"
+#include "lagrangian.h"
 #include <assert.h>
+#include <errno.h>
+#include <float.h>
+#include <math.h>
+
+void destroy_output_locks(ccubes_mutex *locks, int noutputs) {
+    if (!locks) return;
+    for (int o = 0; o < noutputs; o++) {
+        ccubes_mutex_destroy(&locks[o]);
+    }
+    free(locks);
+}
+
+bool env_flag_enabled(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !*value) return false;
+
+    return (
+        strcmp(value, "0") != 0 &&
+        strcmp(value, "false") != 0 &&
+        strcmp(value, "FALSE") != 0 &&
+        strcmp(value, "no") != 0 &&
+        strcmp(value, "NO") != 0
+    );
+}
+
+bool parse_int_strict(const char *text, int *value) {
+    if (!text || !*text || !value) return false;
+
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') return false;
+    if (parsed < INT_MIN || parsed > INT_MAX) return false;
+
+    *value = (int)parsed;
+    return true;
+}
+
+bool parse_nonnegative_double(const char *text, double *value) {
+    if (!text || !*text || !value) return false;
+
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(text, &end);
+    if (errno != 0 || end == text || *end != '\0') return false;
+    if (!isfinite(parsed) || parsed < 0.0) return false;
+
+    *value = parsed;
+    return true;
+}
+
+bool parse_hybrid_effort_level(const char *text, int *level) {
+    int parsed = 0;
+    if (!parse_int_strict(text, &parsed)) return false;
+    if (parsed < 0 || parsed > 2) return false;
+    *level = parsed;
+    return true;
+}
+
+void print_hybrid_stats(int output_index) {
+    DBG_INFO_BLOCK {
+        const LagrangianStats *stats = lagrangian_last_stats();
+        if (!stats || stats->stop_reason == LAGR_STOP_NOT_RUN) return;
+
+        fprintf(
+            debug_out,
+            "Hybrid output %d: rows=%d cols=%d UB=%d ",
+            output_index + 1,
+            stats->rows,
+            stats->cols,
+            stats->best_ub
+        );
+
+        if (stats->best_lb == INT_MIN) {
+            fprintf(debug_out, "LB=- gap=- ");
+        } else {
+            fprintf(
+                debug_out,
+                "LB=%d gap=%d ",
+                stats->best_lb,
+                stats->gap
+            );
+        }
+
+        fprintf(
+            debug_out,
+            "bestZLB=%.6f lastZLB=%.6f iterations=%d stop=%s%s\n",
+            stats->best_zlb,
+            stats->last_zlb,
+            stats->iterations,
+            lagrangian_stop_reason_name(stats->stop_reason),
+            stats->pool_mode ? " pool" : ""
+        );
+    }
+}
+
+double *build_cover_weights(
+    const PIstorage *pi,
+    int found_pi,
+    int completed_level,
+    int weight_mode
+) {
+    if (!pi || found_pi <= 0 || completed_level <= 0 || weight_mode <= 0) {
+        return NULL;
+    }
+
+    double *weights = (double *)calloc((size_t)found_pi, sizeof(double));
+    if (!weights) return NULL;
+
+    int start = 0;
+    for (int level = 1; level <= completed_level && start < found_pi; ++level) {
+        int end = pi->nofpi[level - 1];
+        if (end < start) end = start;
+        if (end > found_pi) end = found_pi;
+
+        double level_weight = scalbn(1.0, completed_level - level);
+        if (!isfinite(level_weight)) level_weight = DBL_MAX / 4.0;
+
+        for (int col = start; col < end; ++col) {
+            weights[col] = level_weight;
+            if (weight_mode == 2 && pi->shared) {
+                weights[col] += pi->shared[col];
+            }
+        }
+        start = end;
+    }
+
+    /* A malformed or legacy checkpoint must not leave active columns unweighted. */
+    for (int col = start; col < found_pi; ++col) {
+        weights[col] = 1.0;
+        if (weight_mode == 2 && pi->shared) {
+            weights[col] += pi->shared[col];
+        }
+    }
+
+    return weights;
+}
 
 typedef struct {
     PIstorage *pi;
@@ -51,6 +189,11 @@ static int cmp_pi_canonical(
     PIstorage *pi = pi_canonical_sort_ctx.pi;
     int ipw = pi_canonical_sort_ctx.implicant_words;
 
+    /* Preserve the strongest cross-output representative of equal coverage. */
+    if (pi->shared[ia] != pi->shared[ib]) {
+        return pi->shared[ib] - pi->shared[ia];
+    }
+
     int cmp = cmp_u64_words(
         &pi->implicants_pos[(size_t)ia * (size_t)ipw],
         &pi->implicants_pos[(size_t)ib * (size_t)ipw],
@@ -78,10 +221,6 @@ static int cmp_pi_canonical(
 
     if (pi->covsum[ia] != pi->covsum[ib]) {
         return pi->covsum[ib] - pi->covsum[ia];
-    }
-
-    if (pi->shared[ia] != pi->shared[ib]) {
-        return pi->shared[ib] - pi->shared[ia];
     }
 
     return 0;
@@ -150,6 +289,25 @@ static void pi_coverage_insert(
     slots[pos] = idx;
 }
 
+static void pi_coverage_replace(
+    PIstorage *pi,
+    int *slots,
+    size_t table_size,
+    int idx
+) {
+    size_t mask = table_size - 1u;
+    size_t pos = (size_t)(pi_coverage_hash(pi, idx) & (uint64_t)mask);
+
+    while (slots[pos] >= 0) {
+        if (pi_coverage_equal(pi, slots[pos], idx)) {
+            slots[pos] = idx;
+            return;
+        }
+        pos = (pos + 1u) & mask;
+    }
+    slots[pos] = idx;
+}
+
 static void copy_pi_record(
     PIstorage *pi,
     int dst,
@@ -207,12 +365,22 @@ static int prune_duplicate_coverage_in_level(
 
     int write = level_start;
     for (int read = level_start; read < found; ++read) {
-        if (pi_coverage_lookup(pi, slots, table_size, read) >= 0) {
-            continue;
+        int existing = pi_coverage_lookup(pi, slots, table_size, read);
+        if (existing >= 0) {
+            /*
+            Keep one shareable representative from the new level even when a
+            lower-level PI has identical local coverage. Current-level records
+            are sorted by sharing count, so later duplicates can be discarded.
+            */
+            if (existing >= level_start || pi->shared[read] <= 0) continue;
         }
 
         copy_pi_record(pi, write, read, implicant_words);
-        pi_coverage_insert(pi, slots, table_size, write);
+        if (existing >= 0) {
+            pi_coverage_replace(pi, slots, table_size, write);
+        } else {
+            pi_coverage_insert(pi, slots, table_size, write);
+        }
         write++;
     }
 
@@ -1229,10 +1397,7 @@ int process_task(
         }
 
         int OFF_minterms = PInfo[o].OFF_minterms;
-        int *covered = PInfo[o].covered;
-        int *last_index = PInfo[o].last_index;
         int pichart_words = PInfo[o].pichart_words;
-        uint64_t *pichart_pos = PInfo[o].pichart_pos; // mask for the PI chart values
         int *cov_word_index = PInfo[o].cov_word_index;
         uint64_t *shifted_cov_mask = PInfo[o].shifted_cov_mask;
 
@@ -1461,30 +1626,6 @@ int process_task(
                 }
             }
 
-            // check if the current PI is not redundant by row dominance
-            // against the PIs at the previous level of complexity k - 1
-            // last_index does not (yet) contain any PI indexes at the current level of complexity k
-            bool redundant = false;
-
-            if (covsum > 0) {
-                for (int rd = 0; rd < last_index[covsum - 1]; rd++) {
-                    bool dominated = true;
-                    for (int w = 0; w < pichart_words; w++) {
-                        if ((pichart_values[w] & pichart_pos[covered[rd] * pichart_words + w]) != pichart_values[w]) {
-                            dominated = false;
-                            break;
-                        }
-                    }
-
-                    if (dominated) {
-                        redundant = true;
-                        break;
-                    }
-                }
-            }
-
-            if (redundant) continue;
-
             // add everything to the temporary / task storage objects
 
             for (int w = 0; w < pichart_words; w++) {
@@ -1635,14 +1776,15 @@ int process_task(
                     int *covsum = PInfo[o].covsum;
 
                     bool redundant = false;
+                    bool shareable = shared_count[u] > 1;
 
-                    // check if the PI is redundant by row dominance
-                    // but now against the previous PIs from the SAME complexity level k
-
-                    int start_index = (k == 1 || u_covsum <= 1) ? 0 : last_index[u_covsum - 1];
-
-                    if (!deterministic_order) {
-                        for (int rd = start_index; rd < ((u_covsum <= 1) ? 0 : k_last_index[u_covsum - 1]); rd++) {
+                    /*
+                    Local dominance is safe for coverage but not for global
+                    product-row sharing. Retain exact cubes available to more
+                    than one output; prune unique candidates as before.
+                    */
+                    if (!shareable && u_covsum > 0) {
+                        for (int rd = 0; rd < last_index[u_covsum - 1]; rd++) {
                             bool dominated = true;
                             for (int w = 0; w < pichart_words; w++) {
                                 if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
@@ -1651,6 +1793,26 @@ int process_task(
                                 }
                             }
 
+                            if (dominated) {
+                                redundant = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!shareable && !redundant && !deterministic_order) {
+                        int start_index = (k == 1 || u_covsum <= 1) ?
+                            0 : last_index[u_covsum - 1];
+                        int end_index = (u_covsum <= 1) ?
+                            0 : k_last_index[u_covsum - 1];
+                        for (int rd = start_index; rd < end_index; rd++) {
+                            bool dominated = true;
+                            for (int w = 0; w < pichart_words; w++) {
+                                if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
+                                    dominated = false;
+                                    break;
+                                }
+                            }
                             if (dominated) {
                                 redundant = true;
                                 break;
