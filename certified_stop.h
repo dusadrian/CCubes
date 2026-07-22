@@ -38,18 +38,23 @@ typedef struct {
 /* Per-output state for the observational/adaptive plateau diagnostic. */
 typedef struct {
     bool reported;
+    bool warning_detected;
     bool certification_required;
+    bool escalation_suppressed;
+    bool pool_warning_avoided;
+    bool boundary_horizon_unproved;
+    int certification_horizon;
+    uint64_t estimated_remaining_tasks;
+    bool task_estimate_capped;
 } BlockingStopState;
 
 /*
- * The current certificate applies to binary point-set inputs: each observed
- * row is a total binary assignment and every output has nonempty ON/OFF sets.
+ * Default adaptive stopping is an engineering safeguard, not an implicit
+ * request for exhaustive search.  It may continue only when the remaining
+ * certified horizon contains at most this many position-subset tasks.  The
+ * explicit -c mode is intentionally not subject to this limit.
  */
-bool certified_model_supported(
-    const PIstorage *PInfo,
-    int ninputs,
-    int noutputs
-);
+#define CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT UINT64_C(1000000)
 
 /* Initialize an empty state; coverage can be recorded before static setup. */
 void certified_stop_state_reset(CertifiedStopState *state);
@@ -112,6 +117,18 @@ void certified_blocking_diagnostic_print(
 /* Initialize, then observe at most the first terminating plateau. */
 void certified_blocking_state_init(BlockingStopState *state);
 
+/*
+ * Estimate sum(C(ninputs, k), k = level + 1 .. horizon), capped at limit + 1.
+ * The return value says whether the complete remaining horizon fits the limit.
+ */
+bool certified_stop_adaptive_work_within_limit(
+    int ninputs,
+    int level,
+    int horizon,
+    uint64_t limit,
+    uint64_t *estimated_tasks
+);
+
 bool certified_blocking_observe_plateau(
     BlockingStopState *state,
     CertifiedStopState *certificate,
@@ -123,20 +140,23 @@ bool certified_blocking_observe_plateau(
     const PIstorage *pi,
     int ninputs,
     int level,
-    const int *selected_indices,
+    int *selected_indices,
     int selected_terms,
-    bool boundary_exact
+    bool boundary_exact,
+    bool inspect_equal_pool
 );
 
 /* Combine plateau, full-certified, and one-way adaptive stopping semantics. */
 bool certified_stop_policy_decision(
     const CertifiedStopState *certificate,
-    const BlockingStopState *blocking,
+    BlockingStopState *blocking,
     bool certified_mode,
     bool plateau_triggered,
     int level,
     int cover_size,
-    bool boundary_exact
+    bool boundary_exact,
+    FILE *stream,
+    int output_index
 );
 
 #endif /* CERTIFIED_STOP_H */

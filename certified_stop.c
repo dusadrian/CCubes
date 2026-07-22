@@ -11,32 +11,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdlib.h>
-
-bool certified_model_supported(
-    const PIstorage *PInfo,
-    int ninputs,
-    int noutputs
-) {
-    if (!PInfo || ninputs <= 0 || noutputs <= 0) return false;
-
-    for (int o = 0; o < noutputs; ++o) {
-        if (PInfo[o].ON_minterms <= 0 || PInfo[o].OFF_minterms <= 0) {
-            return false;
-        }
-
-        size_t on_cells = (size_t)PInfo[o].ON_minterms * (size_t)ninputs;
-        size_t off_cells = (size_t)PInfo[o].OFF_minterms * (size_t)ninputs;
-
-        for (size_t j = 0; j < on_cells; ++j) {
-            if (PInfo[o].ON_set[j] < 1 || PInfo[o].ON_set[j] > 2) return false;
-        }
-        for (size_t j = 0; j < off_cells; ++j) {
-            if (PInfo[o].OFF_set[j] < 1 || PInfo[o].OFF_set[j] > 2) return false;
-        }
-    }
-
-    return true;
-}
+#include <string.h>
 
 /*
  * Two ON rows are compatible when their agreement supercube covers no OFF
@@ -382,6 +357,181 @@ void certified_blocking_state_init(BlockingStopState *state) {
     if (state) *state = (BlockingStopState){0};
 }
 
+static uint64_t capped_binomial(int n, int k, uint64_t cap) {
+    if (n < 0 || k < 0 || k > n) return 0;
+    if (k == 0 || k == n) return 1;
+    if (k > n - k) k = n - k;
+
+    uint64_t value = 1;
+    for (int i = 1; i <= k; ++i) {
+        const uint64_t numerator = (uint64_t)(n - k + i);
+#if defined(__SIZEOF_INT128__)
+        __uint128_t next = (__uint128_t)value * numerator / (uint64_t)i;
+        if (next > cap) return cap;
+        value = (uint64_t)next;
+#else
+        /* Exact divisibility lets us reduce before multiplying. */
+        uint64_t divisor = (uint64_t)i;
+        uint64_t a = value;
+        uint64_t b = numerator;
+        uint64_t x = a;
+        uint64_t y = divisor;
+        while (y != 0) {
+            uint64_t remainder = x % y;
+            x = y;
+            y = remainder;
+        }
+        a /= x;
+        divisor /= x;
+        x = b;
+        y = divisor;
+        while (y != 0) {
+            uint64_t remainder = x % y;
+            x = y;
+            y = remainder;
+        }
+        b /= x;
+        divisor /= x;
+        if (divisor != 1 || (a != 0 && b > cap / a)) return cap;
+        value = a * b;
+        if (value > cap) return cap;
+#endif
+    }
+    return value;
+}
+
+bool certified_stop_adaptive_work_within_limit(
+    int ninputs,
+    int level,
+    int horizon,
+    uint64_t limit,
+    uint64_t *estimated_tasks
+) {
+    if (!estimated_tasks || ninputs < 0 || level < 0 || horizon < 0) {
+        return false;
+    }
+
+    const uint64_t cap = limit == UINT64_MAX ? UINT64_MAX : limit + 1u;
+    uint64_t total = 0;
+    int final_level = horizon < ninputs ? horizon : ninputs;
+    for (int k = level + 1; k <= final_level; ++k) {
+        uint64_t remaining_cap = cap - total;
+        uint64_t tasks = capped_binomial(ninputs, k, remaining_cap);
+        if (tasks >= remaining_cap) {
+            total = cap;
+            break;
+        }
+        total += tasks;
+    }
+
+    *estimated_tasks = total;
+    return total <= limit;
+}
+
+static bool same_cover_set(const int *left, const int *right, int terms) {
+    if (!left || !right || terms <= 0) return false;
+    for (int i = 0; i < terms; ++i) {
+        bool found = false;
+        for (int j = 0; j < terms; ++j) {
+            if (left[i] == right[j]) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/*
+ * The blocking warning belongs to a cover, not merely to its cardinality.
+ * Hybrid and exact solvers may return different tied covers.  Before an
+ * adaptive escalation, inspect every retained equal-cardinality alternative
+ * and prefer a warning-free representative when one exists.
+ */
+static bool prefer_warning_free_pool_cover(
+    const PIstorage *pi,
+    int ninputs,
+    int level,
+    int *selected_indices,
+    int selected_terms,
+    BlockingDiagnostic *selected_diagnostic,
+    int *checked,
+    int *warning_free,
+    bool *replaced
+) {
+    if (!pi || !selected_indices || !selected_diagnostic || !checked ||
+        !warning_free || !replaced) {
+        return false;
+    }
+
+    *checked = 1;
+    *warning_free = selected_diagnostic->delayed_private_pairs == 0 ? 1 : 0;
+    *replaced = false;
+    const int *best = selected_indices;
+    uint64_t best_delayed = selected_diagnostic->delayed_private_pairs;
+
+    for (int p = 0; p < pi->pool_count; ++p) {
+        const int *candidate = pi->pool_solutions ? pi->pool_solutions[p] : NULL;
+        if (!candidate || same_cover_set(candidate, selected_indices, selected_terms)) {
+            continue;
+        }
+
+        BlockingDiagnostic diagnostic;
+        if (!certified_blocking_diagnostic(
+            pi,
+            ninputs,
+            level,
+            candidate,
+            selected_terms,
+            false,
+            &diagnostic
+        )) {
+            return false;
+        }
+        (*checked)++;
+        if (diagnostic.delayed_private_pairs == 0) (*warning_free)++;
+        if (diagnostic.delayed_private_pairs < best_delayed) {
+            best = candidate;
+            best_delayed = diagnostic.delayed_private_pairs;
+            *selected_diagnostic = diagnostic;
+        }
+    }
+
+    if (pi->prevsolmin == selected_terms && pi->previndices &&
+        !same_cover_set(pi->previndices, selected_indices, selected_terms)) {
+        BlockingDiagnostic diagnostic;
+        if (!certified_blocking_diagnostic(
+            pi,
+            ninputs,
+            level,
+            pi->previndices,
+            selected_terms,
+            false,
+            &diagnostic
+        )) {
+            return false;
+        }
+        (*checked)++;
+        if (diagnostic.delayed_private_pairs == 0) (*warning_free)++;
+        if (diagnostic.delayed_private_pairs < best_delayed) {
+            best = pi->previndices;
+            best_delayed = diagnostic.delayed_private_pairs;
+            *selected_diagnostic = diagnostic;
+        }
+    }
+
+    if (best != selected_indices) {
+        memcpy(
+            selected_indices,
+            best,
+            (size_t)selected_terms * sizeof(*selected_indices)
+        );
+        *replaced = true;
+    }
+    return true;
+}
+
 bool certified_blocking_observe_plateau(
     BlockingStopState *state,
     CertifiedStopState *certificate,
@@ -393,15 +543,17 @@ bool certified_blocking_observe_plateau(
     const PIstorage *pi,
     int ninputs,
     int level,
-    const int *selected_indices,
+    int *selected_indices,
     int selected_terms,
-    bool boundary_exact
+    bool boundary_exact,
+    bool inspect_equal_pool
 ) {
     if (!state) return false;
     if (!plateau_triggered || state->reported) {
         return true;
     }
     if (!adaptive_mode && !report_diagnostic) return true;
+    FILE *output = stream ? stream : stderr;
 
     BlockingDiagnostic diagnostic;
     if (!certified_blocking_diagnostic(
@@ -416,28 +568,101 @@ bool certified_blocking_observe_plateau(
         return false;
     }
 
+    const uint64_t delayed_before = diagnostic.delayed_private_pairs;
+    int pool_checked = 1;
+    int warning_free = delayed_before == 0 ? 1 : 0;
+    bool pool_replaced = false;
+    if (adaptive_mode && inspect_equal_pool && pi->pool_count > 0 &&
+        !prefer_warning_free_pool_cover(
+            pi,
+            ninputs,
+            level,
+            selected_indices,
+            selected_terms,
+            &diagnostic,
+            &pool_checked,
+            &warning_free,
+            &pool_replaced
+        )) {
+        return false;
+    }
+    if (pool_replaced && report_diagnostic && !certified_blocking_diagnostic(
+        pi,
+        ninputs,
+        level,
+        selected_indices,
+        selected_terms,
+        true,
+        &diagnostic
+    )) {
+        return false;
+    }
+
+    state->warning_detected = delayed_before > 0;
+    state->pool_warning_avoided =
+        delayed_before > 0 && diagnostic.delayed_private_pairs == 0;
+
+    if (report_diagnostic || pool_replaced || delayed_before > 0) {
+        if (inspect_equal_pool && pi->pool_count > 0) {
+            fprintf(
+                output,
+                "CCUBES_ADAPTIVE_POOL output=%d level=%d checked=%d "
+                "warning_free=%d replaced=%d delayed_before=%" PRIu64
+                " delayed_after=%" PRIu64 "\n",
+                output_index,
+                level,
+                pool_checked,
+                warning_free,
+                pool_replaced ? 1 : 0,
+                delayed_before,
+                diagnostic.delayed_private_pairs
+            );
+        }
+    }
+
     if (report_diagnostic) {
         certified_blocking_diagnostic_print(
-            stream,
+            output,
             output_index,
             boundary_exact,
             &diagnostic
         );
     }
     if (adaptive_mode) {
-        state->certification_required =
-            diagnostic.delayed_private_pairs > 0;
-        if (state->certification_required &&
-            !certified_stop_state_prepare(certificate, pi, ninputs)) {
-            return false;
+        const bool unresolved_warning = diagnostic.delayed_private_pairs > 0;
+        if (unresolved_warning) {
+            if (!certified_stop_state_prepare(certificate, pi, ninputs)) {
+                return false;
+            }
+            state->certification_horizon = certified_stop_horizon(certificate);
+            state->certification_required = certified_stop_adaptive_work_within_limit(
+                ninputs,
+                level,
+                state->certification_horizon,
+                CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT,
+                &state->estimated_remaining_tasks
+            );
+            state->task_estimate_capped =
+                !state->certification_required &&
+                state->estimated_remaining_tasks >
+                    CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT;
+            state->escalation_suppressed = !state->certification_required;
         }
-        if (report_diagnostic) {
+        if (report_diagnostic || unresolved_warning) {
             fprintf(
-                stream,
-                "CCUBES_ADAPTIVE output=%d level=%d action=%s\n",
+                output,
+                "CCUBES_ADAPTIVE output=%d level=%d action=%s horizon=%d "
+                "remaining_position_tasks=%" PRIu64 " estimate_capped=%d "
+                "limit=%" PRIu64 "\n",
                 output_index,
                 level,
-                state->certification_required ? "certify" : "plateau"
+                state->certification_required
+                    ? "certify"
+                    : unresolved_warning ? "warn-stop" : "plateau",
+                state->certification_horizon,
+                state->estimated_remaining_tasks,
+                state->task_estimate_capped ? 1 : 0,
+                (uint64_t)CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT
             );
         }
     }
@@ -447,25 +672,63 @@ bool certified_blocking_observe_plateau(
 
 bool certified_stop_policy_decision(
     const CertifiedStopState *certificate,
-    const BlockingStopState *blocking,
+    BlockingStopState *blocking,
     bool certified_mode,
     bool plateau_triggered,
     int level,
     int cover_size,
-    bool boundary_exact
+    bool boundary_exact,
+    FILE *stream,
+    int output_index
 ) {
     const bool escalated = blocking && blocking->certification_required;
 
     /* Every supported output has a nonempty ON set, so one term is optimal. */
     if (cover_size == 1) return true;
 
-    if (certified_mode || escalated) {
+    if (certified_mode) {
         return certified_stop_should_stop(
             certificate,
             level,
             cover_size,
             boundary_exact
         );
+    }
+
+    if (escalated) {
+        if (certified_stop_should_stop(
+            certificate,
+            level,
+            cover_size,
+            boundary_exact
+        )) {
+            return true;
+        }
+
+        /*
+         * Adaptive mode never searches beyond the horizon whose work it
+         * budgeted.  If the hybrid boundary has not closed its gap there,
+         * preserve the best cover and stop with an explicit warning.  -c is
+         * handled above and intentionally remains unbounded by this guard.
+         */
+        if (blocking->certification_horizon > 0 &&
+            level >= blocking->certification_horizon) {
+            blocking->certification_required = false;
+            blocking->escalation_suppressed = true;
+            blocking->boundary_horizon_unproved = true;
+            fprintf(
+                stream ? stream : stderr,
+                "CCUBES_ADAPTIVE output=%d level=%d action=warn-stop "
+                "horizon=%d remaining_position_tasks=0 estimate_capped=0 "
+                "limit=%" PRIu64 " reason=boundary-not-proved\n",
+                output_index,
+                level,
+                blocking->certification_horizon,
+                (uint64_t)CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT
+            );
+            return true;
+        }
+        return false;
     }
 
     return plateau_triggered;

@@ -48,6 +48,18 @@ int main(void) {
     assert(stats.pool_shared_cubes == 3);
     assert(count_retained_shared_cubes(pinfo, 3, 1) == 3);
 
+    int selected[3] = {0, 0, 0};
+    for (int output = 0; output < 3; ++output) {
+        assert(chosen[output] >= 0);
+        selected[output] = pinfo[output].pool_solutions[chosen[output]][0];
+        pinfo[output].indices = &selected[output];
+    }
+    assert(measure_selected_pool_solutions(pinfo, 3, 1, &stats));
+    assert(stats.output_connections == 3);
+    assert(stats.selected_distinct_cubes == 2);
+    assert(stats.selected_shared_cubes == 1);
+    assert(stats.sharing_savings == 1);
+
     puts("pool selection regression: OK");
     return 0;
 }

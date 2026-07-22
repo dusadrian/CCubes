@@ -704,6 +704,69 @@ bool select_joint_pool_solutions(
     return true;
 }
 
+bool measure_selected_pool_solutions(
+    const PIstorage *pinfo,
+    int noutputs,
+    int implicant_words,
+    PoolSelectionStats *stats
+) {
+    if (!pinfo || noutputs <= 0 || implicant_words <= 0 || !stats) {
+        return false;
+    }
+
+    size_t connections = 0u;
+    for (int output = 0; output < noutputs; ++output) {
+        if (pinfo[output].solmin <= 0 || !pinfo[output].indices) continue;
+        if ((size_t)pinfo[output].solmin > SIZE_MAX - connections) return false;
+        connections += (size_t)pinfo[output].solmin;
+    }
+    if (connections == 0u) {
+        stats->output_connections = 0;
+        stats->selected_distinct_cubes = 0;
+        stats->selected_shared_cubes = 0;
+        stats->sharing_savings = 0;
+        return true;
+    }
+    if (connections > (size_t)INT_MAX) return false;
+
+    CubeUniverse universe;
+    if (!universe_init(&universe, pinfo, implicant_words, connections)) {
+        return false;
+    }
+    int *refcount = (int *)calloc(connections, sizeof(*refcount));
+    if (!refcount) {
+        universe_destroy(&universe);
+        return false;
+    }
+
+    bool ok = true;
+    for (int output = 0; output < noutputs && ok; ++output) {
+        for (int i = 0; i < pinfo[output].solmin; ++i) {
+            int id = universe_add(&universe, output, pinfo[output].indices[i]);
+            if (id < 0) {
+                ok = false;
+                break;
+            }
+            refcount[id]++;
+        }
+    }
+
+    if (ok) {
+        int selected_shared = 0;
+        for (int id = 0; id < universe.count; ++id) {
+            if (refcount[id] > 1) selected_shared++;
+        }
+        stats->output_connections = (int)connections;
+        stats->selected_distinct_cubes = universe.count;
+        stats->selected_shared_cubes = selected_shared;
+        stats->sharing_savings = (int)connections - universe.count;
+    }
+
+    free(refcount);
+    universe_destroy(&universe);
+    return ok;
+}
+
 int count_retained_shared_cubes(
     const PIstorage *pinfo,
     int noutputs,

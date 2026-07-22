@@ -103,6 +103,20 @@ typedef struct ThreadBuffer {
     int       found;
 } ThreadBuffer;
 
+/* Binary total-row model required by adaptive and certified stopping. */
+bool certified_model_supported(
+    const PIstorage *PInfo,
+    int ninputs,
+    int noutputs
+);
+
+/* Binary PLA patterns, allowing input dashes, for heuristic execution. */
+bool heuristic_pattern_model_supported(
+    const PIstorage *PInfo,
+    int ninputs,
+    int noutputs
+);
+
 uint64_t nchoosek(
     int n,
     int k

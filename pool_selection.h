@@ -31,6 +31,14 @@ bool select_joint_pool_solutions(
     PoolSelectionStats *stats
 );
 
+/* Refresh the selected-union fields after a tied cover is replaced in-place. */
+bool measure_selected_pool_solutions(
+    const PIstorage *pinfo,
+    int noutputs,
+    int implicant_words,
+    PoolSelectionStats *stats
+);
+
 /* Count exact cube identities retained in the charts of at least two outputs. */
 int count_retained_shared_cubes(
     const PIstorage *pinfo,

@@ -6,15 +6,17 @@ The minimization process is extremely efficient with incompletely specified func
 
 It employs a bottom-up search strategy, starting from the simplest combinations of 1 input, 2 inputs etc. and gradually increases the complexity. After each such level, it solves the minterm matrix and evaluates whether deeper prime implicants can still change the result.
 
-The default stopping policy is adaptive. A one-term cover stops immediately because no nonempty function can use fewer terms. Otherwise, at the first unchanged boundary value, CCubes examines private witnesses of the current cover. If a compatible witness pair has no jointly covering retained PI, the output is structurally delayed and automatically continues under the certified policy. Otherwise CCubes accepts the plateau as a fast heuristic exit. A negative pair warning is not a proof of global optimality because a delayed group of three or more rows can escape the pair screen.
+The default `-s0 -e0` profile is deliberately the fastest hybrid heuristic. It stops at the first unchanged cover cardinality and never triggers automatic certification. The optional `-g` diagnostic may describe the plateau, but it does not change this policy. An explicit `-c` remains an override for users who deliberately request certified exact stopping.
+
+For fully specified binary point rows, `-e1`, `-e2`, and the Gurobi boundary profile use bounded adaptive stopping unless `-c` is requested. A one-term cover stops immediately because no nonempty function can use fewer terms. Otherwise, at the first unchanged boundary value, CCubes examines private witnesses of the current cover. Because this warning is cover-dependent, CCubes first checks the retained equal-cardinality solution pool and substitutes a warning-free tied cover when one exists. Only an unresolved warning can trigger deeper generation. That escalation is allowed only when the complete remaining certified horizon contains at most one million position-subset tasks; otherwise CCubes keeps the plateau cover, emits `action=warn-stop`, and finishes. If the bounded horizon is reached but the hybrid boundary solver has not closed its proof gap, it likewise warns and stops instead of searching past the budget. A negative pair warning is not a proof of global optimality because a delayed group of three or more rows can escape the pair screen.
 
 For applications that require a certificate from the outset, `-c` selects exact certified stopping based on compatible ON-row supercubes and an incompatibility lower bound. It stops only when the returned cover meets a global lower bound or the certified generation horizon has been completed and the boundary solver has proved its cover optimal. Gurobi supplies an exact boundary directly; the hybrid solver can also certify a boundary when its lower and upper bounds meet.
 
-The small `examples/certified_F2.pla` instance demonstrates the escalation. Its cover value is two at levels one and two, but a delayed pair is detected; the default continues, reaches the one-term cover at level three, and certifies it.
+The small `examples/certified_F2.pla` instance demonstrates an affordable escalation under `-e1` or `-e2`. Its cover value is two at levels one and two, but a delayed pair is detected; the adaptive profile continues, reaches the one-term cover at level three, and certifies it. The default `-e0` profile intentionally accepts the level-two plateau instead.
 
-The optional `-g` switch prints the machine-readable `CCUBES_BLOCKING` observation and the resulting `CCUBES_ADAPTIVE` action without changing the default policy. The `model_union_bound` field is an ex-ante all-ON-pair bound under an auxiliary independent, uniform, with-replacement OFF-row model; it is not conditioned on the observed cover and is not a finite-sample certificate. It is reported as `NA` when more than one million ON pairs would make this explanatory statistic disproportionately expensive.
+The optional `-g` switch prints the machine-readable `CCUBES_BLOCKING` observation without changing the selected stopping policy. Adaptive profiles also print the resulting `CCUBES_ADAPTIVE` action, and pool inspection is reported as `CCUBES_ADAPTIVE_POOL`. Under `-e0`, the observation remains diagnostic only. Unresolved adaptive warnings are always printed, even without `-g`, so that `action=certify` and `action=warn-stop` cannot be silent. The `model_union_bound` field is an ex-ante all-ON-pair bound under an auxiliary independent, uniform, with-replacement OFF-row model; it is not conditioned on the observed cover and is not a finite-sample certificate. It is reported as `NA` when more than one million ON pairs would make this explanatory statistic disproportionately expensive.
 
-Both stopping policies currently require binary, fully specified input rows and nonempty ON and OFF sets for every output. Unsupported inputs are rejected rather than silently processed under an unjustified stopping rule. The certified static analysis is lazy in the default mode: ordinary unwarned outputs do not pay for the full compatible-pair horizon and incompatibility scan.
+Input-dash PLA pattern rows are accepted through a separate, explicitly announced heuristic path, provided every output has nonempty ON and OFF sets. That path uses the first plateau and does not claim the point-row blocking diagnostic or a global certificate; `-c` is rejected. Certified static analysis is lazy in the adaptive point-row modes: ordinary unwarned outputs do not pay for the full compatible-pair horizon and incompatibility scan, while `-e0` never requests that analysis automatically.
 
 Minimum covering of the PI chart is NP-hard. The `-s1` option delegates this boundary problem to the Gurobi optimizer. For compilation, Gurobi's path is configured in the Makefile and may need to be adjusted for the local installation and operating system. At runtime, Gurobi searches for a valid license; academic licences are available from Gurobi.
 
@@ -24,7 +26,7 @@ If no weights are applied, the combination of prime implicants that cover the ON
 
 Two weighting options are available, for instance the default `-w1` for weight based on complexity levels (prime implicants with lower number of literals will be given more weight). The option `-w2` adds additional weight if a prime implicant is shared between multiple outputs.
 
-The option `-p` aims to spend additional time collecting a pool of possible solutions from the solver and decide which solution is best by comparing their shared prime implicants with those from the other outputs. Activating this parameter to more than 1 solutions will automatically set the weighting to `-w2`. Its rationale is that the solver may select different shared prime implicants, even though all have an equal (weighted) contribution to optimality.
+The option `-p` spends additional time collecting equal-cardinality candidate covers for each output, then selects the tuple whose union contains the fewest distinct cube rows. The Cartesian product is searched exactly when it contains at most two million tuples; larger products use a deterministic three-start coordinate search. This is a secondary multi-output sharing objective over the available pools, not a proof of the globally smallest shared cover. With the bundled hybrid solver, “equal-cardinality” means equal to its best feasible cover and is globally optimal only when the reported lower and upper bounds meet. Activating `-p` above 1 automatically selects `-w2`.
 
 Unlike other minimizers like Espresso (usually single threaded), CCubes is scalable and can handle larger problem instances more efficiently. Where possible, it will use a parallel search process using available CPU cores. Theoretically, its scalability can be extended to distributed computing environments, allowing it to tackle even larger instances by using multiple machines.
 
@@ -58,14 +60,15 @@ Options:
                             (presolve + Lagrangian bounds + bounded exact search)
                           1 Gurobi exact
   -e<number>          : hybrid solver effort level:
-                          0 (default) fastest, bounded strong finish
-                          1 stronger bounds, more time
-                          2 best bound mode, adaptive bundle portfolio
+                          0 (default) fastest heuristic; first-plateau stop
+                          1 stronger bounds with bounded adaptive certification
+                          2 strongest bounds with bounded adaptive certification
   -d                  : deterministic PI ordering
   -g                  : print the adaptive blocking diagnostic at the first plateau
-  -c                  : require certified exact stopping
-                          default: adaptive warning, then certify only when warned
-  -p<number>          : decide from a pool of up to <number> equally optimal solutions
+  -c                  : require certified exact stopping (point rows only)
+                          explicitly overrides the -e0 heuristic plateau policy
+                          input-dash rows: heuristic plateau stopping
+  -p<number>          : coordinate up to <number> equal-cardinality covers per output
   -l<sec>[=<file>]    : time limit to save a checkpoint in the <file>
   -r=<file>           : resume from checkpoint file
   -i<level>=<file>    : inspect checkpoint (print progress and metadata)

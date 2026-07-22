@@ -123,7 +123,16 @@ $(BIN): $(OBJ)
 clean:
 	rm -f $(OBJ) $(BIN)
 
-.PHONY: test-pool-selection
+.PHONY: test test-pool-selection test-certified-stop test-effort-policy
+test: test-pool-selection test-certified-stop test-effort-policy
+
 test-pool-selection:
 	$(CC) -Wall -O2 -I. tests/test_pool_selection.c pool_selection.c -o /tmp/ccubes_test_pool_selection
 	/tmp/ccubes_test_pool_selection
+
+test-certified-stop:
+	$(CC) -Wall -O2 -I. tests/test_certified_stop.c certified_stop.c -lm -o /tmp/ccubes_test_certified_stop
+	/tmp/ccubes_test_certified_stop
+
+test-effort-policy: $(BIN)
+	sh tests/test_effort_policy.sh ./$(BIN) examples/certified_F2.pla

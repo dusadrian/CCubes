@@ -14,6 +14,58 @@
 #include <float.h>
 #include <math.h>
 
+bool certified_model_supported(
+    const PIstorage *PInfo,
+    int ninputs,
+    int noutputs
+) {
+    if (!PInfo || ninputs <= 0 || noutputs <= 0) return false;
+
+    for (int o = 0; o < noutputs; ++o) {
+        if (PInfo[o].ON_minterms <= 0 || PInfo[o].OFF_minterms <= 0) {
+            return false;
+        }
+
+        size_t on_cells = (size_t)PInfo[o].ON_minterms * (size_t)ninputs;
+        size_t off_cells = (size_t)PInfo[o].OFF_minterms * (size_t)ninputs;
+
+        for (size_t j = 0; j < on_cells; ++j) {
+            if (PInfo[o].ON_set[j] < 1 || PInfo[o].ON_set[j] > 2) return false;
+        }
+        for (size_t j = 0; j < off_cells; ++j) {
+            if (PInfo[o].OFF_set[j] < 1 || PInfo[o].OFF_set[j] > 2) return false;
+        }
+    }
+
+    return true;
+}
+
+bool heuristic_pattern_model_supported(
+    const PIstorage *PInfo,
+    int ninputs,
+    int noutputs
+) {
+    if (!PInfo || ninputs <= 0 || noutputs <= 0) return false;
+
+    for (int o = 0; o < noutputs; ++o) {
+        if (PInfo[o].ON_minterms <= 0 || PInfo[o].OFF_minterms <= 0) {
+            return false;
+        }
+
+        size_t on_cells = (size_t)PInfo[o].ON_minterms * (size_t)ninputs;
+        size_t off_cells = (size_t)PInfo[o].OFF_minterms * (size_t)ninputs;
+
+        for (size_t j = 0; j < on_cells; ++j) {
+            if (PInfo[o].ON_set[j] < 0 || PInfo[o].ON_set[j] > 2) return false;
+        }
+        for (size_t j = 0; j < off_cells; ++j) {
+            if (PInfo[o].OFF_set[j] < 0 || PInfo[o].OFF_set[j] > 2) return false;
+        }
+    }
+
+    return true;
+}
+
 void destroy_output_locks(ccubes_mutex *locks, int noutputs) {
     if (!locks) return;
     for (int o = 0; o < noutputs; o++) {
@@ -1169,6 +1221,11 @@ void write_pla_file(
 }
 
 void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
+    if (!PInfo) {
+        free(buffer);
+        return;
+    }
+
     int noutputs = PInfo[0].outputs;
     for (int o = 0; o < noutputs; o++) {
         free(PInfo[o].ON_set);
@@ -1196,6 +1253,8 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
     }
 
     free(PInfo);
+
+    if (!buffer) return;
 
     int threads = 1;
     if (buffer[0]) {
@@ -1278,7 +1337,14 @@ void print_info(const char *INFO_PATH, const int info_level) {
     printf("Inputs: %d, Outputs: %d\n", ni, no);
     // printf("Bits per word: %d, value bit width: %d, implicant words: %d\n", bpw, vbw, ipw);
     printf("Level k reached: %d\n", ck);
-    printf("Stopping policy: %s\n", certified_mode ? "certified" : "adaptive");
+    const char *stopping_policy = certified_mode
+        ? "certified"
+        : certified_model_supported(pi_tmp, ni, no)
+            ? "adaptive"
+            : heuristic_pattern_model_supported(pi_tmp, ni, no)
+                ? "heuristic plateau"
+                : "unsupported";
+    printf("Stopping policy: %s\n", stopping_policy);
     uint64_t maxt = nchoosek(ni, ck);
 
     if (ck > 0 && maxt > 0) {
@@ -1320,6 +1386,56 @@ void print_info(const char *INFO_PATH, const int info_level) {
     cleanup(pi_tmp, dummy);
 }
 
+
+static bool projected_cube_is_prime(
+    const PIstorage *pi,
+    int ninputs,
+    const int *support,
+    int level,
+    const uint64_t *value_bits,
+    const int *word_index,
+    const int *bit_index
+) {
+    if (!pi || !support || !value_bits || !word_index || !bit_index || level <= 0) {
+        return false;
+    }
+
+    /*
+     * A consistent cube is prime exactly when deleting any one of its
+     * literals makes it intersect at least one OFF pattern. A zero in an OFF
+     * row is an input dash and therefore matches either binary literal.
+     */
+    for (int removed = 0; removed < level; ++removed) {
+        bool deletion_blocked = false;
+
+        for (int z = 0; z < pi->OFF_minterms; ++z) {
+            bool matches = true;
+            for (int c = 0; c < level; ++c) {
+                if (c == removed) continue;
+
+                int input = support[c];
+                int off_value = pi->OFF_set[(size_t)z * (size_t)ninputs + (size_t)input];
+                int cube_value = 1 + (int)(
+                    (value_bits[word_index[input]] >> bit_index[input]) & 1ULL
+                );
+
+                if (off_value != 0 && off_value != cube_value) {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if (matches) {
+                deletion_blocked = true;
+                break;
+            }
+        }
+
+        if (!deletion_blocked) return false;
+    }
+
+    return true;
+}
 
 int process_task(
     uint64_t task,
@@ -1751,6 +1867,16 @@ int process_task(
 
                 // the output this PI belongs to
                 int o = output_map[u * noutputs + s];
+                bool shareable = shared_count[u] > 1;
+                bool shareable_prime = !shareable || projected_cube_is_prime(
+                    &PInfo[o],
+                    ninputs,
+                    tempk,
+                    k,
+                    &buffer[tid][o].value_bits[(size_t)f * (size_t)implicant_words],
+                    word_index,
+                    bit_index
+                );
 
                 int ON_minterms = PInfo[o].ON_minterms;
                 int *last_index = PInfo[o].last_index;
@@ -1775,15 +1901,15 @@ int process_task(
                     int *shared = PInfo[o].shared;
                     int *covsum = PInfo[o].covsum;
 
-                    bool redundant = false;
-                    bool shareable = shared_count[u] > 1;
+                    bool redundant = !shareable_prime;
 
                     /*
-                    Local dominance is safe for coverage but not for global
-                    product-row sharing. Retain exact cubes available to more
-                    than one output; prune unique candidates as before.
+                    Local dominance is safe for coverage but can remove a
+                    genuine PI useful for global product-row sharing. Shared
+                    candidates may bypass local dominance only after the
+                    explicit primality test above.
                     */
-                    if (!shareable && u_covsum > 0) {
+                    if (!shareable && !redundant && u_covsum > 0) {
                         for (int rd = 0; rd < last_index[u_covsum - 1]; rd++) {
                             bool dominated = true;
                             for (int w = 0; w < pichart_words; w++) {

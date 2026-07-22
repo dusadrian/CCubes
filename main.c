@@ -133,14 +133,15 @@ void help() {
     printf("                             (presolve + Lagrangian bounds + bounded exact search)\n");
     printf("                           1 Gurobi exact\n");
     printf("  -e<number>           : hybrid solver effort level:\n");
-    printf("                           0 (default) fastest, bounded strong finish\n");
-    printf("                           1 stronger bounds, more time\n");
-    printf("                           2 best bound mode, adaptive bundle portfolio with bounded strong finish\n");
+    printf("                           0 (default) fastest heuristic; stop at first plateau\n");
+    printf("                           1 stronger bounds with bounded adaptive certification\n");
+    printf("                           2 strongest bounds with bounded adaptive certification\n");
     printf("  -d                   : deterministic PI ordering\n");
     printf("  -g                   : print the adaptive blocking diagnostic at the first plateau\n");
-    printf("  -c                   : require certified exact stopping\n");
-    printf("                         (default: adaptive warning, then certify only when warned)\n");
-    printf("  -p<number>           : decide from a pool of up to <number> equally optimal solutions\n");
+    printf("  -c                   : require certified exact stopping (point rows only)\n");
+    printf("                         (explicitly overrides the -e0 heuristic plateau policy)\n");
+    printf("                         (input-dash rows: heuristic plateau stopping)\n");
+    printf("  -p<number>           : coordinate up to <number> equal-cardinality covers per output\n");
     printf("  -l<sec>[=<file>]     : time limit to save a checkpoint in the <file>\n");
     printf("  -r=<file>            : resume from checkpoint file\n");
     printf("  -i<level>=<file>     : inspect checkpoint (print progress and metadata)\n");
@@ -163,7 +164,7 @@ int main(int argc, char *argv[]) {
     bool gurobi_ok = false;
 
     // Record start time for execution timing
-    struct timespec start, end, startk, endk, startg, endg;
+    struct timespec start, end, startk, endk, startg, endg, startpi, endpi;
     double execution_time;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
@@ -507,18 +508,69 @@ int main(int argc, char *argv[]) {
     }
 
     CertifiedStopState *certified_states = NULL;
+    bool adaptive_stopping_supported = certified_model_supported(
+        PInfo,
+        ninputs,
+        noutputs
+    );
+    bool heuristic_pattern_supported = heuristic_pattern_model_supported(
+        PInfo,
+        ninputs,
+        noutputs
+    );
+    const bool fast_hybrid_heuristic =
+        adaptive_stopping_supported &&
+        SCP_TYPE == 0 &&
+        HYBRID_EFFORT_LEVEL == 0 &&
+        !CERTIFIED_MODE;
+    const bool adaptive_escalation_enabled =
+        adaptive_stopping_supported &&
+        !fast_hybrid_heuristic &&
+        !CERTIFIED_MODE;
 
-    if (!certified_model_supported(PInfo, ninputs, noutputs)) {
+    if (!heuristic_pattern_supported) {
         fprintf(
             stderr,
-            "Error: adaptive and certified stopping require binary, fully specified input rows "
-            "with nonempty ON and OFF sets for every output.\n"
+            "Error: CCubes requires binary point or pattern rows with nonempty ON and OFF sets "
+            "for every output.\n"
         );
         free(chk_stop_counter);
         free(chk_coverage_horizon);
-        ThreadBuffer *empty_buffer[1] = {NULL};
-        cleanup(PInfo, empty_buffer);
+        cleanup(PInfo, NULL);
         return 1;
+    }
+
+    if (!adaptive_stopping_supported && CERTIFIED_MODE) {
+        fprintf(
+            stderr,
+            "Error: -c certified stopping requires fully specified binary point rows; "
+            "input-dash pattern rows support heuristic stopping only.\n"
+        );
+        free(chk_stop_counter);
+        free(chk_coverage_horizon);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+
+    if (!adaptive_stopping_supported) {
+        fprintf(
+            stderr,
+            "Notice: input-dash pattern rows detected; using heuristic plateau stopping. "
+            "Adaptive pair diagnosis and certified stopping are unavailable.\n"
+        );
+        if (REPORT_BLOCKING_DIAGNOSTIC) {
+            fprintf(
+                stderr,
+                "Notice: -g is ignored because the blocking diagnostic requires point rows.\n"
+            );
+            REPORT_BLOCKING_DIAGNOSTIC = false;
+        }
+    } else if (fast_hybrid_heuristic) {
+        fprintf(
+            stderr,
+            "Notice: hybrid effort 0 uses fast heuristic plateau stopping; "
+            "automatic certification is disabled.\n"
+        );
     }
 
     certified_states = calloc((size_t)noutputs, sizeof(CertifiedStopState));
@@ -526,8 +578,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: stopping-state allocation failed.\n");
         free(chk_stop_counter);
         free(chk_coverage_horizon);
-        ThreadBuffer *empty_buffer[1] = {NULL};
-        cleanup(PInfo, empty_buffer);
+        cleanup(PInfo, NULL);
         return 1;
     }
 
@@ -545,8 +596,7 @@ int main(int argc, char *argv[]) {
             free(chk_stop_counter);
             free(chk_coverage_horizon);
             free(certified_states);
-            ThreadBuffer *empty_buffer[1] = {NULL};
-            cleanup(PInfo, empty_buffer);
+            cleanup(PInfo, NULL);
             return 1;
         }
         if (CERTIFIED_MODE) {
@@ -717,9 +767,17 @@ int main(int argc, char *argv[]) {
         } else {
             stop_counter[o] = 0;
         }
-        if (RESUME_PATH && stop_counter[o] > 0) {
+        if (adaptive_stopping_supported && RESUME_PATH && stop_counter[o] > 0) {
             blocking_stop_states[o].reported = true;
-            if (!CERTIFIED_MODE && !PInfo[o].stop_search) {
+            if (fast_hybrid_heuristic && !PInfo[o].stop_search) {
+                PInfo[o].stop_search = true;
+                fprintf(
+                    stderr,
+                    "Notice: output %d resumed under -e0; accepting the stored "
+                    "plateau without automatic certification.\n",
+                    o + 1
+                );
+            } else if (adaptive_escalation_enabled && !PInfo[o].stop_search) {
                 blocking_stop_states[o].certification_required = true;
                 if (!certified_stop_state_prepare(
                     &certified_states[o],
@@ -730,6 +788,33 @@ int main(int argc, char *argv[]) {
                     free(certified_states);
                     cleanup(PInfo, buffer);
                     return 1;
+                }
+                blocking_stop_states[o].certification_horizon =
+                    certified_stop_horizon(&certified_states[o]);
+                const int estimate_from_level = RESUME_K > 0 ? RESUME_K - 1 : 0;
+                blocking_stop_states[o].certification_required =
+                    certified_stop_adaptive_work_within_limit(
+                        ninputs,
+                        estimate_from_level,
+                        blocking_stop_states[o].certification_horizon,
+                        CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT,
+                        &blocking_stop_states[o].estimated_remaining_tasks
+                    );
+                if (!blocking_stop_states[o].certification_required) {
+                    blocking_stop_states[o].escalation_suppressed = true;
+                    blocking_stop_states[o].task_estimate_capped = true;
+                    PInfo[o].stop_search = true;
+                    fprintf(
+                        stderr,
+                        "CCUBES_ADAPTIVE output=%d level=%d action=warn-stop "
+                        "horizon=%d remaining_position_tasks=%llu estimate_capped=1 "
+                        "limit=%llu reason=resume-budget\n",
+                        o + 1,
+                        RESUME_K,
+                        blocking_stop_states[o].certification_horizon,
+                        (unsigned long long)blocking_stop_states[o].estimated_remaining_tasks,
+                        (unsigned long long)CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT
+                    );
                 }
             }
         }
@@ -840,7 +925,7 @@ int main(int argc, char *argv[]) {
         shifted_mask[r] = (VALUE_BIT_MASK << bit_index[r]);
     }
 
-    double scp_time = 0.0, k_scp_time = 0.0;
+    double scp_time = 0.0, k_scp_time = 0.0, pi_generation_time = 0.0;
 
 
     int k;
@@ -919,6 +1004,7 @@ int main(int argc, char *argv[]) {
             .state_lock = &state_lock
         };
 
+        clock_gettime(CLOCK_MONOTONIC, &startpi);
         if (
             !ccubes_parallel_for(
                 start_task,
@@ -956,6 +1042,11 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+        clock_gettime(CLOCK_MONOTONIC, &endpi);
+        double k_pi_generation_time =
+            (endpi.tv_sec - startpi.tv_sec) +
+            (endpi.tv_nsec - startpi.tv_nsec) / 1e9;
+        pi_generation_time += k_pi_generation_time;
 
         if (TIME_LIMIT_SEC > 0 && level_time_up) {
             if (!CHK_SAVE_PATH) {
@@ -1059,11 +1150,13 @@ int main(int argc, char *argv[]) {
                     *ON_set_covered = test_coverage;
                 }
 
-                certified_stop_observe_coverage(
-                    &certified_states[o],
-                    k,
-                    *ON_set_covered
-                );
+                if (adaptive_stopping_supported) {
+                    certified_stop_observe_coverage(
+                        &certified_states[o],
+                        k,
+                        *ON_set_covered
+                    );
+                }
 
 
                 if (*ON_set_covered && !PInfo[o].stop_search) {
@@ -1192,11 +1285,11 @@ int main(int argc, char *argv[]) {
                         plateau_triggered = stop_counter[o] >= STOP_AFTER_EQUALITY;
                     }
 
-                    if (!certified_blocking_observe_plateau(
+                    if (adaptive_stopping_supported && !certified_blocking_observe_plateau(
                         &blocking_stop_states[o],
                         &certified_states[o],
                         REPORT_BLOCKING_DIAGNOSTIC,
-                        !CERTIFIED_MODE,
+                        adaptive_escalation_enabled,
                         plateau_triggered,
                         stderr,
                         o + 1,
@@ -1205,7 +1298,8 @@ int main(int argc, char *argv[]) {
                         k,
                         indices,
                         *solmin,
-                        boundary_exact
+                        boundary_exact,
+                        false
                     )) {
                         fprintf(stderr, "Error: blocking diagnostic failed for output %d.\n", o + 1);
                         destroy_output_locks(output_locks, noutputs);
@@ -1219,7 +1313,9 @@ int main(int argc, char *argv[]) {
                         plateau_triggered,
                         k,
                         *solmin,
-                        boundary_exact
+                        boundary_exact,
+                        stderr,
+                        o + 1
                     );
 
                     DBG_TRACE_BLOCK {
@@ -1294,11 +1390,13 @@ int main(int argc, char *argv[]) {
                     *ON_set_covered = test_coverage;
                 }
 
-                certified_stop_observe_coverage(
-                    &certified_states[o],
-                    k,
-                    *ON_set_covered
-                );
+                if (adaptive_stopping_supported) {
+                    certified_stop_observe_coverage(
+                        &certified_states[o],
+                        k,
+                        *ON_set_covered
+                    );
+                }
 
                 if (*ON_set_covered && !PInfo[o].stop_search) {
                     clear_output_solution_pool(&PInfo[o]);
@@ -1402,6 +1500,140 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
 
+            // Copy chosen solutions into indices for each output
+            for (int o = 0; o < noutputs; ++o) {
+                int *prevsolmin = &PInfo[o].prevsolmin;
+                int *solmin      = &PInfo[o].solmin;
+                int *previndices =  PInfo[o].previndices;
+                int *indices     =  PInfo[o].indices;
+
+                int pool_count_val = PInfo[o].pool_count;
+                int solmin_o = PInfo[o].solmin;
+
+                /* Only update stop logic if a valid solution exists at this k */
+                if (solmin_o > 0) {
+                    const bool output_was_searching = !PInfo[o].stop_search;
+                    bool has_choice = !(pool_count_val <= 0 || chosen_idx[o] < 0);
+                    if (has_choice) {
+                        int *src = PInfo[o].pool_solutions[chosen_idx[o]];
+                        for (int i = 0; i < solmin_o; ++i) {
+                            indices[i] = src[i];
+                        }
+                    } else if (*prevsolmin == solmin_o) {
+                        for (int i = 0; i < solmin_o; ++i) {
+                            indices[i] = previndices[i];
+                        }
+                    }
+
+                    bool plateau_triggered = false;
+                    bool inspect_equal_pool = false;
+                    if (*solmin < *prevsolmin) {
+                        *prevsolmin = *solmin;
+                        for (int i = 0; i < *solmin; i++) {
+                            previndices[i] = indices[i];
+                        }
+
+                        if (!blocking_stop_states[o].certification_required) {
+                            stop_counter[o] = 0;
+                        }
+
+                    } else {
+                        if (*solmin == *prevsolmin) {
+                            /* Preserve the incumbent until tied covers are diagnosed. */
+                            inspect_equal_pool = true;
+                        } else {
+                            /* A worse boundary incumbent cannot replace the previous one. */
+                            for (int i = 0; i < *prevsolmin; i++) {
+                                indices[i] = previndices[i];
+                            }
+                            *solmin = *prevsolmin;
+                        }
+                        stop_counter[o]++;
+
+                        plateau_triggered = stop_counter[o] >= STOP_AFTER_EQUALITY;
+                    }
+
+                    if (adaptive_stopping_supported && !certified_blocking_observe_plateau(
+                        &blocking_stop_states[o],
+                        &certified_states[o],
+                        REPORT_BLOCKING_DIAGNOSTIC,
+                        adaptive_escalation_enabled,
+                        plateau_triggered,
+                        stderr,
+                        o + 1,
+                        &PInfo[o],
+                        ninputs,
+                        k,
+                        indices,
+                        *solmin,
+                        pool_boundary_exact[o],
+                        inspect_equal_pool
+                    )) {
+                        fprintf(stderr, "Error: blocking diagnostic failed for output %d.\n", o + 1);
+                        free(chosen_idx);
+                        destroy_output_locks(output_locks, noutputs);
+                        cleanup(PInfo, buffer);
+                        return 1;
+                    }
+
+                    if (inspect_equal_pool) {
+                        /* Retain the final coordinated/diagnostic-safe tied cover. */
+                        for (int i = 0; i < *solmin; ++i) {
+                            previndices[i] = indices[i];
+                        }
+                    }
+
+                    PInfo[o].stop_search = certified_stop_policy_decision(
+                        certified_states ? &certified_states[o] : NULL,
+                        &blocking_stop_states[o],
+                        CERTIFIED_MODE,
+                        plateau_triggered,
+                        k,
+                        *solmin,
+                        pool_boundary_exact[o],
+                        stderr,
+                        o + 1
+                    );
+
+                    DBG_INFO_BLOCK {
+                        if (*solmin > 0 && output_was_searching) {
+                            fprintf(
+                                debug_out,
+                                "[pool] Output %d (SCP %.3fs) solution (%d): ",
+                                o + 1,
+                                pool_execution_time[o],
+                                *solmin
+                            );
+                            for (int i = 0; i < *solmin; ++i) {
+                                fprintf(debug_out, "%d ", indices[i] + 1);
+                            }
+                            fprintf(
+                                debug_out,
+                                "%s\n",
+                                PInfo[o].stop_search
+                                    ? "-- stopping search"
+                                    : plateau_triggered
+                                        ? "-- plateau; continuing certification"
+                                        : ""
+                            );
+                        }
+                    }
+                }
+            }
+
+            if (!measure_selected_pool_solutions(
+                PInfo,
+                noutputs,
+                implicant_words,
+                &pool_stats
+            )) {
+                fprintf(stderr, "Error: coordinated pool measurement failed\n");
+                free(chosen_idx);
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                return 1;
+            }
+
             DBG_INFO_BLOCK {
                 pool_stats.retained_shared_cubes = count_retained_shared_cubes(
                     PInfo,
@@ -1426,111 +1658,6 @@ int main(int argc, char *argv[]) {
                 );
             }
 
-            // Copy chosen solutions into indices for each output
-            for (int o = 0; o < noutputs; ++o) {
-                int *prevsolmin = &PInfo[o].prevsolmin;
-                int *solmin      = &PInfo[o].solmin;
-                int *previndices =  PInfo[o].previndices;
-                int *indices     =  PInfo[o].indices;
-
-                int pool_count_val = PInfo[o].pool_count;
-                int solmin_o = PInfo[o].solmin;
-
-                /* Only update stop logic if a valid solution exists at this k */
-                if (solmin_o > 0) {
-                    bool has_choice = !(pool_count_val <= 0 || chosen_idx[o] < 0);
-                    if (has_choice) {
-                        int *src = PInfo[o].pool_solutions[chosen_idx[o]];
-                        for (int i = 0; i < solmin_o; ++i) {
-                            indices[i] = src[i];
-                        }
-                    } else if (*prevsolmin == solmin_o) {
-                        for (int i = 0; i < solmin_o; ++i) {
-                            indices[i] = previndices[i];
-                        }
-                    }
-
-                    DBG_INFO_BLOCK {
-                        if (*solmin > 0 && !PInfo[o].stop_search) {
-                            fprintf(debug_out, "[pool] Output %d (SCP %.3fs) solution (%d): ", o + 1, pool_execution_time[o], *solmin);
-                            for (int i = 0; i < *solmin; i++) {
-                                fprintf(debug_out, "%d ", indices[i] + 1);
-                            }
-                        }
-                    }
-
-                    bool plateau_triggered = false;
-                    if (*solmin < *prevsolmin) {
-                        *prevsolmin = *solmin;
-                        for (int i = 0; i < *solmin; i++) {
-                            previndices[i] = indices[i];
-                        }
-
-                        if (!blocking_stop_states[o].certification_required) {
-                            stop_counter[o] = 0;
-                        }
-
-                        DBG_INFO_BLOCK {
-                            if (!PInfo[o].stop_search) {
-                                fprintf(debug_out, "\n");
-                            }
-                        }
-                    } else {
-                        if (*solmin == *prevsolmin) {
-                            /* Keep the best coordinated equal-cardinality cover. */
-                            for (int i = 0; i < *solmin; i++) {
-                                previndices[i] = indices[i];
-                            }
-                        } else {
-                            /* A worse boundary incumbent cannot replace the previous one. */
-                            for (int i = 0; i < *prevsolmin; i++) {
-                                indices[i] = previndices[i];
-                            }
-                            *solmin = *prevsolmin;
-                        }
-                        stop_counter[o]++;
-
-                        DBG_INFO_BLOCK {
-                            if (!PInfo[o].stop_search) {
-                                fprintf(debug_out, "%s\n", stop_counter[o] >= STOP_AFTER_EQUALITY ? "-- stopping search" : "");
-                            }
-                        }
-
-                        plateau_triggered = stop_counter[o] >= STOP_AFTER_EQUALITY;
-                    }
-
-                    if (!certified_blocking_observe_plateau(
-                        &blocking_stop_states[o],
-                        &certified_states[o],
-                        REPORT_BLOCKING_DIAGNOSTIC,
-                        !CERTIFIED_MODE,
-                        plateau_triggered,
-                        stderr,
-                        o + 1,
-                        &PInfo[o],
-                        ninputs,
-                        k,
-                        indices,
-                        *solmin,
-                        pool_boundary_exact[o]
-                    )) {
-                        fprintf(stderr, "Error: blocking diagnostic failed for output %d.\n", o + 1);
-                        destroy_output_locks(output_locks, noutputs);
-                        cleanup(PInfo, buffer);
-                        return 1;
-                    }
-                    PInfo[o].stop_search = certified_stop_policy_decision(
-                        certified_states ? &certified_states[o] : NULL,
-                        &blocking_stop_states[o],
-                        CERTIFIED_MODE,
-                        plateau_triggered,
-                        k,
-                        *solmin,
-                        pool_boundary_exact[o]
-                    );
-                }
-            }
-
             free(chosen_idx);
 
         } // end of searching for solutions with pooling
@@ -1542,6 +1669,15 @@ int main(int argc, char *argv[]) {
 
         DBG_INFO_BLOCK {
             fprintf(debug_out, "k-level execution completed in %.3f (%.3f) seconds\n", execution_time, k_scp_time);
+            fprintf(
+                debug_out,
+                "CCUBES_TIMING level=%d pi_generation=%.6f scp=%.6f other=%.6f total=%.6f\n",
+                k,
+                k_pi_generation_time,
+                k_scp_time,
+                execution_time - k_pi_generation_time - k_scp_time,
+                execution_time
+            );
         }
 
         scp_time += k_scp_time;
@@ -1658,6 +1794,14 @@ int main(int argc, char *argv[]) {
     double total_scp_time  = BASE_SCP + scp_time;
 
     fprintf(stderr, "Execution completed in %.3f (%.3f SCP) seconds\n", total_exec_time, total_scp_time);
+    fprintf(
+        stderr,
+        "CCUBES_TIMING_TOTAL pi_generation=%.6f scp=%.6f other=%.6f total=%.6f\n",
+        pi_generation_time,
+        total_scp_time,
+        total_exec_time - pi_generation_time - total_scp_time,
+        total_exec_time
+    );
 
     DBG_INFO_BLOCK {
         fprintf(debug_out, "all good.\n");
