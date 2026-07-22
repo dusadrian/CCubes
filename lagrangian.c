@@ -43,6 +43,14 @@ const LagrangianStats *lagrangian_last_stats(void) {
     return &lagr_last_stats;
 }
 
+bool lagrangian_last_run_proved_optimal(void) {
+    return (
+        lagr_last_stats.best_lb != INT_MIN &&
+        lagr_last_stats.best_ub > 0 &&
+        lagr_last_stats.best_lb == lagr_last_stats.best_ub
+    );
+}
+
 const char *lagrangian_stop_reason_name(LagrangianStopReason reason) {
     switch (reason) {
         case LAGR_STOP_OPTIMAL: return "optimal";

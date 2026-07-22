@@ -13,7 +13,7 @@
 #include <string.h>
 
 #define CK_MAGIC "CCCHKv1"  // 7 chars + \0
-#define CK_VERSION 4u
+#define CK_VERSION 6u
 
 static int write_bytes(FILE *f, const void *buf, size_t len) {
     return fwrite(buf, 1, len, f) == len ? 0 : -1;
@@ -88,12 +88,13 @@ int save_checkpoint(
     int weight_pic,
     int scp_type,
     int pool_max,
-    int start_level,
     const char *src_path,
     const char *dst_path,
     double elapsed_total,
     double elapsed_scp,
-    uint64_t last_task
+    uint64_t last_task,
+    bool certified_mode,
+    const int *coverage_horizon
 ) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
@@ -112,7 +113,6 @@ int save_checkpoint(
     if (write_u32(f, (uint32_t)weight_pic) < 0) goto FAIL;
     if (write_u32(f, (uint32_t)scp_type) < 0) goto FAIL;
     if (write_u32(f, (uint32_t)pool_max) < 0) goto FAIL;
-    if (write_u32(f, (uint32_t)start_level) < 0) goto FAIL;
 
     // src and dst paths (may be NULL)
     if (write_str(f, src_path) < 0) goto FAIL;
@@ -125,9 +125,13 @@ int save_checkpoint(
     // last_task at current_k
     if (write_u64(f, last_task) < 0) goto FAIL;
 
+    // Stopping-policy state (version 6).
+    if (write_int(f, certified_mode ? 1 : 0) < 0) goto FAIL;
+
     // stop_counter per output
     for (int o = 0; o < noutputs; ++o) {
         if (write_int(f, stop_counter ? stop_counter[o] : 0) < 0) goto FAIL;
+        if (write_int(f, coverage_horizon ? coverage_horizon[o] : 0) < 0) goto FAIL;
     }
 
     // For each output, write the necessary fields
@@ -193,13 +197,14 @@ int load_checkpoint(
     int *weight_pic,
     int *scp_type,
     int *pool_max,
-    int *start_level,
     int **nofvalues_out,
     char **src_path_out,
     char **dst_path_out,
     double *elapsed_total_out,
     double *elapsed_scp_out,
-    uint64_t *last_task_out
+    uint64_t *last_task_out,
+    bool *certified_mode_out,
+    int **coverage_horizon_out
 ) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -208,8 +213,9 @@ int load_checkpoint(
     if (read_bytes(f, magic, sizeof(magic)) < 0) goto FAIL;
     if (memcmp(magic, CK_MAGIC, sizeof(magic)) != 0) goto FAIL;
 
-    uint32_t ver=0, ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0, sl=0;
+    uint32_t ver=0, ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0;
     if (read_u32(f, &ver) < 0) goto FAIL;
+    if (ver != CK_VERSION) goto FAIL;
 
     if (read_u32(f, &ni) < 0) goto FAIL;
     if (read_u32(f, &no) < 0) goto FAIL;
@@ -221,7 +227,6 @@ int load_checkpoint(
     if (read_u32(f, &wp) < 0) goto FAIL;
     if (read_u32(f, &st) < 0) goto FAIL;
     if (read_u32(f, &pm) < 0) goto FAIL;
-    if (read_u32(f, &sl) < 0) goto FAIL;
 
     *ninputs = (int)ni;
     *noutputs = (int)no;
@@ -233,7 +238,6 @@ int load_checkpoint(
     *weight_pic = (int)wp;
     *scp_type = (int)st;
     *pool_max = (int)pm;
-    *start_level = (int)sl;
 
     // src and dst paths for version >= 2
     char *loaded_src = NULL, *loaded_dst = NULL;
@@ -243,23 +247,35 @@ int load_checkpoint(
     }
     double loaded_elapsed_total = 0.0, loaded_elapsed_scp = 0.0;
     uint64_t loaded_last_task = 0ull;
-    if (ver >= 3u) {
-        if (read_double(f, &loaded_elapsed_total) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
-        if (read_double(f, &loaded_elapsed_scp) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
-    }
-    if (ver >= 4u) {
-        if (read_u64(f, &loaded_last_task) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
-    }
+    int loaded_certified_mode = 0;
+    if (read_double(f, &loaded_elapsed_total) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
+    if (read_double(f, &loaded_elapsed_scp) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
+    if (read_u64(f, &loaded_last_task) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
+    if (read_int(f, &loaded_certified_mode) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
 
     int *stopc = (int*)calloc((size_t)no, sizeof(int));
-    if (!stopc) { free(loaded_src); free(loaded_dst); goto FAIL; }
+    int *coverage = (int*)calloc((size_t)no, sizeof(int));
+    if (!stopc || !coverage) {
+        free(stopc);
+        free(coverage);
+        free(loaded_src);
+        free(loaded_dst);
+        goto FAIL;
+    }
     for (int o = 0; o < (int)no; ++o) {
-        if (read_int(f, &stopc[o]) < 0) { free(stopc); free(loaded_src); free(loaded_dst); goto FAIL; }
+        if (read_int(f, &stopc[o]) < 0 || read_int(f, &coverage[o]) < 0) {
+            free(stopc);
+            free(coverage);
+            free(loaded_src);
+            free(loaded_dst);
+            goto FAIL;
+        }
     }
     *stop_counter_out = stopc;
+    *coverage_horizon_out = coverage;
 
     PIstorage *pi = (PIstorage*)calloc((size_t)no, sizeof(PIstorage));
-    if (!pi) { free(loaded_src); free(loaded_dst); goto FAIL; }
+    if (!pi) { free(coverage); free(loaded_src); free(loaded_dst); goto FAIL; }
 
     // initialize pointers to NULL for safe cleanup()
     for (int o = 0; o < (int)no; ++o) {
@@ -372,6 +388,7 @@ int load_checkpoint(
     if (!nofvals) {
         free(pi);
         free(*stop_counter_out);
+        free(*coverage_horizon_out);
         free(loaded_src);
         free(loaded_dst);
         return -1;
@@ -412,6 +429,7 @@ int load_checkpoint(
     if (elapsed_total_out) *elapsed_total_out = loaded_elapsed_total;
     if (elapsed_scp_out) *elapsed_scp_out = loaded_elapsed_scp;
     if (last_task_out) *last_task_out = loaded_last_task;
+    if (certified_mode_out) *certified_mode_out = loaded_certified_mode != 0;
 
     *PInfo = pi;
     return 0;
@@ -437,8 +455,9 @@ READ_FAIL:
         free(pi[o].nofpi);
     }
     free(pi);
+    free(*stop_counter_out);
+    free(*coverage_horizon_out);
 FAIL:
     fclose(f);
     return -1;
 }
-

@@ -10,26 +10,6 @@
 #include "checkpoint.h"
 #include <assert.h>
 
-// Helper for fast preselection sorting
-typedef struct {
-    int idx;
-    int score;
-} PIIndexScore;
-
-static int cmp_pair_desc(
-    const void *a,
-    const void *b
-) {
-    const PIIndexScore *pa = (const PIIndexScore *)a;
-    const PIIndexScore *pb = (const PIIndexScore *)b;
-
-    if (pa->score != pb->score) {
-        return (pb->score - pa->score); // higher first
-    }
-
-    return (pa->idx - pb->idx); // stable tie-breaker
-}
-
 typedef struct {
     PIstorage *pi;
     int implicant_words;
@@ -1092,8 +1072,9 @@ char *prefix_basename(const char *filepath, const char *prefix) {
 
 void print_info(const char *INFO_PATH, const int info_level) {
     PIstorage *pi_tmp = NULL;
-    int ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0, sl=0;
-    int *stopc_tmp = NULL; int *nofvals_tmp = NULL; char *src_saved=NULL; char *dst_saved=NULL;
+    int ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0;
+    int *stopc_tmp = NULL; int *coverage_tmp = NULL; int *nofvals_tmp = NULL;
+    char *src_saved=NULL; char *dst_saved=NULL; bool certified_mode = false;
     double elapsed_total = 0.0, elapsed_scp = 0.0; uint64_t last_task = 0ull;
 
     if (load_checkpoint(
@@ -1110,13 +1091,14 @@ void print_info(const char *INFO_PATH, const int info_level) {
             &wp,
             &st,
             &pm,
-            &sl,
             &nofvals_tmp,
             &src_saved,
             &dst_saved,
             &elapsed_total,
             &elapsed_scp,
-            &last_task
+            &last_task,
+            &certified_mode,
+            &coverage_tmp
     ) != 0) {
         fprintf(stderr, "Error: failed to load checkpoint from %s\n", INFO_PATH);
         return;
@@ -1127,7 +1109,8 @@ void print_info(const char *INFO_PATH, const int info_level) {
     printf("Destination: %s\n", dst_saved ? dst_saved : "-");
     printf("Inputs: %d, Outputs: %d\n", ni, no);
     // printf("Bits per word: %d, value bit width: %d, implicant words: %d\n", bpw, vbw, ipw);
-        printf("Level k reached: %d (start level: %d, stop after max levels: %d)\n", ck, sl, ml);
+    printf("Level k reached: %d\n", ck);
+    printf("Stopping policy: %s\n", certified_mode ? "certified" : "adaptive");
     uint64_t maxt = nchoosek(ni, ck);
 
     if (ck > 0 && maxt > 0) {
@@ -1141,22 +1124,19 @@ void print_info(const char *INFO_PATH, const int info_level) {
 
     if (info_level > 0) {
         for (int o = 0; o < no; ++o) {
-                bool stop_flag = false;
-
-            if (stopc_tmp) {
-                stop_flag = stopc_tmp[o] >= ml;
-            } else {
-                stop_flag = pi_tmp[o].stop_search;
-            }
+            bool stop_flag = pi_tmp[o].stop_search;
+            bool escalated = !certified_mode && stopc_tmp && stopc_tmp[o] > 0 && !stop_flag;
 
             printf(
-                "Output %d: ON=%d OFF=%d foundPI=%d solmin=%d stop=%s\n",
+                "Output %d: ON=%d OFF=%d foundPI=%d solmin=%d stop=%s kcov=%d%s\n",
                 o,
                 pi_tmp[o].ON_minterms,
                 pi_tmp[o].OFF_minterms,
                 pi_tmp[o].foundPI,
                 pi_tmp[o].solmin,
-                stop_flag ? "yes" : "no"
+                stop_flag ? "yes" : "no",
+                coverage_tmp ? coverage_tmp[o] : 0,
+                escalated ? " escalated=yes" : ""
             );
         }
     }
@@ -1165,6 +1145,7 @@ void print_info(const char *INFO_PATH, const int info_level) {
     if (dst_saved) free(dst_saved);
     if (nofvals_tmp) free(nofvals_tmp);
     if (stopc_tmp) free(stopc_tmp);
+    if (coverage_tmp) free(coverage_tmp);
 
     // Use cleanup to free PInfo; provide a dummy buffer holder
     ThreadBuffer **dummy = (ThreadBuffer**)calloc(1, sizeof(ThreadBuffer*));
@@ -1189,7 +1170,6 @@ int process_task(
     int *max_shared,
     int increase,
     int *multiplier,
-    int fast_filter_level,
     bool deterministic_order
 ) {
     int tempk[k];
@@ -1528,93 +1508,6 @@ int process_task(
             (*task_found)++;
 
         } // end of found loop
-
-        // Optional fast preselection: keep only top-scoring PIs per output
-        if (fast_filter_level > 0) {
-            int found_local = buffer[tid][o].found;
-            if (found_local > 0) {
-                // Determine limit based on aggressiveness and problem size
-                int base_mult = (fast_filter_level == 1) ? 8 : (fast_filter_level == 2) ? 4 : 2;
-                int floor_cap = (fast_filter_level == 1) ? 4096 : (fast_filter_level == 2) ? 2048 : 1024;
-                int limit = ON_minterms * base_mult;
-                if (limit < floor_cap) limit = floor_cap;
-                if (limit > found_local) limit = found_local;
-
-                // Literal-aware bias: penalize larger k by shrinking the per-task limit
-                double k_bias = (fast_filter_level == 1) ? 0.25 : (fast_filter_level == 2) ? 0.5 : 1.0;
-                double denom = 1.0 + k_bias * (double)(k - 1);
-                int limit_k = (int)((double)limit / denom);
-                if (limit_k < 1) limit_k = 1;
-                if (limit_k > found_local) limit_k = found_local;
-
-                if (limit_k < found_local) {
-                    // Build (idx, score) pairs and sort by composite score (covsum + scarcity)
-                    PIIndexScore *pairs = (PIIndexScore*)malloc((size_t)found_local * sizeof(PIIndexScore));
-                    if (pairs) {
-                        int *covsum_arr = buffer[tid][o].covsum;
-                        bool *cv = buffer[tid][o].coverage;
-
-                        // Row coverage counts within this task buffer (scarcity proxy)
-                        int *row_cov = (int*)calloc((size_t)ON_minterms, sizeof(int));
-                        if (row_cov) {
-                            for (int fidx = 0; fidx < found_local; ++fidx) {
-                                size_t base = (size_t)fidx * (size_t)ON_minterms;
-                                for (int rr = 0; rr < ON_minterms; ++rr) {
-                                    if (cv[base + rr]) row_cov[rr]++;
-                                }
-                            }
-                        }
-
-                        double scw = (fast_filter_level == 1) ? 0.5 : (fast_filter_level == 2) ? 1.0 : 1.5;
-                        for (int ii = 0; ii < found_local; ++ii) {
-                            // Scarcity: sum 1/row_cov[r] over rows this PI covers
-                            double scarcity = 0.0;
-                            if (row_cov) {
-                                size_t base = (size_t)ii * (size_t)ON_minterms;
-                                for (int rr = 0; rr < ON_minterms; ++rr) {
-                                    int rc = row_cov[rr];
-                                    if (cv[base + rr] && rc > 0) scarcity += 1.0 / (double)rc;
-                                }
-                            }
-                            double score_d = (double)covsum_arr[ii] + scw * scarcity;
-                            int score_i = (int)(score_d * 1000.0);
-                            pairs[ii].idx = ii;
-                            pairs[ii].score = score_i;
-                        }
-                        free(row_cov);
-
-                        qsort(pairs, (size_t)found_local, sizeof(PIIndexScore), cmp_pair_desc);
-
-                        // Pack top 'limit_k' entries in-place into slot [0..limit_k)
-                        uint64_t *pv = buffer[tid][o].pichart_values;
-                        int      *dp = buffer[tid][o].decpos;
-                        int      *cs = buffer[tid][o].covsum;
-                        uint64_t *fb = buffer[tid][o].fixed_bits;
-                        uint64_t *vb = buffer[tid][o].value_bits;
-
-                        size_t row_pv = (size_t)pichart_words;       // words per PI in pichart_values
-                        size_t row_cv = (size_t)ON_minterms;         // coverage rows per PI
-                        size_t row_bits = (size_t)implicant_words;   // words per PI for fixed/value
-
-                        for (int pos = 0; pos < limit_k; ++pos) {
-                            int src = pairs[pos].idx;
-                            if (src == pos) continue; // already in place
-                            // Move scalars
-                            dp[pos] = dp[src];
-                            cs[pos] = cs[src];
-                            // Move arrays (use memmove to be safe)
-                            memmove(&pv[pos * row_pv], &pv[src * row_pv], row_pv * sizeof(uint64_t));
-                            memmove(&cv[pos * row_cv], &cv[src * row_cv], row_cv * sizeof(bool));
-                            memmove(&fb[pos * row_bits], &fb[src * row_bits], row_bits * sizeof(uint64_t));
-                            memmove(&vb[pos * row_bits], &vb[src * row_bits], row_bits * sizeof(uint64_t));
-                        }
-
-                        buffer[tid][o].found = limit_k;
-                        free(pairs);
-                    }
-                }
-            }
-        }
 
         free(decpos);
         free(decneg);

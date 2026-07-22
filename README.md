@@ -4,11 +4,21 @@ CCubes is a Boolean minimizer designed to efficiently minimize functions with mu
 
 The minimization process is extremely efficient with incompletely specified functions with many don't cares. It compares the ON set minterms with the OFF set minterms, and for this reasons it needs a ".type fr" PLA file.
 
-It employs a bottom-up search strategy, starting from the simplest combinations of 1 input, 2 inputs etc. and gradually increases the complexity. After each such level, it tries to solve the minterm matrix and stops as soon as there is a high probability that no new decisive prime implicants will be found at the next level.
+It employs a bottom-up search strategy, starting from the simplest combinations of 1 input, 2 inputs etc. and gradually increases the complexity. After each such level, it solves the minterm matrix and evaluates whether deeper prime implicants can still change the result.
 
-Solving the minterm matrix coverage is an NP-hard problem beyond the scope of CCubes. Exact solutions are provided by Gurobi, an industry level power optimization solver. For compilation, Gurobi's path is hardcoded in the Makefile and it needs to be changed manually, according to the user's installation and operating system. At runtime, Gurobi will search for a valid license, freely offered for academic research.
+The default stopping policy is adaptive. A one-term cover stops immediately because no nonempty function can use fewer terms. Otherwise, at the first unchanged boundary value, CCubes examines private witnesses of the current cover. If a compatible witness pair has no jointly covering retained PI, the output is structurally delayed and automatically continues under the certified policy. Otherwise CCubes accepts the plateau as a fast heuristic exit. A negative pair warning is not a proof of global optimality because a delayed group of three or more rows can escape the pair screen.
 
-The default option, in case Gurobi is not available, is to solve the minterm matrix coverage using a custom implementation of a parallel processing Lagrangian relaxation method, based on the sources of BOOM (courtesy of Petr Fišer). It has since grown into a hybrid solver: a dominance presolve shrinks the chart, the Lagrangian bound drives reduced-cost fixing, and a bounded branch-and-bound finish searches the remaining core. The effort levels `-l0` to `-l2` trade time for stronger bounds within fixed search budgets. They may prove optimality when the bounds meet, but exactness is not guaranteed; use Gurobi when a proven minimum cover is required.
+For applications that require a certificate from the outset, `-c` selects exact certified stopping based on compatible ON-row supercubes and an incompatibility lower bound. It stops only when the returned cover meets a global lower bound or the certified generation horizon has been completed and the boundary solver has proved its cover optimal. Gurobi supplies an exact boundary directly; the hybrid solver can also certify a boundary when its lower and upper bounds meet.
+
+The small `examples/certified_F2.pla` instance demonstrates the escalation. Its cover value is two at levels one and two, but a delayed pair is detected; the default continues, reaches the one-term cover at level three, and certifies it.
+
+The optional `-g` switch prints the machine-readable `CCUBES_BLOCKING` observation and the resulting `CCUBES_ADAPTIVE` action without changing the default policy. The `model_union_bound` field is an ex-ante all-ON-pair bound under an auxiliary independent, uniform, with-replacement OFF-row model; it is not conditioned on the observed cover and is not a finite-sample certificate. It is reported as `NA` when more than one million ON pairs would make this explanatory statistic disproportionately expensive.
+
+Both stopping policies currently require binary, fully specified input rows and nonempty ON and OFF sets for every output. Unsupported inputs are rejected rather than silently processed under an unjustified stopping rule. The certified static analysis is lazy in the default mode: ordinary unwarned outputs do not pay for the full compatible-pair horizon and incompatibility scan.
+
+Minimum covering of the PI chart is NP-hard. The `-s1` option delegates this boundary problem to the Gurobi optimizer. For compilation, Gurobi's path is configured in the Makefile and may need to be adjusted for the local installation and operating system. At runtime, Gurobi searches for a valid license; academic licences are available from Gurobi.
+
+The default `-s0` option selects CCubes's own bundled hybrid covering solver. It combines dominance presolve, Lagrangian bounds and reduced-cost fixing, and a bounded branch-and-bound search of the remaining core. The effort levels `-e0` to `-e2` trade time for stronger bounds within fixed search budgets. The hybrid solver may prove optimality when its lower and upper bounds meet, but exactness is not guaranteed on every run; use `-s1` with Gurobi when a proven minimum boundary cover is required.
 
 If no weights are applied, the combination of prime implicants that cover the ON set minterms is the quickest exact method, roughly equivalent to `espresso -Dso` type of output, although it produces a much more efficient circuit especially with an exact optimization.
 
@@ -16,17 +26,15 @@ Two weighting options are available, for instance the default `-w1` for weight b
 
 The option `-p` aims to spend additional time collecting a pool of possible solutions from the solver and decide which solution is best by comparing their shared prime implicants with those from the other outputs. Activating this parameter to more than 1 solutions will automatically set the weighting to `-w2`. Its rationale is that the solver may select different shared prime implicants, even though all have an equal (weighted) contribution to optimality.
 
-An experimental switch `-f` enables some filtering of prime implicants during their generation, by quickly discarding those that are less likely to contribute to the final solution. This can significantly speed up the minimization process, especially for large problem instances with many variables and outputs. However, it may also lead to suboptimal solutions in some cases, as some potentially useful prime implicants might be filtered out. Users should experiment with different levels of filtering (1 to 3) to find a balance between speed and solution quality that suits their specific needs.
-
 Unlike other minimizers like Espresso (usually single threaded), CCubes is scalable and can handle larger problem instances more efficiently. Where possible, it will use a parallel search process using available CPU cores. Theoretically, its scalability can be extended to distributed computing environments, allowing it to tackle even larger instances by using multiple machines.
 
 Parallel search supports both OpenMP and pthreads. The build automatically uses OpenMP when it is available; otherwise it uses the pthread backend, which is enabled by default. If neither backend is available or enabled, CCubes falls back to serial execution, so users do not need to install OpenMP specifically.
 
-There is a minimal help system integrated into CCubes. Users can enable debug output by setting the debug level via command line options. This will provide insights into the internal workings of the minimization process and can be useful for troubleshooting and understanding the behavior of the tool.
+There is a minimal help system integrated into CCubes. `-d` canonicalizes PI ordering for deterministic experiments. Users can enable diagnostic logging with `-dbg<level>`; this provides insights into the internal workings of the minimization process and can be useful for troubleshooting. The older `-debug<level>` spelling remains accepted for compatibility.
 
 The debug levels are preliminary, and more detailed logging functionality will be added in the future.
 
-For very large problem instances, CCubes can save its state into a binary checkpoint file and exit, when a certain `-t` time limit is reached. The process can be resumed later from the checkpoint file, allowing users to continue the minimization process without re-specifying the input and output files. If the binary checkpoint file is not specified, it will default to `chk_<basename(source)>.bin`. Even when `-r`esuming from a checkpoint, a further time limit can be specified to save another intermediate checkpoint, and the binary checkpoint file will be overwritten unless specifying a different one.
+For very large problem instances, CCubes can save its state into a binary checkpoint file and exit, when a certain `-l` time limit is reached. The process can be resumed later from the checkpoint file, allowing users to continue the minimization process without re-specifying the input and output files. If the binary checkpoint file is not specified, it will default to `chk_<basename(source)>.bin`. Even when `-r`esuming from a checkpoint, a further time limit can be specified to save another intermediate checkpoint, and the binary checkpoint file will be overwritten unless specifying a different one. Checkpoint version 6 records adaptive/certified policy state; older checkpoint formats are intentionally not accepted.
 
 The binary checkpoint file can be inspected using the `-i` option with various progress information in the metadata.
 
@@ -39,33 +47,33 @@ The destination .pla file is optional. If not specified, a `ccubes_<basename(sou
 ```
 ccubes [options] source.pla [dest.pla]
 Options:
-  -k<number>          : start searching from level k
-  -e<number>          : end criterion (default +1 level with the same minima)
   -b<number>          : bits per word, either 8, 16, 32, 64 (default) or 128
-  -c<number>          : number of CPU cores / threads to use with a parallel backend
+  -t<number>          : number of CPU cores / threads to use with a parallel backend
   -w<number>          : weights applied to the prime implicants:
                           0 no weight
                           1 (default) weight based on complexity levels k
                           2 additional weight if shared between outputs
   -s<number>          : how to solve the covering problem:
-                          0 (default) hybrid Lagrangian relaxation solver
+                          0 (default) bundled hybrid solver
+                            (presolve + Lagrangian bounds + bounded exact search)
                           1 Gurobi exact
-  -l<number>          : Lagrangian effort level:
+  -e<number>          : hybrid solver effort level:
                           0 (default) fastest, bounded strong finish
                           1 stronger bounds, more time
                           2 best bound mode, adaptive bundle portfolio
-  -d<level>[=<file>]  : incremental debug information
-                          0 (default) errors + warnings
-                          1 errors + warnings + info
-                          2 everything (trace)
+  -d                  : deterministic PI ordering
+  -g                  : print the adaptive blocking diagnostic at the first plateau
+  -c                  : require certified exact stopping
+                          default: adaptive warning, then certify only when warned
   -p<number>          : decide from a pool of up to <number> equally optimal solutions
-  -f[level]           : (experimental) fast filtering of prime implicants during generation
-                          0 (default) disabled
-                          1..3 increasing aggressiveness
-  -t<sec>[=<file>]    : time limit to save a checkpoint in the <file>
+  -l<sec>[=<file>]    : time limit to save a checkpoint in the <file>
   -r=<file>           : resume from checkpoint file
   -i<level>=<file>    : inspect checkpoint (print progress and metadata)
                           0 (default) progress report
                           1 complete metadata about each output
+  -dbg<level>[=<file>] : incremental debug information
+                          0 (default) errors + warnings
+                          1 errors + warnings + info
+                          2 everything (trace)
   -h, --help          : show this help message
 ```

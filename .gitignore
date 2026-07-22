@@ -1,0 +1,26 @@
+# Ignore everything
+*
+
+# But keep source code and headers
+!*.c
+!*.h
+!*.cpp
+!*.hpp
+!*.md
+!Makefile
+!LICENSE
+!.gitignore
+
+# Keep the reproducibility artifacts used by the paper
+!proofs/
+!proofs/README.md
+!proofs/*.lean
+!proofs/*.py
+!proofs/lean-toolchain
+
+# Keep the examples directory and all its contents
+!examples/
+!examples/**
+
+temp/
+proofs/

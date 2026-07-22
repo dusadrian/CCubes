@@ -16,6 +16,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "main.h"
+#include "certified_stop.h"
 #include "checkpoint.h"
 #include "ccubes_threads.h"
 
@@ -34,7 +35,6 @@ typedef struct {
     int *max_shared;
     int increase;
     int *multiplier;
-    int fast_filter_level;
     bool deterministic_order;
     double time_limit_sec;
     double base_elapsed;
@@ -79,7 +79,20 @@ static bool parse_int_strict(const char *text, int *value) {
     return true;
 }
 
-static bool parse_lagrangian_level(const char *text, int *level) {
+static bool parse_nonnegative_double(const char *text, double *value) {
+    if (!text || !*text || !value) return false;
+
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(text, &end);
+    if (errno != 0 || end == text || *end != '\0') return false;
+    if (!isfinite(parsed) || parsed < 0.0) return false;
+
+    *value = parsed;
+    return true;
+}
+
+static bool parse_hybrid_effort_level(const char *text, int *level) {
     int parsed = 0;
     if (!parse_int_strict(text, &parsed)) return false;
     if (parsed < 0 || parsed > 2) return false;
@@ -184,7 +197,6 @@ static void pi_search_range_worker(
             ctx->max_shared,
             ctx->increase,
             ctx->multiplier,
-            ctx->fast_filter_level,
             ctx->deterministic_order
         );
 
@@ -204,36 +216,35 @@ static void pi_search_range_worker(
 void help() {
     printf("Usage: ccubes [options] source.pla [dest.pla]\n");
     printf("Options:\n");
-    printf("  -k<number>         : start searching from level k\n");
-    printf("  -e<number>         : end criterion (default +1 level with the same minima)\n");
-    printf("  -b<number>         : bits per word, either 8, 16, 32, 64 (default) or 128\n");
-    printf("  -c<number>         : number of CPU worker threads to use\n");
-    printf("  -w<number>         : weights applied to the prime implicants:\n");
-    printf("                         0 no weight\n");
-    printf("                         1 (default) weight based on complexity levels k\n");
-    printf("                         2 additional weight if shared between outputs\n");
-    printf("  -s<number>         : how to solve the covering problem:\n");
-    printf("                         0 (default) Lagrangian relaxation heuristic\n");
-    printf("                         1 Gurobi exact\n");
-    printf("  -l<number>         : Lagrangian effort level:\n");
-    printf("                         0 (default) fastest, bounded strong finish\n");
-    printf("                         1 stronger bounds, more time\n");
-    printf("                         2 best bound mode, adaptive bundle portfolio with bounded strong finish\n");
-    printf("  -d<level>[=<file>] : incremental debug information\n");
-    printf("                         0 (default) errors + warnings\n");
-    printf("                         1 errors + warnings + info\n");
-    printf("                         2 everything (trace)\n");
-    printf("  -p<number>         : decide from a pool of up to <number> equally optimal solutions\n");
-    printf("  -f[level]          : (experimental) fast filtering of prime implicants during generation\n");
-    printf("                         0 (default) disabled\n");
-    printf("                         1..3 increasing aggressiveness\n");
-    printf("  -t<sec>[=<file>]   : time limit to save a checkpoint in the <file>\n");
-    printf("  -r=<file>          : resume from checkpoint file\n");
-    printf("  -i<level>=<file>   : inspect checkpoint (print progress and metadata)\n");
-    printf("                         0 (default) progress report\n");
-    printf("                         1 complete metadata about each output\n");
-    printf("  --deterministic    : canonicalize PI order before solving for reproducible benchmarks\n");
-    printf("  -h, --help         : show this help message\n");
+    printf("  -b<number>           : bits per word, either 8, 16, 32, 64 (default) or 128\n");
+    printf("  -t<number>           : number of CPU worker threads to use\n");
+    printf("  -w<number>           : weights applied to the prime implicants:\n");
+    printf("                           0 no weight\n");
+    printf("                           1 (default) weight based on complexity levels k\n");
+    printf("                           2 additional weight if shared between outputs\n");
+    printf("  -s<number>           : how to solve the covering problem:\n");
+    printf("                           0 (default) bundled hybrid solver\n");
+    printf("                             (presolve + Lagrangian bounds + bounded exact search)\n");
+    printf("                           1 Gurobi exact\n");
+    printf("  -e<number>           : hybrid solver effort level:\n");
+    printf("                           0 (default) fastest, bounded strong finish\n");
+    printf("                           1 stronger bounds, more time\n");
+    printf("                           2 best bound mode, adaptive bundle portfolio with bounded strong finish\n");
+    printf("  -d                   : deterministic PI ordering\n");
+    printf("  -g                   : print the adaptive blocking diagnostic at the first plateau\n");
+    printf("  -c                   : require certified exact stopping\n");
+    printf("                         (default: adaptive warning, then certify only when warned)\n");
+    printf("  -p<number>           : decide from a pool of up to <number> equally optimal solutions\n");
+    printf("  -l<sec>[=<file>]     : time limit to save a checkpoint in the <file>\n");
+    printf("  -r=<file>            : resume from checkpoint file\n");
+    printf("  -i<level>=<file>     : inspect checkpoint (print progress and metadata)\n");
+    printf("                           0 (default) progress report\n");
+    printf("                           1 complete metadata about each output\n");
+    printf("  -dbg<level>[=<file>] : incremental debug information\n");
+    printf("                           0 (default) errors + warnings\n");
+    printf("                           1 errors + warnings + info\n");
+    printf("                           2 everything (trace)\n");
+    printf("  -h, --help           : show this help message\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -251,17 +262,18 @@ int main(int argc, char *argv[]) {
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     // defaults
-    int START_LEVEL = 1;
-    int MAX_LEVELS = 1;
+    int search_level = 1;
+    const int STOP_AFTER_EQUALITY = 1;
     int BITS_PER_WORD = 64;
     int THREADS = 0; // max by default
-    bool THREADS_FORCED = false; // set to true if -c is provided
+    bool THREADS_FORCED = false; // set to true if -t is provided
     int WEIGHT_PIC = 1;
     int SCP_TYPE = 0;
-    int LAGRANGIAN_LEVEL = 0;
+    int HYBRID_EFFORT_LEVEL = 0;
     int POOL_MAX = 1; // collect up to this many solutions
-    int FAST_FILTER_LEVEL = 0; // 0 disabled; 1..3 increasing aggressiveness
     bool DETERMINISTIC_PI_ORDER = env_flag_enabled("CCUBES_DETERMINISTIC");
+    bool CERTIFIED_MODE = false;
+    bool REPORT_BLOCKING_DIAGNOSTIC = false;
     char *SRC_FILE = NULL;
     char *DST_FILE = NULL;
     // resume timing bases
@@ -282,14 +294,36 @@ int main(int argc, char *argv[]) {
 
     // parse arguments
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--deterministic") == 0) {
+        if (
+            strncmp(argv[i], "-dbg", 4) == 0 ||
+            strncmp(argv[i], "-debug", 6) == 0
+        ) {
+            size_t prefix_length = strncmp(argv[i], "-dbg", 4) == 0 ? 4u : 6u;
+            char *opt = argv[i] + prefix_length;
+            char *eq = strchr(opt, '=');
+            int debug_level = 0;
+            const char *file = NULL;
+
+            if (eq) {
+                *eq = '\0';
+                debug_level = atoi(opt);
+                file = eq + 1;
+            } else {
+                debug_level = atoi(opt);
+            }
+
+            if (debug_level < 0 || debug_level > 2) {
+                fprintf(stderr, "Invalid debug level: %d (must be 0-2)\n", debug_level);
+                help();
+                return 1;
+            }
+            debug_init(file, debug_level);
+        } else if (strcmp(argv[i], "-d") == 0) {
             DETERMINISTIC_PI_ORDER = true;
-        } else if (strcmp(argv[i], "--no-deterministic") == 0) {
-            DETERMINISTIC_PI_ORDER = false;
-        } else if (strncmp(argv[i], "-k", 2) == 0) {
-            START_LEVEL = atoi(argv[i] + 2);
-        } else if (strncmp(argv[i], "-e", 2) == 0) {
-            MAX_LEVELS = atoi(argv[i] + 2);
+        } else if (strcmp(argv[i], "-c") == 0) {
+            CERTIFIED_MODE = true;
+        } else if (strcmp(argv[i], "-g") == 0) {
+            REPORT_BLOCKING_DIAGNOSTIC = true;
         } else if (strncmp(argv[i], "-b", 2) == 0) {
             BITS_PER_WORD = atoi(argv[i] + 2);
             if (
@@ -315,77 +349,44 @@ int main(int argc, char *argv[]) {
                 help();
                 return 1;
             }
-        } else if (strcmp(argv[i], "-l") == 0) {
+        } else if (strcmp(argv[i], "-e") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Error: -l requires a level (0, 1, or 2)\n");
+                fprintf(stderr, "Error: -e requires an effort level (0, 1, or 2)\n");
                 return 1;
             }
-            if (!parse_lagrangian_level(argv[++i], &LAGRANGIAN_LEVEL)) {
-                fprintf(stderr, "Invalid Lagrangian effort level: %s (must be 0, 1, or 2)\n", argv[i]);
+            if (!parse_hybrid_effort_level(argv[++i], &HYBRID_EFFORT_LEVEL)) {
+                fprintf(stderr, "Invalid hybrid effort level: %s (must be 0, 1, or 2)\n", argv[i]);
                 help();
                 return 1;
             }
-        } else if (strncmp(argv[i], "-l", 2) == 0) {
-            if (!parse_lagrangian_level(argv[i] + 2, &LAGRANGIAN_LEVEL)) {
-                fprintf(stderr, "Invalid Lagrangian effort level: %s (must be 0, 1, or 2)\n", argv[i] + 2);
-                help();
-                return 1;
-            }
-        } else if (strncmp(argv[i], "-c", 2) == 0) {
-            THREADS = atoi(argv[i] + 2);
-            if (THREADS < 0) THREADS = 0;
-            THREADS_FORCED = true;
-        } else if (strncmp(argv[i], "-d", 2) == 0) {
-            char *opt = argv[i] + 2;  // string after "-d"
-            char *eq  = strchr(opt, '=');
-
-            int debug_level   = 0; // default to DBG_ERROR
-            const char *file = NULL;
-
-            if (eq) {
-                // split into number + filename
-                *eq = '\0';
-                debug_level = atoi(opt);
-                file = eq + 1;
-            } else {
-                debug_level = atoi(opt);
-            }
-
-            if (debug_level < 0 || debug_level > 2) {
-                fprintf(stderr, "Invalid debug level: %d (must be 0–2)\n", debug_level);
-                help();
-                return 1;
-            }
-
-            debug_init(file, debug_level);
-
-        } else if (strncmp(argv[i], "-p", 2) == 0) {
-            POOL_MAX = atoi(argv[i] + 2);
-            if (POOL_MAX < 1) POOL_MAX = 1;
-        } else if (strncmp(argv[i], "-f", 2) == 0) {
-            // Fast preselection of PIs; optional level after -f
-            if (argv[i][2] == '\0') {
-                FAST_FILTER_LEVEL = 1; // default
-            } else {
-                FAST_FILTER_LEVEL = atoi(argv[i] + 2);
-            }
-
-            if (FAST_FILTER_LEVEL < 1 || FAST_FILTER_LEVEL > 3) {
-                fprintf(stderr, "Invalid fast filter level: %d (must be 1, 2, or 3)\n", FAST_FILTER_LEVEL);
+        } else if (strncmp(argv[i], "-e", 2) == 0) {
+            if (!parse_hybrid_effort_level(argv[i] + 2, &HYBRID_EFFORT_LEVEL)) {
+                fprintf(stderr, "Invalid hybrid effort level: %s (must be 0, 1, or 2)\n", argv[i] + 2);
                 help();
                 return 1;
             }
         } else if (strncmp(argv[i], "-t", 2) == 0) {
-            char *opt = argv[i] + 2;  // string after "-t"
+            if (!parse_int_strict(argv[i] + 2, &THREADS) || THREADS < 0) {
+                fprintf(stderr, "Invalid thread count: %s (must be a nonnegative integer)\n", argv[i] + 2);
+                help();
+                return 1;
+            }
+            THREADS_FORCED = true;
+        } else if (strncmp(argv[i], "-p", 2) == 0) {
+            POOL_MAX = atoi(argv[i] + 2);
+            if (POOL_MAX < 1) POOL_MAX = 1;
+        } else if (strncmp(argv[i], "-l", 2) == 0) {
+            char *opt = argv[i] + 2;  // string after "-l"
             char *eq  = strchr(opt, '=');
             if (eq) {
                 *eq = '\0';
-                TIME_LIMIT_SEC = atof(opt);
                 CHK_SAVE_PATH  = eq + 1;
-            } else {
-                TIME_LIMIT_SEC = atof(opt);
             }
-            if (TIME_LIMIT_SEC < 0) TIME_LIMIT_SEC = 0;
+            if (!parse_nonnegative_double(opt, &TIME_LIMIT_SEC)) {
+                fprintf(stderr, "Invalid time limit: %s (must be nonnegative seconds)\n", opt);
+                help();
+                return 1;
+            }
         } else if (strncmp(argv[i], "-r", 2) == 0) {
             // Support -r=<file> (preferred) and legacy -r<file>
             if (argv[i][2] == '=') {
@@ -442,7 +443,7 @@ int main(int argc, char *argv[]) {
     if (SCP_TYPE == 1) {
         if (!gurobi_ok) {
             SCP_TYPE = 0;
-            printf("Gurobi not available, falling back to the Lagrangian solver.\n");
+            printf("Gurobi not available, falling back to the bundled hybrid solver.\n");
         }
     }
 
@@ -468,13 +469,15 @@ int main(int argc, char *argv[]) {
     DBG_INFO_BLOCK {
         fprintf(debug_out, "--- START ---\n");
         fprintf(debug_out, "SCP_TYPE: %d\n", SCP_TYPE);
-        fprintf(debug_out, "LAGRANGIAN_LEVEL: %d\n", LAGRANGIAN_LEVEL);
+        fprintf(debug_out, "HYBRID_EFFORT_LEVEL: %d\n", HYBRID_EFFORT_LEVEL);
     }
 
     PIstorage *PInfo = NULL;
     int *nofvalues = NULL;
     int ninputs = 0, noutputs = 0, max_value = 0;
     int *chk_stop_counter = NULL; // resume: stop counters per output
+    int *chk_coverage_horizon = NULL;
+    bool chk_certified_mode = false;
     // Keep loaded bit parameters accessible outside the resume block
     int chk_value_bit_width_saved = 0;
     int chk_implicant_words_saved = 0;
@@ -487,7 +490,7 @@ int main(int argc, char *argv[]) {
     if (RESUME_PATH) {
 
         int chk_bits = 0, chk_value_bit_width = 0, chk_implicant_words = 0;
-        int chk_MAX_LEVELS=0, chk_WEIGHT_PIC=0, chk_SCP_TYPE=0, chk_POOL_MAX=0, chk_START_LEVEL=0;
+        int chk_MAX_LEVELS=0, chk_WEIGHT_PIC=0, chk_SCP_TYPE=0, chk_POOL_MAX=0;
         char *chk_src_path = NULL;
         char *chk_dst_path = NULL;
         double chk_elapsed_total = 0.0, chk_elapsed_scp = 0.0;
@@ -508,13 +511,14 @@ int main(int argc, char *argv[]) {
                 &chk_WEIGHT_PIC,
                 &chk_SCP_TYPE,
                 &chk_POOL_MAX,
-                &chk_START_LEVEL,
                 &nofvalues,
                 &chk_src_path,
                 &chk_dst_path,
                 &chk_elapsed_total,
                 &chk_elapsed_scp,
-                &chk_last_task
+                &chk_last_task,
+                &chk_certified_mode,
+                &chk_coverage_horizon
             ) != 0
         ) {
             fprintf(stderr, "Error: failed to load checkpoint from %s\n", RESUME_PATH);
@@ -534,7 +538,8 @@ int main(int argc, char *argv[]) {
             if (chk_dst_path) free(chk_dst_path);
         }
 
-        MAX_LEVELS = chk_MAX_LEVELS;
+        (void)chk_MAX_LEVELS;
+        CERTIFIED_MODE = CERTIFIED_MODE || chk_certified_mode;
         WEIGHT_PIC = chk_WEIGHT_PIC;
         SCP_TYPE = chk_SCP_TYPE;
         POOL_MAX = chk_POOL_MAX;
@@ -545,8 +550,8 @@ int main(int argc, char *argv[]) {
         BASE_ELAPSED = chk_elapsed_total;
         BASE_SCP = chk_elapsed_scp;
 
-        // Resume will start at the saved k
-        START_LEVEL = RESUME_K;
+        // Resume the interrupted generation level recorded in the checkpoint.
+        search_level = RESUME_K;
         // carry forward last_task information for this k
         RESUME_LAST_TASK = chk_last_task;
         HAS_RESUME_LAST_TASK = true;
@@ -595,6 +600,64 @@ int main(int argc, char *argv[]) {
         implicant_words = (ninputs * value_bit_width + BITS_PER_WORD - 1) / BITS_PER_WORD;
     }
 
+    CertifiedStopState *certified_states = NULL;
+
+    if (!certified_model_supported(PInfo, ninputs, noutputs)) {
+        fprintf(
+            stderr,
+            "Error: adaptive and certified stopping require binary, fully specified input rows "
+            "with nonempty ON and OFF sets for every output.\n"
+        );
+        free(chk_stop_counter);
+        free(chk_coverage_horizon);
+        ThreadBuffer *empty_buffer[1] = {NULL};
+        cleanup(PInfo, empty_buffer);
+        return 1;
+    }
+
+    certified_states = calloc((size_t)noutputs, sizeof(CertifiedStopState));
+    if (!certified_states) {
+        fprintf(stderr, "Error: stopping-state allocation failed.\n");
+        free(chk_stop_counter);
+        free(chk_coverage_horizon);
+        ThreadBuffer *empty_buffer[1] = {NULL};
+        cleanup(PInfo, empty_buffer);
+        return 1;
+    }
+
+    for (int o = 0; o < noutputs; ++o) {
+        certified_stop_state_reset(&certified_states[o]);
+        if (chk_coverage_horizon) {
+            certified_states[o].coverage_horizon = chk_coverage_horizon[o];
+        }
+        if (CERTIFIED_MODE && !certified_stop_state_prepare(
+            &certified_states[o],
+            &PInfo[o],
+            ninputs
+        )) {
+            fprintf(stderr, "Error: certified-horizon initialization failed.\n");
+            free(chk_stop_counter);
+            free(chk_coverage_horizon);
+            free(certified_states);
+            ThreadBuffer *empty_buffer[1] = {NULL};
+            cleanup(PInfo, empty_buffer);
+            return 1;
+        }
+        if (CERTIFIED_MODE) {
+            DBG_INFO_BLOCK {
+                fprintf(
+                    debug_out,
+                    "Certified output %d: agreement horizon Amax=%d, cover LB=%d\n",
+                    o + 1,
+                    certified_states[o].agreement_horizon,
+                    certified_states[o].cover_lower_bound
+                );
+            }
+        }
+    }
+    free(chk_coverage_horizon);
+    chk_coverage_horizon = NULL;
+
     uint64_t VALUE_BIT_MASK = (1ULL << value_bit_width) - 1ULL;
 
     // Ensure pichart_words are aligned with BITS_PER_WORD (already set on load for resume)
@@ -637,8 +700,10 @@ int main(int argc, char *argv[]) {
     }
 
     int stop_counter[noutputs];
+    BlockingStopState blocking_stop_states[noutputs];
     // Initialize per-output state (allocate only if not resuming)
     for (int o = 0; o < noutputs; o++) {
+        certified_blocking_state_init(&blocking_stop_states[o]);
 
         // --- temporary debugging code ---
         // printf("Output %d, ON_minterms: %d, OFF_minterms: %d\n", o + 1, PInfo[o].ON_minterms, PInfo[o].OFF_minterms);
@@ -750,6 +815,22 @@ int main(int argc, char *argv[]) {
         } else {
             stop_counter[o] = 0;
         }
+        if (RESUME_PATH && stop_counter[o] > 0) {
+            blocking_stop_states[o].reported = true;
+            if (!CERTIFIED_MODE && !PInfo[o].stop_search) {
+                blocking_stop_states[o].certification_required = true;
+                if (!certified_stop_state_prepare(
+                    &certified_states[o],
+                    &PInfo[o],
+                    ninputs
+                )) {
+                    fprintf(stderr, "Error: failed to restore adaptive certification state.\n");
+                    free(certified_states);
+                    cleanup(PInfo, buffer);
+                    return 1;
+                }
+            }
+        }
 
         // store the number of PIs at each level of complexity k
         if (!PInfo[o].nofpi) {
@@ -761,17 +842,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Preserve stop status when resuming; otherwise initialize based on ON-set emptiness
+        // Preserve stop status when resuming; otherwise initialize it.
         if (!RESUME_PATH) {
             PInfo[o].stop_search = ON_minterms == 0; // if there are no ON-set minterms, then stop searching for PIs
-        } else {
-            // Derive from stop_counter if available; otherwise keep loaded value
-            bool derived_stop = false;
-            // stop_counter[] is set above from chk_stop_counter if present
-            if (o >= 0 && o < noutputs) {
-                derived_stop = (stop_counter[o] >= MAX_LEVELS);
-            }
-            if (derived_stop) PInfo[o].stop_search = true;
         }
 
         PInfo[o].solution = NULL;
@@ -869,7 +942,7 @@ int main(int argc, char *argv[]) {
 
 
     int k;
-    for (k = START_LEVEL; k <= ninputs; k++) {
+    for (k = search_level; k <= ninputs; k++) {
         int level_start[noutputs];
         for (int o = 0; o < noutputs; ++o) {
             int start_pi = (k > 1 && PInfo[o].nofpi) ? PInfo[o].nofpi[k - 2] : 0;
@@ -934,7 +1007,6 @@ int main(int argc, char *argv[]) {
             .max_shared = &max_shared,
             .increase = increase,
             .multiplier = &multiplier,
-            .fast_filter_level = FAST_FILTER_LEVEL,
             .deterministic_order = DETERMINISTIC_PI_ORDER,
             .time_limit_sec = TIME_LIMIT_SEC,
             .base_elapsed = BASE_ELAPSED,
@@ -1001,6 +1073,10 @@ int main(int argc, char *argv[]) {
                 tmp_dst_alloc = prefix_basename(SRC_FILE, "ccubes_");
                 dst_to_save = tmp_dst_alloc; // may be NULL on OOM
             }
+            int checkpoint_coverage[noutputs];
+            for (int o = 0; o < noutputs; ++o) {
+                checkpoint_coverage[o] = certified_states[o].coverage_horizon;
+            }
 
             if (
                 save_checkpoint(
@@ -1013,16 +1089,17 @@ int main(int argc, char *argv[]) {
                     implicant_words,
                     k,
                     stop_counter,
-                    MAX_LEVELS,
+                    STOP_AFTER_EQUALITY,
                     WEIGHT_PIC,
                     SCP_TYPE,
                     POOL_MAX,
-                    START_LEVEL,
                     SRC_FILE,
                     dst_to_save,
                     time_up_elapsed,
                     BASE_SCP + scp_time,
-                    last_task_reached_value
+                    last_task_reached_value,
+                    CERTIFIED_MODE,
+                    checkpoint_coverage
                 ) == 0
             ) {
                 double pct = (double)last_task_reached_value * 100.0 / (double)maxtasks;
@@ -1080,8 +1157,15 @@ int main(int argc, char *argv[]) {
                     *ON_set_covered = test_coverage;
                 }
 
+                certified_stop_observe_coverage(
+                    &certified_states[o],
+                    k,
+                    *ON_set_covered
+                );
+
 
                 if (*ON_set_covered && !PInfo[o].stop_search) {
+                    bool boundary_exact = SCP_TYPE == 1;
                     DBG_TRACE_BLOCK {
                         fprintf(debug_out, "Output %d, found PIs: %d", o + 1, *foundPI);
                     }
@@ -1110,7 +1194,7 @@ int main(int argc, char *argv[]) {
 
                     clock_gettime(CLOCK_MONOTONIC, &startg);
 
-                    if (SCP_TYPE == 0) { // Lagrangian relaxation
+                    if (SCP_TYPE == 0) { // Bundled hybrid solver
                         solve_scp_lagrangian(
                             pichart,
                             *foundPI,
@@ -1118,8 +1202,9 @@ int main(int argc, char *argv[]) {
                             weights,
                             indices,
                             solmin,
-                            LAGRANGIAN_LEVEL
+                            HYBRID_EFFORT_LEVEL
                         );
+                        boundary_exact = lagrangian_last_run_proved_optimal();
                         debug_print_lagrangian_stats(o);
                     }
 
@@ -1168,6 +1253,7 @@ int main(int argc, char *argv[]) {
                         // }
                     }
 
+                    bool plateau_triggered = false;
                     if (*solmin < *prevsolmin) {
                         // either solmin is smaller than the previously found solmin,
                         // or it is the very first time a solmin was found
@@ -1177,7 +1263,9 @@ int main(int argc, char *argv[]) {
                             previndices[i] = indices[i];
                         }
 
-                        stop_counter[o] = 0;
+                        if (!blocking_stop_states[o].certification_required) {
+                            stop_counter[o] = 0;
+                        }
 
                         DBG_TRACE_BLOCK {
                             if (!PInfo[o].stop_search) {
@@ -1204,12 +1292,42 @@ int main(int argc, char *argv[]) {
                                 for (int i = 0; i < *solmin; i++) {
                                     fprintf(debug_out, " %d", indices[i] + 1);
                                 }
-                                fprintf(debug_out, "%s\n", stop_counter[o] >= MAX_LEVELS ? " -- stopping search" : "");
+                                fprintf(debug_out, "%s\n", stop_counter[o] >= STOP_AFTER_EQUALITY ? " -- stopping search" : "");
                             }
                         }
 
-                        PInfo[o].stop_search = stop_counter[o] >= MAX_LEVELS;
+                        plateau_triggered = stop_counter[o] >= STOP_AFTER_EQUALITY;
                     }
+
+                    if (!certified_blocking_observe_plateau(
+                        &blocking_stop_states[o],
+                        &certified_states[o],
+                        REPORT_BLOCKING_DIAGNOSTIC,
+                        !CERTIFIED_MODE,
+                        plateau_triggered,
+                        stderr,
+                        o + 1,
+                        &PInfo[o],
+                        ninputs,
+                        k,
+                        indices,
+                        *solmin,
+                        boundary_exact
+                    )) {
+                        fprintf(stderr, "Error: blocking diagnostic failed for output %d.\n", o + 1);
+                        destroy_output_locks(output_locks, noutputs);
+                        cleanup(PInfo, buffer);
+                        return 1;
+                    }
+                    PInfo[o].stop_search = certified_stop_policy_decision(
+                        certified_states ? &certified_states[o] : NULL,
+                        &blocking_stop_states[o],
+                        CERTIFIED_MODE,
+                        plateau_triggered,
+                        k,
+                        *solmin,
+                        boundary_exact
+                    );
 
                     DBG_TRACE_BLOCK {
                         // fprintf(debug_out, "solmin: %d%s\n", *solmin, PInfo[o].stop_search ? ", stopping search" : "");
@@ -1246,9 +1364,11 @@ int main(int argc, char *argv[]) {
         if (POOL_MAX > 1) { // pooled solutions
 
             double pool_execution_time[noutputs];
+            bool pool_boundary_exact[noutputs];
 
             for (int o = 0; o < noutputs; o++) {
                 pool_execution_time[o] = 0.0;
+                pool_boundary_exact[o] = SCP_TYPE == 1;
 
                 int *foundPI = &PInfo[o].foundPI;
                 bool *ON_set_covered = &PInfo[o].ON_set_covered;
@@ -1281,8 +1401,13 @@ int main(int argc, char *argv[]) {
                     *ON_set_covered = test_coverage;
                 }
 
-                if (*ON_set_covered && !PInfo[o].stop_search) {
+                certified_stop_observe_coverage(
+                    &certified_states[o],
+                    k,
+                    *ON_set_covered
+                );
 
+                if (*ON_set_covered && !PInfo[o].stop_search) {
                     double *weights = NULL;
 
                     if (WEIGHT_PIC > 0) {
@@ -1307,7 +1432,7 @@ int main(int argc, char *argv[]) {
 
                     clock_gettime(CLOCK_MONOTONIC, &startg);
 
-                    if (SCP_TYPE == 0) { // Lagrangian relaxation with solution pool
+                    if (SCP_TYPE == 0) { // Bundled hybrid solver with solution pool
                         solve_scp_lagrangian_pool(
                             pichart,
                             *foundPI,
@@ -1317,8 +1442,9 @@ int main(int argc, char *argv[]) {
                             pool_count,
                             pool_solutions,
                             solmin,
-                            LAGRANGIAN_LEVEL
+                            HYBRID_EFFORT_LEVEL
                         );
+                        pool_boundary_exact[o] = lagrangian_last_run_proved_optimal();
                         debug_print_lagrangian_stats(o);
                     }
 
@@ -1467,13 +1593,16 @@ int main(int argc, char *argv[]) {
                         }
                     }
 
+                    bool plateau_triggered = false;
                     if (*solmin < *prevsolmin) {
                         *prevsolmin = *solmin;
                         for (int i = 0; i < *solmin; i++) {
                             previndices[i] = indices[i];
                         }
 
-                        stop_counter[o] = 0;
+                        if (!blocking_stop_states[o].certification_required) {
+                            stop_counter[o] = 0;
+                        }
 
                         DBG_INFO_BLOCK {
                             if (!PInfo[o].stop_search) {
@@ -1490,12 +1619,42 @@ int main(int argc, char *argv[]) {
 
                         DBG_INFO_BLOCK {
                             if (!PInfo[o].stop_search) {
-                                fprintf(debug_out, "%s\n", stop_counter[o] >= MAX_LEVELS ? "-- stopping search" : "");
+                                fprintf(debug_out, "%s\n", stop_counter[o] >= STOP_AFTER_EQUALITY ? "-- stopping search" : "");
                             }
                         }
 
-                        PInfo[o].stop_search = stop_counter[o] >= MAX_LEVELS;
+                        plateau_triggered = stop_counter[o] >= STOP_AFTER_EQUALITY;
                     }
+
+                    if (!certified_blocking_observe_plateau(
+                        &blocking_stop_states[o],
+                        &certified_states[o],
+                        REPORT_BLOCKING_DIAGNOSTIC,
+                        !CERTIFIED_MODE,
+                        plateau_triggered,
+                        stderr,
+                        o + 1,
+                        &PInfo[o],
+                        ninputs,
+                        k,
+                        indices,
+                        *solmin,
+                        pool_boundary_exact[o]
+                    )) {
+                        fprintf(stderr, "Error: blocking diagnostic failed for output %d.\n", o + 1);
+                        destroy_output_locks(output_locks, noutputs);
+                        cleanup(PInfo, buffer);
+                        return 1;
+                    }
+                    PInfo[o].stop_search = certified_stop_policy_decision(
+                        certified_states ? &certified_states[o] : NULL,
+                        &blocking_stop_states[o],
+                        CERTIFIED_MODE,
+                        plateau_triggered,
+                        k,
+                        *solmin,
+                        pool_boundary_exact[o]
+                    );
                 }
             }
 
@@ -1526,6 +1685,26 @@ int main(int argc, char *argv[]) {
         fprintf(debug_out, "max shared: %d\n", max_shared);
         fprintf(debug_out, "\n--- END ---\n");
     }
+
+    for (int o = 0; o < noutputs; ++o) {
+        bool certificate_required =
+            CERTIFIED_MODE || blocking_stop_states[o].certification_required;
+        if (certificate_required && !PInfo[o].stop_search) {
+            fprintf(
+                stderr,
+                CERTIFIED_MODE
+                    ? "Error: no global optimality certificate was established for output %d.\n"
+                    : "Error: output %d was escalated by the blocking warning but no global optimality certificate was established.\n",
+                o + 1
+            );
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            debug_close();
+            return 1;
+        }
+    }
+
+    free(certified_states);
 
 
     for (int o = 0; o < noutputs; o++) {

@@ -20,12 +20,13 @@ int save_checkpoint(
     int weight_pic,
     int scp_type,
     int pool_max,
-    int start_level,
     const char *src_path,
     const char *dst_path,
     double elapsed_total,
     double elapsed_scp,
-    uint64_t last_task
+    uint64_t last_task,
+    bool certified_mode,
+    const int *coverage_horizon
 );
 
 // Load the search state from a binary checkpoint file.
@@ -46,14 +47,14 @@ int load_checkpoint(
     int *weight_pic,
     int *scp_type,
     int *pool_max,
-    int *start_level,
     int **nofvalues_out,
     char **src_path_out,
     char **dst_path_out,
     double *elapsed_total_out,
     double *elapsed_scp_out,
-    uint64_t *last_task_out
+    uint64_t *last_task_out,
+    bool *certified_mode_out,
+    int **coverage_horizon_out
 );
 
 #endif // CHECKPOINT_H
-

@@ -34,6 +34,8 @@ void lagrangian_reset_stats(void);
 
 const LagrangianStats *lagrangian_last_stats(void);
 
+bool lagrangian_last_run_proved_optimal(void);
+
 const char *lagrangian_stop_reason_name(LagrangianStopReason reason);
 
 void solve_scp_lagrangian(
