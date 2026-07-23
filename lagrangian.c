@@ -2549,6 +2549,42 @@ static int pool_add_if_new(
     return 1;
 }
 
+static void pool_order_by_weight(
+    int **pool_solutions,
+    int pool_count,
+    int len,
+    const double *weights
+) {
+    if (!pool_solutions || pool_count <= 1 || len <= 0) return;
+
+    for (int i = 1; i < pool_count; ++i) {
+        int *candidate = pool_solutions[i];
+        double candidate_weight =
+            solution_total_weight(candidate, len, weights);
+        int position = i;
+
+        while (position > 0) {
+            int *previous = pool_solutions[position - 1];
+            double previous_weight =
+                solution_total_weight(previous, len, weights);
+            bool precedes =
+                candidate_weight > previous_weight + EPS ||
+                (
+                    fabs(candidate_weight - previous_weight) <= EPS &&
+                    memcmp(
+                        candidate,
+                        previous,
+                        (size_t)len * sizeof(int)
+                    ) < 0
+                );
+            if (!precedes) break;
+            pool_solutions[position] = previous;
+            position--;
+        }
+        pool_solutions[position] = candidate;
+    }
+}
+
 typedef struct {
     int max_iter;
     int heur_every;
@@ -4467,7 +4503,16 @@ void solve_scp_lagrangian_pool(
 
     /* output */
     if (max_pool > 1 && out_pool_count) {
-        /* Return the pool */
+        /*
+         * Candidate zero is the preferred weighted incumbent used as the
+         * mandatory seed by cross-output marginal-value retention.
+         */
+        pool_order_by_weight(
+            pool_solutions,
+            pool_count,
+            pool_min_len,
+            weights
+        );
         *out_pool_count = pool_count;
     }
 

@@ -103,6 +103,20 @@ typedef struct ThreadBuffer {
     int       found;
 } ThreadBuffer;
 
+/*
+ * Per-output coverage index used while generating one complexity level.
+ * Coverage keys are copied into the index so worker lookups remain valid if
+ * the global PI arrays grow while a level is being generated.
+ */
+typedef struct {
+    int *slots;
+    uint64_t *keys;
+    size_t table_size;
+    size_t count;
+    int words;
+    bool include_current_level;
+} PICoverageIndex;
+
 /* Binary total-row model required by adaptive and certified stopping. */
 bool certified_model_supported(
     const PIstorage *PInfo,
@@ -135,6 +149,19 @@ double *build_cover_weights(
     int found_pi,
     int completed_level,
     int weight_mode
+);
+
+/*
+ * Pooling is a Boolean user choice.  Candidate discovery grows only
+ * logarithmically with PI-chart width and is capped tightly because pooling
+ * is a secondary multi-output objective, not part of cover feasibility.
+ */
+#define CCUBES_POOL_MIN_CANDIDATES 5
+#define CCUBES_POOL_SEED_CANDIDATES 10
+#define CCUBES_POOL_STORAGE_CAPACITY 20
+
+int automatic_pool_solution_limit(
+    int found_pi
 );
 
 void trim_whitespace(
@@ -184,9 +211,29 @@ int process_task(
     ThreadBuffer **buffer,
     int tid,
     ccubes_mutex *output_locks,
+    PICoverageIndex *coverage_indices,
     int *max_shared,
     int increase,
-    int *multiplier,
+    int *multiplier
+);
+
+bool build_pi_coverage_indices(
+    PICoverageIndex **indices,
+    PIstorage *PInfo,
+    int noutputs,
+    const int *level_start,
+    bool deterministic_order
+);
+
+void destroy_pi_coverage_indices(
+    PICoverageIndex *indices,
+    int noutputs
+);
+
+int finalize_pi_level(
+    PIstorage *PInfo,
+    int implicant_words,
+    int level_start,
     bool deterministic_order
 );
 

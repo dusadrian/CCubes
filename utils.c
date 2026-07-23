@@ -200,6 +200,27 @@ double *build_cover_weights(
     return weights;
 }
 
+int automatic_pool_solution_limit(int found_pi) {
+    /*
+     * Pooling is an optional secondary objective.  A logarithmic discovery
+     * budget lets wider charts expose more alternatives without reproducing
+     * the square-root growth that made exact pool enumeration dominate both
+     * time and memory.  Cross-output marginal-value filtering in
+     * pool_selection.c subsequently removes alternatives that add no new
+     * sharing opportunity.
+     */
+    if (found_pi <= 1) return 1;
+
+    int limit = (int)ceil(log2((double)found_pi + 1.0));
+    if (limit < CCUBES_POOL_MIN_CANDIDATES) {
+        limit = CCUBES_POOL_MIN_CANDIDATES;
+    }
+    if (limit > CCUBES_POOL_STORAGE_CAPACITY) {
+        limit = CCUBES_POOL_STORAGE_CAPACITY;
+    }
+    return limit;
+}
+
 typedef struct {
     PIstorage *pi;
     int implicant_words;
@@ -278,21 +299,30 @@ static int cmp_pi_canonical(
     return 0;
 }
 
-static uint64_t pi_coverage_hash(
-    PIstorage *pi,
-    int idx
+static uint64_t coverage_words_hash(
+    const uint64_t *coverage,
+    int words
 ) {
     const uint64_t FNV_OFFSET = 1469598103934665603ULL;
     const uint64_t FNV_PRIME = 1099511628211ULL;
     uint64_t hash = FNV_OFFSET;
-    uint64_t *coverage = &pi->pichart_pos[(size_t)idx * (size_t)pi->pichart_words];
 
-    for (int w = 0; w < pi->pichart_words; ++w) {
+    for (int w = 0; w < words; ++w) {
         hash ^= coverage[w];
         hash *= FNV_PRIME;
     }
 
     return hash;
+}
+
+static uint64_t pi_coverage_hash(
+    const PIstorage *pi,
+    int idx
+) {
+    return coverage_words_hash(
+        &pi->pichart_pos[(size_t)idx * (size_t)pi->pichart_words],
+        pi->pichart_words
+    );
 }
 
 static bool pi_coverage_equal(
@@ -358,6 +388,179 @@ static void pi_coverage_replace(
         pos = (pos + 1u) & mask;
     }
     slots[pos] = idx;
+}
+
+static int coverage_index_lookup_words(
+    const PICoverageIndex *index,
+    const uint64_t *coverage
+) {
+    if (!index || !index->slots || index->table_size == 0) return -1;
+
+    size_t mask = index->table_size - 1u;
+    size_t pos = (size_t)(
+        coverage_words_hash(coverage, index->words) & (uint64_t)mask
+    );
+
+    while (index->slots[pos] >= 0) {
+        if (
+            cmp_u64_words(
+                &index->keys[(size_t)pos * (size_t)index->words],
+                coverage,
+                index->words
+            ) == 0
+        ) {
+            return index->slots[pos];
+        }
+        pos = (pos + 1u) & mask;
+    }
+
+    return -1;
+}
+
+static bool coverage_index_resize(
+    PICoverageIndex *index,
+    size_t requested_size
+) {
+    size_t table_size = 16u;
+    while (table_size < requested_size) {
+        if (table_size > SIZE_MAX / 2u) return false;
+        table_size <<= 1u;
+    }
+
+    int *slots = (int *)malloc(table_size * sizeof(int));
+    if (!slots) return false;
+    for (size_t i = 0; i < table_size; ++i) slots[i] = -1;
+    uint64_t *keys = index->words > 0
+        ? (uint64_t *)calloc(
+            table_size * (size_t)index->words,
+            sizeof(uint64_t)
+        )
+        : NULL;
+    if (index->words > 0 && !keys) {
+        free(slots);
+        return false;
+    }
+
+    if (index->slots) {
+        size_t mask = table_size - 1u;
+        for (size_t i = 0; i < index->table_size; ++i) {
+            if (index->slots[i] < 0) continue;
+
+            const uint64_t *key = &index->keys[
+                i * (size_t)index->words
+            ];
+            size_t pos = (size_t)(
+                coverage_words_hash(key, index->words) & (uint64_t)mask
+            );
+            while (slots[pos] >= 0) pos = (pos + 1u) & mask;
+            slots[pos] = 1;
+            memcpy(
+                &keys[pos * (size_t)index->words],
+                key,
+                (size_t)index->words * sizeof(uint64_t)
+            );
+        }
+    }
+
+    free(index->slots);
+    free(index->keys);
+    index->slots = slots;
+    index->keys = keys;
+    index->table_size = table_size;
+    return true;
+}
+
+static bool coverage_index_insert_words(
+    PICoverageIndex *index,
+    const uint64_t *coverage
+) {
+    if (coverage_index_lookup_words(index, coverage) >= 0) return true;
+
+    if (
+        index->table_size == 0 ||
+        (index->count + 1u) * 10u >= index->table_size * 7u
+    ) {
+        size_t requested = index->table_size > 0
+            ? index->table_size * 2u
+            : 16u;
+        if (!coverage_index_resize(index, requested)) return false;
+    }
+
+    size_t mask = index->table_size - 1u;
+    size_t pos = (size_t)(
+        coverage_words_hash(coverage, index->words) & (uint64_t)mask
+    );
+    while (index->slots[pos] >= 0) pos = (pos + 1u) & mask;
+    index->slots[pos] = 1;
+    memcpy(
+        &index->keys[pos * (size_t)index->words],
+        coverage,
+        (size_t)index->words * sizeof(uint64_t)
+    );
+    index->count++;
+    return true;
+}
+
+bool build_pi_coverage_indices(
+    PICoverageIndex **indices,
+    PIstorage *PInfo,
+    int noutputs,
+    const int *level_start,
+    bool deterministic_order
+) {
+    if (!indices || !PInfo || noutputs < 0 || !level_start) return false;
+
+    *indices = (PICoverageIndex *)calloc(
+        (size_t)noutputs,
+        sizeof(PICoverageIndex)
+    );
+    if (!*indices) return false;
+
+    for (int o = 0; o < noutputs; ++o) {
+        PICoverageIndex *index = &(*indices)[o];
+        index->include_current_level = !deterministic_order;
+        index->words = PInfo[o].pichart_words;
+
+        int records = deterministic_order
+            ? level_start[o]
+            : PInfo[o].foundPI;
+        if (records < 0) records = 0;
+        if (records > PInfo[o].foundPI) records = PInfo[o].foundPI;
+
+        size_t requested = records > 0 ? (size_t)records * 2u : 16u;
+        if (!coverage_index_resize(index, requested)) {
+            destroy_pi_coverage_indices(*indices, noutputs);
+            *indices = NULL;
+            return false;
+        }
+
+        for (int record = 0; record < records; ++record) {
+            if (!coverage_index_insert_words(
+                index,
+                &PInfo[o].pichart_pos[
+                    (size_t)record * (size_t)PInfo[o].pichart_words
+                ]
+            )) {
+                destroy_pi_coverage_indices(*indices, noutputs);
+                *indices = NULL;
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+void destroy_pi_coverage_indices(
+    PICoverageIndex *indices,
+    int noutputs
+) {
+    if (!indices) return;
+    for (int o = 0; o < noutputs; ++o) {
+        free(indices[o].slots);
+        free(indices[o].keys);
+    }
+    free(indices);
 }
 
 static void copy_pi_record(
@@ -506,6 +709,18 @@ static int rebuild_pi_buckets(
     free(next_prev);
     free(next_curr);
     return 1;
+}
+
+int finalize_pi_level(
+    PIstorage *PInfo,
+    int implicant_words,
+    int level_start,
+    bool deterministic_order
+) {
+    if (deterministic_order) {
+        return canonicalize_pi_order(PInfo, implicant_words, level_start);
+    }
+    return rebuild_pi_buckets(PInfo, level_start);
 }
 
 int canonicalize_pi_order(
@@ -1451,10 +1666,10 @@ int process_task(
     ThreadBuffer **buffer,
     int tid,
     ccubes_mutex *output_locks,
+    PICoverageIndex *coverage_indices,
     int *max_shared,
     int increase,
-    int *multiplier,
-    bool deterministic_order
+    int *multiplier
 ) {
     int tempk[k];
     uint64_t combination = task;
@@ -1879,7 +2094,6 @@ int process_task(
                 );
 
                 int ON_minterms = PInfo[o].ON_minterms;
-                int *last_index = PInfo[o].last_index;
                 int pichart_words = PInfo[o].pichart_words;
 
                 uint64_t *task_pichart_values = buffer[tid][o].pichart_values;
@@ -1888,10 +2102,42 @@ int process_task(
                 if (u_covsum < 1) u_covsum = 1;
                 if (u_covsum > ON_minterms) u_covsum = ON_minterms;
 
+                bool redundant = !shareable_prime;
+                PICoverageIndex *coverage_index = coverage_indices
+                    ? &coverage_indices[o]
+                    : NULL;
+
+                /*
+                 * Buckets up to covsum contain only coverages no larger than
+                 * this candidate. A stored coverage can dominate the
+                 * candidate only when the two bitsets are equal. Use the
+                 * level index for that exact lookup instead of scanning every
+                 * earlier PI while holding the output lock.
+                 *
+                 * In deterministic mode the index contains only completed
+                 * levels and is immutable during the worker pass, so this
+                 * lookup is contention-free. Current-level duplicates are
+                 * removed by canonicalize_pi_order after the workers finish.
+                 */
+                if (
+                    !shareable &&
+                    !redundant &&
+                    coverage_index &&
+                    !coverage_index->include_current_level
+                ) {
+                    redundant = coverage_index_lookup_words(
+                        coverage_index,
+                        &task_pichart_values[
+                            (size_t)f * (size_t)pichart_words
+                        ]
+                    ) >= 0;
+                }
+
+                if (redundant) continue;
+
                 if (output_locks) ccubes_mutex_lock(&output_locks[o]);
 
                     int *covered = PInfo[o].covered;
-                    int *k_last_index = PInfo[o].k_last_index;
                     uint64_t *pichart_pos = PInfo[o].pichart_pos;
                     int *pichart = PInfo[o].pichart;
                     uint64_t *implicants_pos = PInfo[o].implicants_pos;
@@ -1901,49 +2147,22 @@ int process_task(
                     int *shared = PInfo[o].shared;
                     int *covsum = PInfo[o].covsum;
 
-                    bool redundant = !shareable_prime;
-
                     /*
-                    Local dominance is safe for coverage but can remove a
-                    genuine PI useful for global product-row sharing. Shared
-                    candidates may bypass local dominance only after the
-                    explicit primality test above.
-                    */
-                    if (!shareable && !redundant && u_covsum > 0) {
-                        for (int rd = 0; rd < last_index[u_covsum - 1]; rd++) {
-                            bool dominated = true;
-                            for (int w = 0; w < pichart_words; w++) {
-                                if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
-                                    dominated = false;
-                                    break;
-                                }
-                            }
-
-                            if (dominated) {
-                                redundant = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (!shareable && !redundant && !deterministic_order) {
-                        int start_index = (k == 1 || u_covsum <= 1) ?
-                            0 : last_index[u_covsum - 1];
-                        int end_index = (u_covsum <= 1) ?
-                            0 : k_last_index[u_covsum - 1];
-                        for (int rd = start_index; rd < end_index; rd++) {
-                            bool dominated = true;
-                            for (int w = 0; w < pichart_words; w++) {
-                                if ((task_pichart_values[f * pichart_words + w] & pichart_pos[covered[rd] * pichart_words + w]) != task_pichart_values[f * pichart_words + w]) {
-                                    dominated = false;
-                                    break;
-                                }
-                            }
-                            if (dominated) {
-                                redundant = true;
-                                break;
-                            }
-                        }
+                     * Non-deterministic mode historically removed duplicate
+                     * current-level coverages as workers arrived. Preserve
+                     * that behavior with a synchronized hash lookup.
+                     */
+                    if (
+                        !shareable &&
+                        coverage_index &&
+                        coverage_index->include_current_level
+                    ) {
+                        redundant = coverage_index_lookup_words(
+                            coverage_index,
+                            &task_pichart_values[
+                                (size_t)f * (size_t)pichart_words
+                            ]
+                        ) >= 0;
                     }
 
                     if (redundant) {
@@ -2000,19 +2219,25 @@ int process_task(
                     }
                     covsum[*foundPI] = u_covsum;
 
-                    int insert_at = k_last_index[u_covsum - 1];
-                    if (insert_at < 0) insert_at = 0;
-                    if (insert_at > *foundPI) insert_at = *foundPI;
-
-                    for (int i = *foundPI; i > insert_at; i--) {
-                        covered[i] = covered[i - 1];
-                    }
-
-                    covered[insert_at] = *foundPI;
-
-                    // Shift boundaries for all buckets at or above this covsum
-                    for (int l = u_covsum - 1; l < ON_minterms; l++) {
-                        k_last_index[l] += 1;
+                    if (
+                        coverage_index &&
+                        coverage_index->include_current_level &&
+                        !coverage_index_insert_words(
+                            coverage_index,
+                            &task_pichart_values[
+                                (size_t)f * (size_t)pichart_words
+                            ]
+                        )
+                    ) {
+                        if (output_locks) {
+                            ccubes_mutex_unlock(&output_locks[o]);
+                        }
+                        free(output_map);
+                        free(covsum_map);
+                        free(found_map);
+                        free(uniquePIs);
+                        free(shared_count);
+                        return 1;
                     }
 
                     (*foundPI)++;

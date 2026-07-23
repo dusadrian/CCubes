@@ -373,7 +373,15 @@ void gurobi_solution_pool(
     /* pool params on model's environment */
     error = GRBsetintparam(menv, GRB_INT_PAR_POOLSOLUTIONS, max_pool);
     if (error) goto QUIT;
-    error = GRBsetintparam(menv, GRB_INT_PAR_POOLSEARCHMODE, 2);
+    /*
+     * Mode 2 proves that the retained solutions are the globally best
+     * max_pool alternatives for the secondary weight objective.  CCubes does
+     * not need that expensive ranking proof: pooling is used only to expose
+     * useful equal-cardinality alternatives for cross-output coordination.
+     * Mode 1 collects additional incumbents opportunistically while keeping
+     * memory bounded by the small internal pool budget.
+     */
+    error = GRBsetintparam(menv, GRB_INT_PAR_POOLSEARCHMODE, 1);
     if (error) goto QUIT;
 
     error = GRBupdatemodel(model);

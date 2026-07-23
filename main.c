@@ -30,10 +30,10 @@ typedef struct {
     PIstorage *PInfo;
     ThreadBuffer **buffer;
     ccubes_mutex *output_locks;
+    PICoverageIndex *coverage_indices;
     int *max_shared;
     int increase;
     int *multiplier;
-    bool deterministic_order;
     double time_limit_sec;
     double base_elapsed;
     struct timespec start_time;
@@ -100,10 +100,10 @@ static void pi_search_range_worker(
             ctx->buffer,
             worker_id,
             ctx->output_locks,
+            ctx->coverage_indices,
             ctx->max_shared,
             ctx->increase,
-            ctx->multiplier,
-            ctx->deterministic_order
+            ctx->multiplier
         );
 
         if (error) {
@@ -141,7 +141,7 @@ void help() {
     printf("  -c                   : require certified exact stopping (point rows only)\n");
     printf("                         (explicitly overrides the -e0 heuristic plateau policy)\n");
     printf("                         (input-dash rows: heuristic plateau stopping)\n");
-    printf("  -p<number>           : coordinate up to <number> equal-cardinality covers per output\n");
+    printf("  -p                   : enable automatic equal-cardinality cover pooling\n");
     printf("  -l<sec>[=<file>]     : time limit to save a checkpoint in the <file>\n");
     printf("  -r=<file>            : resume from checkpoint file\n");
     printf("  -i<level>=<file>     : inspect checkpoint (print progress and metadata)\n");
@@ -279,9 +279,15 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             THREADS_FORCED = true;
+        } else if (strcmp(argv[i], "-p") == 0) {
+            POOL_MAX = CCUBES_POOL_STORAGE_CAPACITY;
         } else if (strncmp(argv[i], "-p", 2) == 0) {
-            POOL_MAX = atoi(argv[i] + 2);
-            if (POOL_MAX < 1) POOL_MAX = 1;
+            fprintf(
+                stderr,
+                "Error: -p is a Boolean switch and does not accept a number.\n"
+            );
+            help();
+            return 1;
         } else if (strncmp(argv[i], "-l", 2) == 0) {
             char *opt = argv[i] + 2;  // string after "-l"
             char *eq  = strchr(opt, '=');
@@ -943,6 +949,7 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &startk);
 
         uint64_t maxtasks = nchoosek(ninputs, k);
+        PICoverageIndex *coverage_indices = NULL;
         atomic_bool time_up;
         atomic_init(&time_up, false);
         double time_up_elapsed = 0.0;
@@ -974,6 +981,20 @@ int main(int argc, char *argv[]) {
             return(1);
         }
 
+        if (!build_pi_coverage_indices(
+            &coverage_indices,
+            PInfo,
+            noutputs,
+            level_start,
+            DETERMINISTIC_PI_ORDER
+        )) {
+            fprintf(stderr, "Error: failed to build PI coverage indices\n");
+            ccubes_mutex_destroy(&state_lock);
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            return 1;
+        }
+
         DBG_INFO_BLOCK {
             fprintf(debug_out, "\nk: %d\n", k);
             fprintf(debug_out, "maxtasks: %lld\n", maxtasks);
@@ -991,10 +1012,10 @@ int main(int argc, char *argv[]) {
             .PInfo = PInfo,
             .buffer = buffer,
             .output_locks = output_locks,
+            .coverage_indices = coverage_indices,
             .max_shared = &max_shared,
             .increase = increase,
             .multiplier = &multiplier,
-            .deterministic_order = DETERMINISTIC_PI_ORDER,
             .time_limit_sec = TIME_LIMIT_SEC,
             .base_elapsed = BASE_ELAPSED,
             .start_time = start,
@@ -1016,6 +1037,7 @@ int main(int argc, char *argv[]) {
             )
         ) {
             fprintf(stderr, "Error: failed to start workers for PI search\n");
+            destroy_pi_coverage_indices(coverage_indices, noutputs);
             ccubes_mutex_destroy(&state_lock);
             destroy_output_locks(output_locks, noutputs);
             cleanup(PInfo, buffer);
@@ -1031,15 +1053,23 @@ int main(int argc, char *argv[]) {
             memory_order_acquire
         );
         ccubes_mutex_destroy(&state_lock);
+        destroy_pi_coverage_indices(coverage_indices, noutputs);
 
-        if (DETERMINISTIC_PI_ORDER) {
-            for (int o = 0; o < noutputs; ++o) {
-                if (!canonicalize_pi_order(&PInfo[o], implicant_words, level_start[o])) {
-                    fprintf(stderr, "Error: failed to canonicalize PI order for output %d\n", o + 1);
-                    destroy_output_locks(output_locks, noutputs);
-                    cleanup(PInfo, buffer);
-                    return 1;
-                }
+        for (int o = 0; o < noutputs; ++o) {
+            if (!finalize_pi_level(
+                &PInfo[o],
+                implicant_words,
+                level_start[o],
+                DETERMINISTIC_PI_ORDER
+            )) {
+                fprintf(
+                    stderr,
+                    "Error: failed to finalize PI level for output %d\n",
+                    o + 1
+                );
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                return 1;
             }
         }
         clock_gettime(CLOCK_MONOTONIC, &endpi);
@@ -1400,6 +1430,19 @@ int main(int argc, char *argv[]) {
 
                 if (*ON_set_covered && !PInfo[o].stop_search) {
                     clear_output_solution_pool(&PInfo[o]);
+                    int pool_limit =
+                        automatic_pool_solution_limit(*foundPI);
+                    DBG_INFO_BLOCK {
+                        fprintf(
+                            debug_out,
+                            "CCUBES_POOL_BUDGET level=%d output=%d "
+                            "chart_cols=%d limit=%d\n",
+                            k,
+                            o + 1,
+                            *foundPI,
+                            pool_limit
+                        );
+                    }
 
                     double *weights = build_cover_weights(
                         &PInfo[o],
@@ -1422,7 +1465,7 @@ int main(int argc, char *argv[]) {
                             *foundPI,
                             ON_minterms,
                             weights,
-                            POOL_MAX,
+                            pool_limit,
                             pool_count,
                             pool_solutions,
                             solmin,
@@ -1437,7 +1480,7 @@ int main(int argc, char *argv[]) {
                             pichart,
                             *foundPI,
                             ON_minterms,
-                            POOL_MAX,
+                            pool_limit,
                             weights,
                             pool_count,
                             pool_solutions,
@@ -1547,6 +1590,14 @@ int main(int argc, char *argv[]) {
                                 indices[i] = previndices[i];
                             }
                             *solmin = *prevsolmin;
+
+                            /*
+                            The current pool contains covers of the discarded,
+                            larger cardinality.  It must not survive into a
+                            later joint-pool pass, where solmin now describes
+                            the shorter retained incumbent.
+                            */
+                            clear_output_solution_pool(&PInfo[o]);
                         }
                         stop_counter[o]++;
 
@@ -1642,11 +1693,15 @@ int main(int argc, char *argv[]) {
                 );
                 fprintf(
                     debug_out,
-                    "CCUBES_POOL level=%d active_outputs=%d candidates=%d "
+                    "CCUBES_POOL level=%d active_outputs=%d generated=%d "
+                    "valuable=%d discarded=%d candidates=%d "
                     "retained_shared=%d pool_shared=%d connections=%d "
                     "selected_rows=%d selected_shared=%d savings=%d selection=%s\n",
                     k,
                     pool_stats.active_outputs,
+                    pool_stats.generated_pool_solutions,
+                    pool_stats.valuable_pool_solutions,
+                    pool_stats.discarded_pool_solutions,
                     pool_stats.total_pool_solutions,
                     pool_stats.retained_shared_cubes,
                     pool_stats.pool_shared_cubes,

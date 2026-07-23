@@ -9,11 +9,13 @@
 #include "pool_selection.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define EXACT_COMBINATION_LIMIT 2000000ULL
+#define POOL_VALUE_EPSILON 1e-12
 
 typedef struct {
     int output;
@@ -37,6 +39,7 @@ typedef struct {
     int len;
     int *cube_ids;
     int potential;
+    int value_rank;
 } PoolCandidate;
 
 typedef struct {
@@ -225,9 +228,281 @@ static void free_output_pools(OutputPool *outputs, int noutputs) {
     free(outputs);
 }
 
+static int candidate_overlap(
+    const PoolCandidate *a,
+    const PoolCandidate *b
+) {
+    int overlap = 0;
+    for (int i = 0; i < a->len; ++i) {
+        for (int j = 0; j < b->len; ++j) {
+            if (a->cube_ids[i] == b->cube_ids[j]) {
+                overlap++;
+                break;
+            }
+        }
+    }
+    return overlap;
+}
+
+/*
+ * Retain covers for their marginal compatibility with the candidate
+ * landscapes of the other outputs.  For a retained family K_o, the facility
+ * value is
+ *
+ *   F(K_o) = sum_{j != o} (1 / |P_j|)
+ *              sum_{D in P_j} max_{C in K_o} |C intersect D|.
+ *
+ * Greedy marginal gain gives diminishing priority automatically. Candidate
+ * zero and a solver-ranked safety seed are always preserved. Beyond the seed,
+ * candidates with positive marginal value are ranked first; candidates with
+ * an absolute cross-output cube match remain eligible because a higher-order
+ * tuple may still use them. Only covers with no sharing opportunity are
+ * discarded. Keep decisions for every output are computed before any pool is
+ * compacted, so the score is symmetric with respect to the original
+ * candidate landscape.
+ */
+static bool mark_valuable_candidates(
+    OutputPool *outputs,
+    int noutputs,
+    bool ***keep_out,
+    int **keep_count_out
+) {
+    bool **keep = (bool **)calloc((size_t)noutputs, sizeof(*keep));
+    int *keep_count = (int *)calloc((size_t)noutputs, sizeof(*keep_count));
+    if (!keep || !keep_count) {
+        free(keep);
+        free(keep_count);
+        return false;
+    }
+
+    for (int output = 0; output < noutputs; ++output) {
+        int count = outputs[output].count;
+        if (count <= 0) continue;
+
+        keep[output] = (bool *)calloc((size_t)count, sizeof(bool));
+        if (!keep[output]) {
+            for (int prior = 0; prior < output; ++prior) free(keep[prior]);
+            free(keep);
+            free(keep_count);
+            return false;
+        }
+
+        keep[output][0] = true;
+        outputs[output].candidate[0].value_rank = 0;
+        keep_count[output] = 1;
+        if (count == 1) continue;
+
+        int reference_count = 0;
+        for (int other = 0; other < noutputs; ++other) {
+            if (other != output) reference_count += outputs[other].count;
+        }
+        if (reference_count <= 0) continue;
+
+        const PoolCandidate **reference = (const PoolCandidate **)malloc(
+            (size_t)reference_count * sizeof(*reference)
+        );
+        double *reference_weight = (double *)malloc(
+            (size_t)reference_count * sizeof(*reference_weight)
+        );
+        int *best_overlap = (int *)calloc(
+            (size_t)reference_count,
+            sizeof(*best_overlap)
+        );
+        if (!reference || !reference_weight || !best_overlap) {
+            free(reference);
+            free(reference_weight);
+            free(best_overlap);
+            for (int prior = 0; prior <= output; ++prior) free(keep[prior]);
+            free(keep);
+            free(keep_count);
+            return false;
+        }
+
+        int ref = 0;
+        for (int other = 0; other < noutputs; ++other) {
+            if (other == output || outputs[other].count <= 0) continue;
+            double weight = 1.0 / (double)outputs[other].count;
+            for (int p = 0; p < outputs[other].count; ++p) {
+                reference[ref] = &outputs[other].candidate[p];
+                reference_weight[ref] = weight;
+                best_overlap[ref] = candidate_overlap(
+                    &outputs[output].candidate[0],
+                    reference[ref]
+                );
+                ref++;
+            }
+        }
+
+        while (
+            keep_count[output] < count &&
+            keep_count[output] < CCUBES_POOL_STORAGE_CAPACITY
+        ) {
+            int best_candidate = -1;
+            double best_gain = 0.0;
+            int best_potential = INT_MIN;
+
+            for (int p = 1; p < count; ++p) {
+                if (keep[output][p]) continue;
+
+                double gain = 0.0;
+                for (int r = 0; r < reference_count; ++r) {
+                    int overlap = candidate_overlap(
+                        &outputs[output].candidate[p],
+                        reference[r]
+                    );
+                    if (overlap > best_overlap[r]) {
+                        gain += reference_weight[r] *
+                            (double)(overlap - best_overlap[r]);
+                    }
+                }
+
+                int potential = outputs[output].candidate[p].potential;
+                if (
+                    gain > best_gain + POOL_VALUE_EPSILON ||
+                    (
+                        fabs(gain - best_gain) <= POOL_VALUE_EPSILON &&
+                        gain > POOL_VALUE_EPSILON &&
+                        (
+                            potential > best_potential ||
+                            (
+                                potential == best_potential &&
+                                (best_candidate < 0 || p < best_candidate)
+                            )
+                        )
+                    )
+                ) {
+                    best_candidate = p;
+                    best_gain = gain;
+                    best_potential = potential;
+                }
+            }
+
+            if (
+                best_candidate < 0 ||
+                best_gain <= POOL_VALUE_EPSILON
+            ) {
+                /*
+                 * Preserve a small solver-ranked seed before applying the
+                 * strict positive-marginal rule.  Whole-cover coordination
+                 * can exploit co-occurrence patterns that a pairwise overlap
+                 * surrogate does not see; the seed prevents that surrogate
+                 * from collapsing every low-overlap output to one cover.
+                 */
+                if (
+                    keep_count[output] <
+                    CCUBES_POOL_SEED_CANDIDATES
+                ) {
+                    best_candidate = -1;
+                    for (int p = 1; p < count; ++p) {
+                        if (!keep[output][p]) {
+                            best_candidate = p;
+                            break;
+                        }
+                    }
+                    if (best_candidate < 0) break;
+                } else {
+                    /*
+                     * Marginal facility value is a ranking surrogate, not
+                     * the final joint-union objective.  A cover with any
+                     * exact cross-output cube match can still matter through
+                     * a higher-order combination, so retain it within the
+                     * hard 20-cover cap.  Only candidates with no sharing
+                     * opportunity at all are safely discarded here.
+                     */
+                    best_candidate = -1;
+                    best_potential = 0;
+                    for (int p = 1; p < count; ++p) {
+                        if (
+                            !keep[output][p] &&
+                            outputs[output].candidate[p].potential >
+                                best_potential
+                        ) {
+                            best_candidate = p;
+                            best_potential =
+                                outputs[output].candidate[p].potential;
+                        }
+                    }
+                    if (best_candidate < 0) break;
+                }
+            }
+
+            keep[output][best_candidate] = true;
+            outputs[output].candidate[best_candidate].value_rank =
+                keep_count[output];
+            keep_count[output]++;
+            for (int r = 0; r < reference_count; ++r) {
+                int overlap = candidate_overlap(
+                    &outputs[output].candidate[best_candidate],
+                    reference[r]
+                );
+                if (overlap > best_overlap[r]) best_overlap[r] = overlap;
+            }
+        }
+
+        free(reference);
+        free(reference_weight);
+        free(best_overlap);
+    }
+
+    *keep_out = keep;
+    *keep_count_out = keep_count;
+    return true;
+}
+
+static void compact_valuable_candidates(
+    OutputPool *outputs,
+    int noutputs,
+    bool **keep,
+    const int *keep_count
+) {
+    for (int output = 0; output < noutputs; ++output) {
+        int write = 0;
+        for (int read = 0; read < outputs[output].count; ++read) {
+            if (keep[output] && keep[output][read]) {
+                if (write != read) {
+                    outputs[output].candidate[write] =
+                        outputs[output].candidate[read];
+                    memset(
+                        &outputs[output].candidate[read],
+                        0,
+                        sizeof(outputs[output].candidate[read])
+                    );
+                }
+                write++;
+            } else {
+                free(outputs[output].candidate[read].cube_ids);
+                outputs[output].candidate[read].cube_ids = NULL;
+            }
+        }
+        outputs[output].count = keep_count[output];
+
+        for (int i = 1; i < outputs[output].count; ++i) {
+            PoolCandidate candidate = outputs[output].candidate[i];
+            int position = i;
+            while (
+                position > 0 &&
+                candidate.value_rank <
+                    outputs[output].candidate[position - 1].value_rank
+            ) {
+                outputs[output].candidate[position] =
+                    outputs[output].candidate[position - 1];
+                position--;
+            }
+            outputs[output].candidate[position] = candidate;
+        }
+        free(keep[output]);
+    }
+    free(keep);
+}
+
 static CandidateShape candidate_shape(const PIstorage *pi) {
     CandidateShape shape = {0};
-    if (!pi || pi->solmin <= 0) return shape;
+    /*
+    A stopped output has already committed its final indices.  Other outputs
+    may continue to later PI levels, but their joint-pool pass must not reopen
+    or replace this cover with a pool retained from an earlier boundary.
+    */
+    if (!pi || pi->stop_search || pi->solmin <= 0) return shape;
 
     bool incumbent_valid =
         pi->prevsolmin > 0 &&
@@ -572,6 +847,30 @@ bool select_joint_pool_solutions(
         }
     }
 
+    bool **keep = NULL;
+    int *keep_count = NULL;
+    if (!mark_valuable_candidates(
+        outputs,
+        noutputs,
+        &keep,
+        &keep_count
+    )) {
+        free_output_pools(outputs, noutputs);
+        universe_destroy(&universe);
+        return false;
+    }
+    int valuable_pool_solutions = 0;
+    for (int output = 0; output < noutputs; ++output) {
+        valuable_pool_solutions += keep_count[output];
+    }
+    compact_valuable_candidates(
+        outputs,
+        noutputs,
+        keep,
+        keep_count
+    );
+    free(keep_count);
+
     int *choice = (int *)malloc((size_t)noutputs * sizeof(int));
     int *trial = (int *)malloc((size_t)noutputs * sizeof(int));
     int *refcount = (int *)calloc((size_t)universe.count, sizeof(int));
@@ -685,6 +984,10 @@ bool select_joint_pool_solutions(
 
     if (stats) {
         stats->active_outputs = active_outputs;
+        stats->generated_pool_solutions = total_pool_solutions;
+        stats->valuable_pool_solutions = valuable_pool_solutions;
+        stats->discarded_pool_solutions =
+            total_pool_solutions - valuable_pool_solutions;
         stats->total_pool_solutions = total_pool_solutions;
         stats->retained_shared_cubes = -1;
         stats->pool_shared_cubes = pool_shared;

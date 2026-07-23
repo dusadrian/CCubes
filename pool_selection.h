@@ -6,6 +6,9 @@
 
 typedef struct {
     int active_outputs;
+    int generated_pool_solutions;
+    int valuable_pool_solutions;
+    int discarded_pool_solutions;
     int total_pool_solutions;
     int retained_shared_cubes;
     int pool_shared_cubes;
