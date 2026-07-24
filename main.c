@@ -135,7 +135,7 @@ void help() {
     printf("  -e<number>           : hybrid solver effort level:\n");
     printf("                           0 (default) fastest heuristic; stop at first plateau\n");
     printf("                           1 stronger bounds with bounded adaptive certification\n");
-    printf("                           2 strongest bounds with bounded adaptive certification\n");
+    printf("                           2 strong warm-started bound; full portfolio only for certification\n");
     printf("  -d                   : deterministic PI ordering\n");
     printf("  -g                   : print the adaptive blocking diagnostic at the first plateau\n");
     printf("  -c                   : require certified exact stopping (point rows only)\n");
@@ -1211,6 +1211,14 @@ int main(int argc, char *argv[]) {
                     clock_gettime(CLOCK_MONOTONIC, &startg);
 
                     if (SCP_TYPE == 0) { // Bundled hybrid solver
+                        bool certification_requested =
+                            CERTIFIED_MODE ||
+                            blocking_stop_states[o].certification_required;
+                        const int *initial_solution =
+                            *prevsolmin > 0 &&
+                            *prevsolmin <= ON_minterms
+                                ? previndices
+                                : NULL;
                         solve_scp_lagrangian(
                             pichart,
                             *foundPI,
@@ -1218,7 +1226,10 @@ int main(int argc, char *argv[]) {
                             weights,
                             indices,
                             solmin,
-                            HYBRID_EFFORT_LEVEL
+                            HYBRID_EFFORT_LEVEL,
+                            initial_solution,
+                            initial_solution ? *prevsolmin : 0,
+                            certification_requested
                         );
                         boundary_exact = lagrangian_last_run_proved_optimal();
                         print_hybrid_stats(o);
@@ -1230,6 +1241,14 @@ int main(int argc, char *argv[]) {
                             *foundPI,
                             ON_minterms,
                             weights,
+                            *prevsolmin > 0 &&
+                                *prevsolmin <= ON_minterms
+                                    ? previndices
+                                    : NULL,
+                            *prevsolmin > 0 &&
+                                *prevsolmin <= ON_minterms
+                                    ? *prevsolmin
+                                    : 0,
                             indices,
                             solmin
                         );
@@ -1469,7 +1488,17 @@ int main(int argc, char *argv[]) {
                             pool_count,
                             pool_solutions,
                             solmin,
-                            HYBRID_EFFORT_LEVEL
+                            HYBRID_EFFORT_LEVEL,
+                            PInfo[o].prevsolmin > 0 &&
+                                PInfo[o].prevsolmin <= ON_minterms
+                                    ? PInfo[o].previndices
+                                    : NULL,
+                            PInfo[o].prevsolmin > 0 &&
+                                PInfo[o].prevsolmin <= ON_minterms
+                                    ? PInfo[o].prevsolmin
+                                    : 0,
+                            CERTIFIED_MODE ||
+                                blocking_stop_states[o].certification_required
                         );
                         pool_boundary_exact[o] = lagrangian_last_run_proved_optimal();
                         print_hybrid_stats(o);
@@ -1482,6 +1511,14 @@ int main(int argc, char *argv[]) {
                             ON_minterms,
                             pool_limit,
                             weights,
+                            PInfo[o].prevsolmin > 0 &&
+                                PInfo[o].prevsolmin <= ON_minterms
+                                    ? PInfo[o].previndices
+                                    : NULL,
+                            PInfo[o].prevsolmin > 0 &&
+                                PInfo[o].prevsolmin <= ON_minterms
+                                    ? PInfo[o].prevsolmin
+                                    : 0,
                             pool_count,
                             pool_solutions,
                             solmin

@@ -8,6 +8,7 @@
 
 #include "lagrangian.h"
 #include "ccubes_threads.h"
+#include "cover_validation.h"
 
 #define EPS 1e-12
 
@@ -19,6 +20,13 @@ static LagrangianStats lagr_last_stats = {
     .best_lb = INT_MIN,
     .gap = -1,
     .pool_mode = 0,
+    .warm_start_requested = 0,
+    .warm_start_accepted = 0,
+    .effort_level = 0,
+    .certification_requested = 0,
+    .iteration_limit = 0,
+    .portfolio_limit = 0,
+    .polish_node_limit = 0,
     .best_zlb = -DBL_MAX,
     .last_zlb = -DBL_MAX,
     .step_coef = 0.0,
@@ -33,6 +41,13 @@ void lagrangian_reset_stats(void) {
     lagr_last_stats.best_lb = INT_MIN;
     lagr_last_stats.gap = -1;
     lagr_last_stats.pool_mode = 0;
+    lagr_last_stats.warm_start_requested = 0;
+    lagr_last_stats.warm_start_accepted = 0;
+    lagr_last_stats.effort_level = 0;
+    lagr_last_stats.certification_requested = 0;
+    lagr_last_stats.iteration_limit = 0;
+    lagr_last_stats.portfolio_limit = 0;
+    lagr_last_stats.polish_node_limit = 0;
     lagr_last_stats.best_zlb = -DBL_MAX;
     lagr_last_stats.last_zlb = -DBL_MAX;
     lagr_last_stats.step_coef = 0.0;
@@ -2700,6 +2715,31 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
 
 }
 
+static void lagr_apply_certification_policy(
+    LagrangianConfig *cfg,
+    int effort_level,
+    bool certification_requested
+) {
+    /*
+     * Effort 2 is ordinarily a bounded strong heuristic, not an unconditional
+     * attempt to reproduce an exact solver. The large portfolio and bounded
+     * finish are reserved for a stopping state that has explicitly requested
+     * certification.
+     */
+    if (lagr_normalize_effort_level(effort_level) < 2 ||
+        certification_requested) {
+        return;
+    }
+
+    cfg->max_iter = 1000;
+    cfg->portfolio_enabled = 0;
+    cfg->portfolio_max_profiles = 1;
+    cfg->hybrid_bundle_portfolio = 0;
+    cfg->bundle_enabled = 0;
+    cfg->polish_node_limit = 400000;
+    cfg->polish_core_cap = 8000;
+}
+
 static int lagr_build_portfolio_configs(
     const LagrangianConfig *baseline,
     double deflection_alpha,
@@ -3454,7 +3494,10 @@ void solve_scp_lagrangian(
     const double weights[],
     int *solution,
     int *solmin,
-    int effort_level
+    int effort_level,
+    const int *initial_solution,
+    int initial_solmin,
+    bool certification_requested
 ) {
     if (solmin) *solmin = -1;
     lagr_stats_begin(ON_minterms, foundPI, 0);
@@ -3485,6 +3528,22 @@ void solve_scp_lagrangian(
         return;
     }
 
+    int warm_start_requested =
+        initial_solution != NULL && initial_solmin > 0;
+    int warm_start_accepted =
+        warm_start_requested &&
+        cover_is_feasible(
+            pichart,
+            foundPI,
+            ON_minterms,
+            initial_solution,
+            initial_solmin
+        );
+    if (!warm_start_accepted) {
+        initial_solution = NULL;
+        initial_solmin = 0;
+    }
+
     /* shrink the instance once; benefits every portfolio profile */
     presolve_dominated_columns(
         ON_minterms,
@@ -3498,6 +3557,11 @@ void solve_scp_lagrangian(
 
     LagrangianConfig baseline;
     lagr_config_for_effort(&baseline, effort_level);
+    lagr_apply_certification_policy(
+        &baseline,
+        effort_level,
+        certification_requested
+    );
     int portfolio_enabled = baseline.portfolio_enabled;
     double portfolio_deflection_alpha = baseline.portfolio_deflection_alpha;
 
@@ -3516,8 +3580,8 @@ void solve_scp_lagrangian(
         colsCoveringCount,
         weights,
         &baseline,
-        NULL,
-        0,
+        initial_solution,
+        initial_solmin,
         solution,
         solmin,
         NULL
@@ -3614,6 +3678,17 @@ void solve_scp_lagrangian(
     }
 
 cleanup:
+    lagr_last_stats.warm_start_requested = warm_start_requested;
+    lagr_last_stats.warm_start_accepted = warm_start_accepted;
+    lagr_last_stats.effort_level =
+        lagr_normalize_effort_level(effort_level);
+    lagr_last_stats.certification_requested =
+        certification_requested ? 1 : 0;
+    lagr_last_stats.iteration_limit = baseline.max_iter;
+    lagr_last_stats.portfolio_limit = baseline.portfolio_enabled
+        ? baseline.portfolio_max_profiles
+        : 1;
+    lagr_last_stats.polish_node_limit = baseline.polish_node_limit;
     free(candidate);
     free_adjacency(
         rowsCovered,
@@ -3634,7 +3709,10 @@ void solve_scp_lagrangian_pool(
     int *out_pool_count,
     int **pool_solutions,
     int *solmin,
-    int effort_level
+    int effort_level,
+    const int *initial_solution,
+    int initial_solmin,
+    bool certification_requested
 ) {
     if (solmin) *solmin = -1;
     lagr_stats_begin(ON_minterms, foundPI, 1);
@@ -3678,6 +3756,21 @@ void solve_scp_lagrangian_pool(
     }
 
     int rows = ON_minterms, cols = foundPI;
+    int warm_start_requested =
+        initial_solution != NULL && initial_solmin > 0;
+    int warm_start_accepted =
+        warm_start_requested &&
+        cover_is_feasible(
+            pichart,
+            cols,
+            rows,
+            initial_solution,
+            initial_solmin
+        );
+    if (!warm_start_accepted) {
+        initial_solution = NULL;
+        initial_solmin = 0;
+    }
 
     double *t = (double*)calloc((size_t)rows, sizeof(double));
     double *t_best = (double*)calloc((size_t)rows, sizeof(double));
@@ -3728,6 +3821,11 @@ void solve_scp_lagrangian_pool(
 
     LagrangianConfig cfg;
     lagr_config_for_effort(&cfg, effort_level);
+    lagr_apply_certification_policy(
+        &cfg,
+        effort_level,
+        certification_requested
+    );
     if (cfg.hybrid_bundle_portfolio) {
         cfg.bundle_enabled = 1;
     }
@@ -3893,7 +3991,7 @@ void solve_scp_lagrangian_pool(
         }
     }
 
-    if (sol_size == -1 && sol_size2 == -1) {
+    if (sol_size == -1 && sol_size2 == -1 && !warm_start_accepted) {
         free(t);
         free(t_best);
         free(rc);
@@ -3921,29 +4019,43 @@ void solve_scp_lagrangian_pool(
     double w1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
     double w2 = (sol_size2 != -1) ? solution_total_weight(sol_tmp2, sol_size2, weights) : -DBL_MAX;
 
-    double bestUB;
-    int bestTerms;
-    double bestWeight;
+    double bestUB = DBL_MAX;
+    int bestTerms = INT_MAX;
+    double bestWeight = -DBL_MAX;
 
-    if (
-        sol_size != -1 &&
-        (
-            sol_size2 == -1 ||
-            sol_size < sol_size2 ||
-            (
-                sol_size == sol_size2 && w1 >= w2
-            )
-        )
-    ) {
+    if (sol_size != -1) {
         bestUB = (double)sol_size;
         bestTerms = sol_size;
         bestWeight = w1;
         *solmin = sol_size;
-    } else {
+    }
+    if (
+        sol_size2 != -1 &&
+        (
+            sol_size2 < bestTerms ||
+            (sol_size2 == bestTerms && w2 > bestWeight + EPS)
+        )
+    ) {
         bestUB = (double)sol_size2;
         bestTerms = sol_size2;
         bestWeight = w2;
         *solmin = sol_size2;
+    }
+    if (warm_start_accepted) {
+        double initial_weight =
+            solution_total_weight(initial_solution, initial_solmin, weights);
+        if (
+            initial_solmin < bestTerms ||
+            (
+                initial_solmin == bestTerms &&
+                initial_weight > bestWeight + EPS
+            )
+        ) {
+            bestUB = (double)initial_solmin;
+            bestTerms = initial_solmin;
+            bestWeight = initial_weight;
+            *solmin = initial_solmin;
+        }
     }
 
     /* seed pool: add only minimal-len solutions */
@@ -3971,12 +4083,33 @@ void solve_scp_lagrangian_pool(
                 pool_add_if_new(pool_solutions, &pool_count, max_pool, norm, sol_size2);
             }
         }
+
+        if (warm_start_accepted) {
+            if (initial_solmin < pool_min_len) {
+                pool_clear(pool_solutions, &pool_count);
+                pool_min_len = initial_solmin;
+            }
+            if (initial_solmin == pool_min_len) {
+                pool_normalize(
+                    initial_solution,
+                    initial_solmin,
+                    norm
+                );
+                pool_add_if_new(
+                    pool_solutions,
+                    &pool_count,
+                    max_pool,
+                    norm,
+                    initial_solmin
+                );
+            }
+        }
     }
 
     double bestLB = -DBL_MAX;
 
     /* parameters */
-    const int max_iter = (cfg.max_iter > 5000) ? cfg.max_iter : 5000;
+    const int max_iter = cfg.max_iter;
     const int heur_every = cfg.heur_every;
     double step_coef = cfg.step_coef;
     const double step_min = cfg.step_min;
@@ -4500,6 +4633,15 @@ void solve_scp_lagrangian_pool(
         iterations,
         stop_reason
     );
+    lagr_last_stats.warm_start_requested = warm_start_requested;
+    lagr_last_stats.warm_start_accepted = warm_start_accepted;
+    lagr_last_stats.effort_level =
+        lagr_normalize_effort_level(effort_level);
+    lagr_last_stats.certification_requested =
+        certification_requested ? 1 : 0;
+    lagr_last_stats.iteration_limit = cfg.max_iter;
+    lagr_last_stats.portfolio_limit = 1;
+    lagr_last_stats.polish_node_limit = cfg.polish_node_limit;
 
     /* output */
     if (max_pool > 1 && out_pool_count) {

@@ -24,6 +24,13 @@ typedef struct {
     int best_lb;
     int gap;
     int pool_mode;
+    int warm_start_requested;
+    int warm_start_accepted;
+    int effort_level;
+    int certification_requested;
+    int iteration_limit;
+    int portfolio_limit;
+    long polish_node_limit;
     double best_zlb;
     double last_zlb;
     double step_coef;
@@ -45,8 +52,10 @@ void solve_scp_lagrangian(
     const double weights[], // can be NULL; higher is better (tie-break inside heuristics)
     int *solution,          // out column indices (0-based)
     int *solmin,            // out size (number of columns); -1 if infeasible
-    int effort_level        // 0 fastest, 1 stronger bound, 2 adaptive bundle portfolio
-                            // with bounded strong finish
+    int effort_level,       // 0 fastest, 1 stronger bound, 2 strong on demand
+    const int *initial_solution,
+    int initial_solmin,
+    bool certification_requested
 );
 
 void solve_scp_lagrangian_pool(
@@ -58,5 +67,8 @@ void solve_scp_lagrangian_pool(
     int *out_pool_count,
     int **pool_solutions,
     int *solmin,
-    int effort_level
+    int effort_level,
+    const int *initial_solution,
+    int initial_solmin,
+    bool certification_requested
 );

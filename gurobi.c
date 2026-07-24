@@ -7,6 +7,7 @@
 */
 
 #include "gurobi.h"
+#include "cover_validation.h"
 
 #ifdef HAVE_GUROBI
 
@@ -66,6 +67,8 @@ void gurobi_multiobjective(
     const int foundPI,
     const int ON_minterms,
     double weights[],        // the weights for each individual PI
+    const int *initial_solution,
+    int initial_solmin,
     int *indices,            // IDs of the selected prime implicants
     int *solmin              // no. of PIs covering the ON_minterms
 ) {
@@ -133,6 +136,27 @@ void gurobi_multiobjective(
             }
         }
         error = GRBaddconstr(model, nz, ind, coeffs, GRB_GREATER_EQUAL, 1.0, NULL);
+        if (error) goto QUIT;
+    }
+
+    if (cover_is_feasible(
+        pichart,
+        foundPI,
+        ON_minterms,
+        initial_solution,
+        initial_solmin
+    )) {
+        for (int j = 0; j < foundPI; ++j) coeffs[j] = 0.0;
+        for (int i = 0; i < initial_solmin; ++i) {
+            coeffs[initial_solution[i]] = 1.0;
+        }
+        error = GRBsetdblattrarray(
+            model,
+            GRB_DBL_ATTR_START,
+            0,
+            foundPI,
+            coeffs
+        );
         if (error) goto QUIT;
     }
 
@@ -219,6 +243,8 @@ void gurobi_solution_pool(
     const int ON_minterms,
     const int max_pool,      // maximum number of solutions to collect
     double weights[],        // the weights for each individual PI
+    const int *initial_solution,
+    int initial_solmin,
     int *pool_count,         // number of solutions returned (<= max_pool)
     int **pool_solutions,    // array of int* solutions
     int *solmin              // minimal number of PIs covering the ON_minterms
@@ -326,6 +352,27 @@ void gurobi_solution_pool(
             }
         }
         error = GRBaddconstr(model, nz, ind, coeffs, GRB_GREATER_EQUAL, 1.0, NULL);
+        if (error) goto QUIT;
+    }
+
+    if (cover_is_feasible(
+        pichart,
+        foundPI,
+        ON_minterms,
+        initial_solution,
+        initial_solmin
+    )) {
+        for (int j = 0; j < foundPI; ++j) coeffs[j] = 0.0;
+        for (int i = 0; i < initial_solmin; ++i) {
+            coeffs[initial_solution[i]] = 1.0;
+        }
+        error = GRBsetdblattrarray(
+            model,
+            GRB_DBL_ATTR_START,
+            0,
+            foundPI,
+            coeffs
+        );
         if (error) goto QUIT;
     }
 
@@ -482,6 +529,8 @@ void gurobi_multiobjective(
     const int foundPI,
     const int ON_minterms,
     double weights[],
+    const int *initial_solution,
+    int initial_solmin,
     int *indices,
     int *solmin
 ) {
@@ -489,6 +538,8 @@ void gurobi_multiobjective(
     (void)foundPI;
     (void)ON_minterms;
     (void)weights;
+    (void)initial_solution;
+    (void)initial_solmin;
     (void)indices;
     if (solmin) *solmin = 0;
 }
@@ -499,6 +550,8 @@ void gurobi_solution_pool(
     const int ON_minterms,
     const int max_pool,
     double weights[],
+    const int *initial_solution,
+    int initial_solmin,
     int *pool_count,
     int **pool_solutions,
     int *solmin
@@ -508,6 +561,8 @@ void gurobi_solution_pool(
     (void)ON_minterms;
     (void)max_pool;
     (void)weights;
+    (void)initial_solution;
+    (void)initial_solmin;
     (void)pool_solutions;
     if (pool_count) *pool_count = 0;
     if (solmin) *solmin = 0;

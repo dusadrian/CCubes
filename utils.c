@@ -148,12 +148,22 @@ void print_hybrid_stats(int output_index) {
 
         fprintf(
             debug_out,
-            "bestZLB=%.6f lastZLB=%.6f iterations=%d stop=%s%s\n",
+            "bestZLB=%.6f lastZLB=%.6f iterations=%d stop=%s%s "
+            "warm_start_requested=%d warm_start_accepted=%d "
+            "effort=%d certification_requested=%d iteration_limit=%d "
+            "portfolio_limit=%d polish_nodes=%ld\n",
             stats->best_zlb,
             stats->last_zlb,
             stats->iterations,
             lagrangian_stop_reason_name(stats->stop_reason),
-            stats->pool_mode ? " pool" : ""
+            stats->pool_mode ? " pool" : "",
+            stats->warm_start_requested,
+            stats->warm_start_accepted,
+            stats->effort_level,
+            stats->certification_requested,
+            stats->iteration_limit,
+            stats->portfolio_limit,
+            stats->polish_node_limit
         );
     }
 }
