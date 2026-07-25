@@ -889,26 +889,8 @@ int main(int argc, char *argv[]) {
         buffer[t]->threads = THREADS;
 
         for (int o = 0; o < noutputs; o++) {
-            int ON_minterms = PInfo[o].ON_minterms;
-            int pichart_words = PInfo[o].pichart_words;
-            buffer[t][o].pichart_values = (uint64_t*)calloc((size_t)ON_minterms * (size_t)pichart_words, sizeof(uint64_t));
-            buffer[t][o].coverage       = (bool*)    calloc((size_t)ON_minterms * (size_t)ON_minterms, sizeof(bool));
-            buffer[t][o].decpos         = (int*)     calloc((size_t)ON_minterms, sizeof(int));
-            buffer[t][o].covsum         = (int*)     calloc((size_t)ON_minterms, sizeof(int));
-            buffer[t][o].fixed_bits     = (uint64_t*)calloc((size_t)ON_minterms * (size_t)implicant_words, sizeof(uint64_t));
-            buffer[t][o].value_bits     = (uint64_t*)calloc((size_t)ON_minterms * (size_t)implicant_words, sizeof(uint64_t));
+            buffer[t][o].capacity       = 0;
             buffer[t][o].found          = 0;
-
-            if (
-                !buffer[t][o].pichart_values || !buffer[t][o].coverage ||
-                !buffer[t][o].decpos || !buffer[t][o].covsum ||
-                !buffer[t][o].fixed_bits || !buffer[t][o].value_bits
-            ) {
-                fprintf(stderr, "Error: buffer per-output alloc failed\n");
-                destroy_output_locks(output_locks, noutputs);
-                cleanup(PInfo, buffer);
-                return 1;
-            }
         }
     }
 

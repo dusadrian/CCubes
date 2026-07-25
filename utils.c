@@ -1486,7 +1486,6 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
         if (!buffer[t]) continue;
         for (int o = 0; o < noutputs; o++) {
             free(buffer[t][o].pichart_values);
-            free(buffer[t][o].coverage);
             free(buffer[t][o].decpos);
             free(buffer[t][o].covsum);
             free(buffer[t][o].fixed_bits);
@@ -1495,6 +1494,75 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
         free(buffer[t]);
     }
     if (buffer) free(buffer);
+}
+
+/*
+ * A worker retains only the candidates for its current position task.  The
+ * upper bound is the projected value-space size, not the full ON-set size.
+ */
+static bool ensure_thread_buffer_capacity(
+    ThreadBuffer *buffer,
+    int needed,
+    int pichart_words,
+    int implicant_words
+) {
+    if (!buffer || needed <= 0 || pichart_words <= 0 || implicant_words <= 0) {
+        return false;
+    }
+    if (buffer->capacity >= needed) return true;
+
+    int capacity = buffer->capacity > 0 ? buffer->capacity : 16;
+    while (capacity < needed) {
+        if (capacity > INT_MAX / 2) {
+            capacity = needed;
+            break;
+        }
+        capacity *= 2;
+    }
+
+    if (
+        (size_t)capacity > SIZE_MAX / (size_t)pichart_words ||
+        (size_t)capacity > SIZE_MAX / (size_t)implicant_words
+    ) {
+        return false;
+    }
+
+    uint64_t *pichart_values = (uint64_t*)calloc(
+        (size_t)capacity * (size_t)pichart_words,
+        sizeof(uint64_t)
+    );
+    int *decpos = (int*)calloc((size_t)capacity, sizeof(int));
+    int *covsum = (int*)calloc((size_t)capacity, sizeof(int));
+    uint64_t *fixed_bits = (uint64_t*)calloc(
+        (size_t)capacity * (size_t)implicant_words,
+        sizeof(uint64_t)
+    );
+    uint64_t *value_bits = (uint64_t*)calloc(
+        (size_t)capacity * (size_t)implicant_words,
+        sizeof(uint64_t)
+    );
+
+    if (!pichart_values || !decpos || !covsum || !fixed_bits || !value_bits) {
+        free(pichart_values);
+        free(decpos);
+        free(covsum);
+        free(fixed_bits);
+        free(value_bits);
+        return false;
+    }
+
+    free(buffer->pichart_values);
+    free(buffer->decpos);
+    free(buffer->covsum);
+    free(buffer->fixed_bits);
+    free(buffer->value_bits);
+    buffer->pichart_values = pichart_values;
+    buffer->decpos = decpos;
+    buffer->covsum = covsum;
+    buffer->fixed_bits = fixed_bits;
+    buffer->value_bits = value_bits;
+    buffer->capacity = capacity;
+    return true;
 }
 
 char *prefix_basename(const char *filepath, const char *prefix) {
@@ -1688,9 +1756,6 @@ int process_task(
         uint64_t *shifted_cov_mask = PInfo[o].shifted_cov_mask;
 
         ThreadBuffer *ts = &buffer[tid][o];
-        uint64_t *task_pichart_values = ts->pichart_values;
-        bool *task_coverage = ts->coverage;
-        int *task_found = &ts->found;
 
 
 
@@ -1719,6 +1784,21 @@ int process_task(
             space_size *= nofvalues[tempk[i]];
         }
         if (space_size < 1) space_size = 1;
+
+        int max_candidates = space_size < ON_minterms ? space_size : ON_minterms;
+        if (!ensure_thread_buffer_capacity(
+            ts,
+            max_candidates,
+            pichart_words,
+            implicant_words
+        )) {
+            free(decpos);
+            free(decneg);
+            fprintf(stderr, "Error: candidate buffer allocation failed\n");
+            return 1;
+        }
+        uint64_t *task_pichart_values = ts->pichart_values;
+        int *task_found = &ts->found;
 
         // Sum of mixed-radix bases (for normalizing decpos to 0..T-1 when values are 1..v)
         int mbase_sum = 0;
@@ -1900,14 +1980,10 @@ int process_task(
                 pichart_values[w] = 0ULL;
             }
 
-            bool coverage[ON_minterms];
             int covsum = 0;
             for (int r = 0; r < ON_minterms; r++) {
-                coverage[r] = decpos[r] == decpos[possible_rows[f]];
-                if (coverage[r]) {
+                if (decpos[r] == decpos[possible_rows[f]]) {
                     pichart_values[cov_word_index[r]] |= shifted_cov_mask[r];
-                    // TODO: store the index of the covered column somewhere
-                    // for a greedy algorithm if the SCP is too complex
                     covsum++;
                 }
             }
@@ -1918,10 +1994,6 @@ int process_task(
                 // the dereference operator in *task_found has precedence
                 // over the multiplication operator *
                 task_pichart_values[*task_found * pichart_words + w] = pichart_values[w];
-            }
-
-            for (int r = 0; r < ON_minterms; r++) {
-                task_coverage[*task_found * ON_minterms + r] = coverage[r];
             }
 
             ts->decpos[*task_found] = decpos[possible_rows[f]];

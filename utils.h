@@ -119,8 +119,8 @@ static inline PIChartView pi_chart_view(const PIstorage *pi) {
 
 typedef struct ThreadBuffer {
     int threads;
+    int capacity;
     uint64_t *pichart_values;
-    bool     *coverage;
     int      *decpos;
     int      *covsum;
     uint64_t *fixed_bits;

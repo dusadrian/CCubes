@@ -115,63 +115,38 @@ static void lagr_stats_finish(
     lagr_last_stats.stop_reason = stop_reason;
 }
 
-typedef struct {
-    const PIChartView *chart;
-    int rows;
-    int cols;
-    int *counts;
-} lagr_count_context;
-
-static void lagr_count_col_rows_worker(
-    uint64_t start,
-    uint64_t end,
-    uint64_t stride,
-    int worker_id,
-    int worker_count,
-    void *data
-) {
-    (void)worker_id;
-    (void)worker_count;
-    lagr_count_context *ctx = (lagr_count_context *)data;
-    for (uint64_t c0 = start; c0 < end; c0 += stride) {
-        int c = (int)c0;
-        int cnt = 0;
-        for (int r = 0; r < ctx->rows; ++r) {
-            cnt += chart_covers(ctx->chart, c, r) ? 1 : 0;
-        }
-        ctx->counts[c] = cnt;
-    }
+static int lagr_popcount64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_popcountll(x);
+#else
+    int n = 0;
+    while (x) { x &= x - 1; ++n; }
+    return n;
+#endif
 }
 
-static void lagr_count_row_cols_worker(
-    uint64_t start,
-    uint64_t end,
-    uint64_t stride,
-    int worker_id,
-    int worker_count,
-    void *data
-) {
-    (void)worker_id;
-    (void)worker_count;
-    lagr_count_context *ctx = (lagr_count_context *)data;
-    for (uint64_t r0 = start; r0 < end; r0 += stride) {
-        int r = (int)r0;
-        int cnt = 0;
-        for (int c = 0; c < ctx->cols; ++c) {
-            cnt += chart_covers(ctx->chart, c, r) ? 1 : 0;
-        }
-        ctx->counts[r] = cnt;
-    }
+static int lagr_ctz64(uint64_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzll(x);
+#else
+    int n = 0;
+    while ((x & UINT64_C(1)) == 0) { x >>= 1; ++n; }
+    return n;
+#endif
 }
 
 typedef struct {
     const PIChartView *chart;
     int rows;
     int cols;
-    int **out;
-} lagr_fill_context;
+    int *rows_covered_count;
+    int *thread_row_count;
+    int *thread_row_write;
+    int **rows_covered;
+    int **cols_covering;
+} lagr_adjacency_context;
 
-static void lagr_fill_rows_covered_worker(
+static void lagr_count_packed_adjacency_worker(
     uint64_t start,
     uint64_t end,
     uint64_t stride,
@@ -179,21 +154,27 @@ static void lagr_fill_rows_covered_worker(
     int worker_count,
     void *data
 ) {
-    (void)worker_id;
     (void)worker_count;
-    lagr_fill_context *ctx = (lagr_fill_context *)data;
+    lagr_adjacency_context *ctx = (lagr_adjacency_context *)data;
+    int *row_count = &ctx->thread_row_count[(size_t)worker_id * (size_t)ctx->rows];
     for (uint64_t c0 = start; c0 < end; c0 += stride) {
         int c = (int)c0;
-        int k = 0;
-        for (int r = 0; r < ctx->rows; ++r) {
-            if (chart_covers(ctx->chart, c, r)) {
-                ctx->out[c][k++] = r;
+        int count = 0;
+        const uint64_t *bits = &ctx->chart->bits[(size_t)c * (size_t)ctx->chart->words];
+        for (int w = 0; w < ctx->chart->words; ++w) {
+            uint64_t word = bits[w];
+            count += lagr_popcount64(word);
+            while (word) {
+                int row = w * ctx->chart->cov_bits + lagr_ctz64(word);
+                if (row < ctx->rows) ++row_count[row];
+                word &= word - 1;
             }
         }
+        ctx->rows_covered_count[c] = count;
     }
 }
 
-static void lagr_fill_cols_covering_worker(
+static void lagr_fill_packed_adjacency_worker(
     uint64_t start,
     uint64_t end,
     uint64_t stride,
@@ -201,15 +182,22 @@ static void lagr_fill_cols_covering_worker(
     int worker_count,
     void *data
 ) {
-    (void)worker_id;
     (void)worker_count;
-    lagr_fill_context *ctx = (lagr_fill_context *)data;
-    for (uint64_t r0 = start; r0 < end; r0 += stride) {
-        int r = (int)r0;
-        int k = 0;
-        for (int c = 0; c < ctx->cols; ++c) {
-            if (chart_covers(ctx->chart, c, r)) {
-                ctx->out[r][k++] = c;
+    lagr_adjacency_context *ctx = (lagr_adjacency_context *)data;
+    int *row_write = &ctx->thread_row_write[(size_t)worker_id * (size_t)ctx->rows];
+    for (uint64_t c0 = start; c0 < end; c0 += stride) {
+        int c = (int)c0;
+        int row_pos = 0;
+        const uint64_t *bits = &ctx->chart->bits[(size_t)c * (size_t)ctx->chart->words];
+        for (int w = 0; w < ctx->chart->words; ++w) {
+            uint64_t word = bits[w];
+            while (word) {
+                int row = w * ctx->chart->cov_bits + lagr_ctz64(word);
+                if (row < ctx->rows) {
+                    ctx->rows_covered[c][row_pos++] = row;
+                    ctx->cols_covering[row][row_write[row]++] = c;
+                }
+                word &= word - 1;
             }
         }
     }
@@ -304,35 +292,55 @@ static int build_adjacency(
 ) {
     int **rc = NULL, *rcc = NULL;
     int **cr = NULL, *crc = NULL;
+    int *thread_row_count = NULL;
+    int *thread_row_write = NULL;
+    int threads = ccubes_thread_count();
+
+    if (!chart || !chart->bits || rows <= 0 || cols <= 0 ||
+        chart->rows != rows || chart->cols != cols || chart->words <= 0 ||
+        chart->cov_bits <= 0 || chart->cov_bits > 64) {
+        return -1;
+    }
+    if (threads > cols) threads = cols;
+    if (threads < 1) threads = 1;
+    if ((size_t)rows > SIZE_MAX / (size_t)threads) goto oom;
 
     rcc = (int*)calloc((size_t)cols, sizeof(int));
     crc = (int*)calloc((size_t)rows, sizeof(int));
-    if (!rcc || !crc) goto oom;
+    thread_row_count = (int*)calloc((size_t)threads * (size_t)rows, sizeof(int));
+    thread_row_write = (int*)calloc((size_t)threads * (size_t)rows, sizeof(int));
+    if (!rcc || !crc || !thread_row_count || !thread_row_write) goto oom;
 
-    lagr_count_context count_cols = {
+    lagr_adjacency_context adjacency = {
         .chart = chart,
         .rows = rows,
         .cols = cols,
-        .counts = rcc
+        .rows_covered_count = rcc,
+        .thread_row_count = thread_row_count,
+        .thread_row_write = thread_row_write,
+        .rows_covered = NULL,
+        .cols_covering = NULL
     };
-    if (!ccubes_parallel_for(0, (uint64_t)cols, ccubes_thread_count(), false, lagr_count_col_rows_worker, &count_cols)) {
+    if (!ccubes_parallel_for(0, (uint64_t)cols, threads, false, lagr_count_packed_adjacency_worker, &adjacency)) {
         goto oom;
     }
 
-    lagr_count_context count_rows = {
-        .chart = chart,
-        .rows = rows,
-        .cols = cols,
-        .counts = crc
-    };
-    if (!ccubes_parallel_for(0, (uint64_t)rows, ccubes_thread_count(), false, lagr_count_row_cols_worker, &count_rows)) {
-        goto oom;
+    for (int r = 0; r < rows; ++r) {
+        int offset = 0;
+        for (int t = 0; t < threads; ++t) {
+            size_t index = (size_t)t * (size_t)rows + (size_t)r;
+            thread_row_write[index] = offset;
+            offset += thread_row_count[index];
+        }
+        crc[r] = offset;
     }
 
     for (int r = 0; r < rows; ++r) {
         if (crc[r] == 0) {
             free(rcc);
             free(crc);
+            free(thread_row_count);
+            free(thread_row_write);
             return -2;
         }
     }
@@ -350,25 +358,14 @@ static int build_adjacency(
         if (crc[r] > 0 && !cr[r]) goto oom;
     }
 
-    lagr_fill_context fill_rows = {
-        .chart = chart,
-        .rows = rows,
-        .cols = cols,
-        .out = rc
-    };
-    if (!ccubes_parallel_for(0, (uint64_t)cols, ccubes_thread_count(), false, lagr_fill_rows_covered_worker, &fill_rows)) {
+    adjacency.rows_covered = rc;
+    adjacency.cols_covering = cr;
+    if (!ccubes_parallel_for(0, (uint64_t)cols, threads, false, lagr_fill_packed_adjacency_worker, &adjacency)) {
         goto oom;
     }
 
-    lagr_fill_context fill_cols = {
-        .chart = chart,
-        .rows = rows,
-        .cols = cols,
-        .out = cr
-    };
-    if (!ccubes_parallel_for(0, (uint64_t)rows, ccubes_thread_count(), false, lagr_fill_cols_covering_worker, &fill_cols)) {
-        goto oom;
-    }
+    free(thread_row_count);
+    free(thread_row_write);
 
     *rowsCovered = rc;
     *rowsCoveredCount = rcc;
@@ -377,6 +374,8 @@ static int build_adjacency(
     return 0;
 
 oom: // out of memory
+    free(thread_row_count);
+    free(thread_row_write);
     if (rc) {
         for (int c = 0; c < cols; ++c) free(rc[c]);
         free(rc);
@@ -1718,16 +1717,6 @@ typedef struct {
     PolishMask full_mask;         /* all rows covered */
     int mask_words;               /* words of col_mask/full_mask actually in use */
 } PolishSearch;
-
-static int lagr_popcount64(uint64_t x) {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_popcountll(x);
-#else
-    int n = 0;
-    while (x) { x &= x - 1; ++n; }
-    return n;
-#endif
-}
 
 static bool polish_candidate_better(const PolishCandidate *a, const PolishCandidate *b) {
     if (a->new_cover != b->new_cover) return a->new_cover > b->new_cover;
