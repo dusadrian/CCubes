@@ -11,37 +11,36 @@
 #include <stddef.h>
 
 bool cover_is_feasible(
-    const int pichart[],
-    int cols,
-    int rows,
+    const PIChartView *chart,
     const int solution[],
     int solution_size
 ) {
     if (
-        !pichart ||
-        cols <= 0 ||
-        rows <= 0 ||
+        !chart ||
+        !chart->bits ||
+        chart->cols <= 0 ||
+        chart->rows <= 0 ||
+        chart->cov_bits <= 0 ||
         !solution ||
         solution_size <= 0 ||
-        solution_size > cols
+        solution_size > chart->cols
     ) {
         return false;
     }
 
     for (int i = 0; i < solution_size; ++i) {
         int col = solution[i];
-        if (col < 0 || col >= cols) return false;
+        if (col < 0 || col >= chart->cols) return false;
 
         for (int j = 0; j < i; ++j) {
             if (solution[j] == col) return false;
         }
     }
 
-    for (int row = 0; row < rows; ++row) {
+    for (int row = 0; row < chart->rows; ++row) {
         bool covered = false;
         for (int i = 0; i < solution_size && !covered; ++i) {
-            int col = solution[i];
-            covered = pichart[(size_t)col * (size_t)rows + (size_t)row] != 0;
+            covered = chart_covers(chart, solution[i], row);
         }
         if (!covered) return false;
     }

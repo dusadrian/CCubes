@@ -622,10 +622,14 @@ int main(int argc, char *argv[]) {
 
     uint64_t VALUE_BIT_MASK = (1ULL << value_bit_width) - 1ULL;
 
-    // Ensure pichart_words are aligned with BITS_PER_WORD (already set on load for resume)
-    PInfo[0].pichart_words = (PInfo[0].ON_minterms + BITS_PER_WORD - 1) / BITS_PER_WORD;
+    // Ensure pichart_words are aligned with the coverage packing width
+    // (already set on load for resume)
+    const int COV_BITS_PER_WORD = coverage_bits_per_word(BITS_PER_WORD);
+    PInfo[0].pichart_words = (PInfo[0].ON_minterms + COV_BITS_PER_WORD - 1) / COV_BITS_PER_WORD;
+    PInfo[0].cov_bits = COV_BITS_PER_WORD;
     for (int o = 0; o < noutputs; o++) {
-        PInfo[o].pichart_words = (PInfo[o].ON_minterms + BITS_PER_WORD - 1) / BITS_PER_WORD;
+        PInfo[o].pichart_words = (PInfo[o].ON_minterms + COV_BITS_PER_WORD - 1) / COV_BITS_PER_WORD;
+        PInfo[o].cov_bits = COV_BITS_PER_WORD;
     }
 
 
@@ -695,16 +699,8 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        if (!PInfo[o].pichart) {
-            PInfo[o].pichart = (int *) calloc(PInfo[o].estimPI * ON_minterms, sizeof(int));
-            if (!PInfo[o].pichart) {
-                fprintf(stderr, "Error: Memory allocation failed for pichart\n");
-                cleanup(PInfo, buffer);
-                return 1;
-            }
-        }
-
-        PInfo[o].pichart_words = (ON_minterms + BITS_PER_WORD - 1) / BITS_PER_WORD; // Words needed per coverage matrix columns
+        PInfo[o].pichart_words = (ON_minterms + COV_BITS_PER_WORD - 1) / COV_BITS_PER_WORD; // Words needed per coverage matrix columns
+        PInfo[o].cov_bits = COV_BITS_PER_WORD;
         if (!PInfo[o].pichart_pos) {
             PInfo[o].pichart_pos = (uint64_t *) calloc(PInfo[o].estimPI * PInfo[o].pichart_words, sizeof(uint64_t));
             if (!PInfo[o].pichart_pos) {
@@ -763,8 +759,8 @@ int main(int argc, char *argv[]) {
         }
 
         for (int r = 0; r < ON_minterms; r++) {
-            PInfo[o].cov_word_index[r] = r / BITS_PER_WORD;
-            PInfo[o].shifted_cov_mask[r] = (1ULL << (r % BITS_PER_WORD));
+            PInfo[o].cov_word_index[r] = r / COV_BITS_PER_WORD;
+            PInfo[o].shifted_cov_mask[r] = (1ULL << (r % COV_BITS_PER_WORD));
         }
 
         // If resuming, restore stop counter from checkpoint
@@ -1151,13 +1147,16 @@ int main(int argc, char *argv[]) {
                 int *foundPI = &PInfo[o].foundPI;
                 bool *ON_set_covered = &PInfo[o].ON_set_covered;
                 int ON_minterms = PInfo[o].ON_minterms;
-                int *pichart = PInfo[o].pichart;
                 int *prevsolmin = &PInfo[o].prevsolmin;
                 int *solmin = &PInfo[o].solmin;
                 int *previndices = PInfo[o].previndices;
                 int *indices = PInfo[o].indices;
 
                 PInfo[o].nofpi[k - 1] = *foundPI; // TODO move this after checking the coverage at this level of k
+
+                /* built here: pichart_pos may have been reallocated during
+                   this level's generation, and foundPI is now final for k */
+                const PIChartView chart = pi_chart_view(&PInfo[o]);
 
                 if (*foundPI > 0 && !*ON_set_covered) {
                     bool test_coverage = true;
@@ -1169,7 +1168,7 @@ int main(int argc, char *argv[]) {
                         int c = 0;
 
                         while (c < *foundPI && !minterm_covered) {
-                            minterm_covered = pichart[c * ON_minterms + r];
+                            minterm_covered = chart_covers(&chart, c, r);
                             c++;
                         }
 
@@ -1220,9 +1219,7 @@ int main(int argc, char *argv[]) {
                                 ? previndices
                                 : NULL;
                         solve_scp_lagrangian(
-                            pichart,
-                            *foundPI,
-                            ON_minterms,
+                            &chart,
                             weights,
                             indices,
                             solmin,
@@ -1237,9 +1234,7 @@ int main(int argc, char *argv[]) {
 
                     if (SCP_TYPE == 1) { // Gurobi: blended multi-objective
                         gurobi_multiobjective(
-                            pichart,
-                            *foundPI,
-                            ON_minterms,
+                            &chart,
                             weights,
                             *prevsolmin > 0 &&
                                 *prevsolmin <= ON_minterms
@@ -1411,12 +1406,15 @@ int main(int argc, char *argv[]) {
                 int *foundPI = &PInfo[o].foundPI;
                 bool *ON_set_covered = &PInfo[o].ON_set_covered;
                 int ON_minterms = PInfo[o].ON_minterms;
-                int *pichart = PInfo[o].pichart;
                 int *solmin = &PInfo[o].solmin;
                 int *pool_count = &PInfo[o].pool_count;
                 int **pool_solutions = PInfo[o].pool_solutions;
 
                 PInfo[o].nofpi[k - 1] = *foundPI;
+
+                /* built here: pichart_pos may have been reallocated during
+                   this level's generation, and foundPI is now final for k */
+                const PIChartView chart = pi_chart_view(&PInfo[o]);
 
                 if (*foundPI > 0 && !*ON_set_covered) {
                     bool test_coverage = true;
@@ -1428,7 +1426,7 @@ int main(int argc, char *argv[]) {
                         int c = 0;
 
                         while (c < *foundPI && !minterm_covered) {
-                            minterm_covered = pichart[c * ON_minterms + r];
+                            minterm_covered = chart_covers(&chart, c, r);
                             c++;
                         }
 
@@ -1480,9 +1478,7 @@ int main(int argc, char *argv[]) {
 
                     if (SCP_TYPE == 0) { // Bundled hybrid solver with solution pool
                         solve_scp_lagrangian_pool(
-                            pichart,
-                            *foundPI,
-                            ON_minterms,
+                            &chart,
                             weights,
                             pool_limit,
                             pool_count,
@@ -1506,9 +1502,7 @@ int main(int argc, char *argv[]) {
 
                     if (SCP_TYPE == 1) { // Gurobi: solution pool
                         gurobi_solution_pool(
-                            pichart,
-                            *foundPI,
-                            ON_minterms,
+                            &chart,
                             pool_limit,
                             weights,
                             PInfo[o].prevsolmin > 0 &&

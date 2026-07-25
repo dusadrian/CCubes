@@ -13,7 +13,8 @@
 #include <string.h>
 
 #define CK_MAGIC "CCCHKv1"  // 7 chars + \0
-#define CK_VERSION 6u
+/* v7: the dense int PI chart is gone; coverage lives only in pichart_pos */
+#define CK_VERSION 7u
 
 static int write_bytes(FILE *f, const void *buf, size_t len) {
     return fwrite(buf, 1, len, f) == len ? 0 : -1;
@@ -164,7 +165,6 @@ int save_checkpoint(
         if (write_bytes(f, pi->covered, fp * sizeof(int)) < 0) goto FAIL;
         if (write_bytes(f, pi->last_index, onm * sizeof(int)) < 0) goto FAIL;
         if (write_bytes(f, pi->k_last_index, onm * sizeof(int)) < 0) goto FAIL;
-        if (write_bytes(f, pi->pichart, fp * onm * sizeof(int)) < 0) goto FAIL;
         if (write_bytes(f, pi->pichart_pos, fp * pcw * sizeof(uint64_t)) < 0) goto FAIL;
         if (write_bytes(f, pi->implicants_pos, fp * ipw * sizeof(uint64_t)) < 0) goto FAIL;
         if (write_bytes(f, pi->implicants_val, fp * ipw * sizeof(uint64_t)) < 0) goto FAIL;
@@ -284,7 +284,6 @@ int load_checkpoint(
         pi[o].covered = NULL;
         pi[o].last_index = NULL;
         pi[o].k_last_index = NULL;
-        pi[o].pichart = NULL;
         pi[o].pichart_pos = NULL;
         pi[o].implicants_pos = NULL;
         pi[o].implicants_val = NULL;
@@ -312,7 +311,11 @@ int load_checkpoint(
         po->ON_set_covered = (flags & 2) != 0;
         po->inputs = (int)ni;
         po->outputs = (int)no;
-        po->pichart_words = (po->ON_minterms + (*bits_per_word) - 1) / (*bits_per_word);
+        {
+            int cov_bits = coverage_bits_per_word(*bits_per_word);
+            po->pichart_words = (po->ON_minterms + cov_bits - 1) / cov_bits;
+            po->cov_bits = cov_bits;
+        }
 
         po->nofpi = (int*)calloc((size_t)ni, sizeof(int));
         if (!po->nofpi) goto READ_FAIL;
@@ -334,7 +337,6 @@ int load_checkpoint(
         po->covered = (int*)calloc(fp, sizeof(int));
         po->last_index = (int*)calloc(onm, sizeof(int));
         po->k_last_index = (int*)calloc(onm, sizeof(int));
-        po->pichart = (int*)calloc(fp * onm, sizeof(int));
         po->pichart_pos = (uint64_t*)calloc(fp * pcw, sizeof(uint64_t));
         po->implicants_pos = (uint64_t*)calloc(fp * ipw_s, sizeof(uint64_t));
         po->implicants_val = (uint64_t*)calloc(fp * ipw_s, sizeof(uint64_t));
@@ -350,7 +352,6 @@ int load_checkpoint(
                 fp &&
                 (
                     !po->covered ||
-                    !po->pichart ||
                     !po->pichart_pos ||
                     !po->implicants_pos ||
                     !po->implicants_val ||
@@ -369,7 +370,6 @@ int load_checkpoint(
         if (read_bytes(f, po->covered, fp * sizeof(int)) < 0) goto READ_FAIL;
         if (read_bytes(f, po->last_index, onm * sizeof(int)) < 0) goto READ_FAIL;
         if (read_bytes(f, po->k_last_index, onm * sizeof(int)) < 0) goto READ_FAIL;
-        if (read_bytes(f, po->pichart, fp * onm * sizeof(int)) < 0) goto READ_FAIL;
         if (read_bytes(f, po->pichart_pos, fp * pcw * sizeof(uint64_t)) < 0) goto READ_FAIL;
         if (read_bytes(f, po->implicants_pos, fp * ipw_s * sizeof(uint64_t)) < 0) goto READ_FAIL;
         if (read_bytes(f, po->implicants_val, fp * ipw_s * sizeof(uint64_t)) < 0) goto READ_FAIL;
@@ -442,7 +442,6 @@ READ_FAIL:
         free(pi[o].covered);
         free(pi[o].last_index);
         free(pi[o].k_last_index);
-        free(pi[o].pichart);
         free(pi[o].pichart_pos);
         free(pi[o].implicants_pos);
         free(pi[o].implicants_val);

@@ -257,8 +257,9 @@ static int first_covered_row(
     int idx
 ) {
     int rows = pi->ON_minterms;
+    const PIChartView chart = pi_chart_view(pi);
     for (int r = 0; r < rows; ++r) {
-        if (pi->pichart[(size_t)idx * (size_t)rows + (size_t)r]) return r;
+        if (chart_covers(&chart, idx, r)) return r;
     }
 
     return rows;
@@ -596,11 +597,6 @@ static void copy_pi_record(
     if (dst == src) return;
 
     memmove(
-        &pi->pichart[(size_t)dst * (size_t)pi->ON_minterms],
-        &pi->pichart[(size_t)src * (size_t)pi->ON_minterms],
-        (size_t)pi->ON_minterms * sizeof(int)
-    );
-    memmove(
         &pi->pichart_pos[(size_t)dst * (size_t)pi->pichart_words],
         &pi->pichart_pos[(size_t)src * (size_t)pi->pichart_words],
         (size_t)pi->pichart_words * sizeof(uint64_t)
@@ -765,11 +761,9 @@ int canonicalize_pi_order(
         return rebuild_pi_buckets(pi, level_start);
     }
 
-    int rows = pi->ON_minterms;
     int pichart_words = pi->pichart_words;
 
     int *order = (int *)malloc((size_t)n * sizeof(int));
-    int *tmp_pichart = (int *)malloc((size_t)n * (size_t)rows * sizeof(int));
     uint64_t *tmp_pichart_pos = (uint64_t *)malloc((size_t)n * (size_t)pichart_words * sizeof(uint64_t));
     uint64_t *tmp_implicants_pos = (uint64_t *)malloc((size_t)n * (size_t)implicant_words * sizeof(uint64_t));
     uint64_t *tmp_implicants_val = (uint64_t *)malloc((size_t)n * (size_t)implicant_words * sizeof(uint64_t));
@@ -778,7 +772,6 @@ int canonicalize_pi_order(
 
     if (
         !order ||
-        !tmp_pichart ||
         !tmp_pichart_pos ||
         !tmp_implicants_pos ||
         !tmp_implicants_val ||
@@ -786,7 +779,6 @@ int canonicalize_pi_order(
         !tmp_covsum
     ) {
         free(order);
-        free(tmp_pichart);
         free(tmp_pichart_pos);
         free(tmp_implicants_pos);
         free(tmp_implicants_val);
@@ -807,11 +799,6 @@ int canonicalize_pi_order(
         int src = order[dst];
 
         memcpy(
-            &tmp_pichart[(size_t)dst * (size_t)rows],
-            &pi->pichart[(size_t)src * (size_t)rows],
-            (size_t)rows * sizeof(int)
-        );
-        memcpy(
             &tmp_pichart_pos[(size_t)dst * (size_t)pichart_words],
             &pi->pichart_pos[(size_t)src * (size_t)pichart_words],
             (size_t)pichart_words * sizeof(uint64_t)
@@ -831,11 +818,6 @@ int canonicalize_pi_order(
         tmp_covsum[dst] = pi->covsum[src];
     }
 
-    memcpy(
-        &pi->pichart[(size_t)level_start * (size_t)rows],
-        tmp_pichart,
-        (size_t)n * (size_t)rows * sizeof(int)
-    );
     memcpy(
         &pi->pichart_pos[(size_t)level_start * (size_t)pichart_words],
         tmp_pichart_pos,
@@ -863,7 +845,6 @@ int canonicalize_pi_order(
     );
 
     free(order);
-    free(tmp_pichart);
     free(tmp_pichart_pos);
     free(tmp_implicants_pos);
     free(tmp_implicants_val);
@@ -1472,7 +1453,6 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
         free(PInfo[o].covered);
         free(PInfo[o].last_index);
         free(PInfo[o].k_last_index);
-        free(PInfo[o].pichart);
         free(PInfo[o].pichart_pos);
         free(PInfo[o].implicants_pos);
         free(PInfo[o].implicants_val);
@@ -2113,7 +2093,6 @@ int process_task(
 
                     int *covered = PInfo[o].covered;
                     uint64_t *pichart_pos = PInfo[o].pichart_pos;
-                    int *pichart = PInfo[o].pichart;
                     uint64_t *implicants_pos = PInfo[o].implicants_pos;
                     uint64_t *implicants_val = PInfo[o].implicants_val;
                     int *estimPI = &PInfo[o].estimPI;
@@ -2148,7 +2127,6 @@ int process_task(
 
                     // Ensure capacity before writing the next PI
                     if ((*foundPI + 1) > *estimPI) {
-                        resize((void**)&pichart,        TYPE_INT,    increase, *estimPI, ON_minterms);
                         resize((void**)&pichart_pos,    TYPE_UINT64, increase, *estimPI, pichart_words);
                         resize((void**)&implicants_pos, TYPE_UINT64, increase, *estimPI, implicant_words);
                         resize((void**)&implicants_val, TYPE_UINT64, increase, *estimPI, implicant_words);
@@ -2157,7 +2135,6 @@ int process_task(
                         resize((void**)&covered,        TYPE_INT,    increase, *estimPI, 1);
 
                         // Update the PInfo structure pointers after resize
-                        PInfo[o].pichart = pichart;
                         PInfo[o].pichart_pos = pichart_pos;
                         PInfo[o].implicants_pos = implicants_pos;
                         PInfo[o].implicants_val = implicants_val;
@@ -2180,13 +2157,11 @@ int process_task(
                         implicants_val[(*foundPI) * implicant_words + w] = buffer[tid][o].value_bits[f * implicant_words + w];
                     }
 
-                    // populate the coverage matrix
-                    for (int r = 0; r < ON_minterms; r++) {
-                        for (int w = 0; w < pichart_words; w++) {
-                            pichart_pos[(*foundPI) * pichart_words + w] = buffer[tid][o].pichart_values[f * pichart_words + w];
-                        }
-
-                        pichart[(*foundPI) * ON_minterms + r] = buffer[tid][o].coverage[f * ON_minterms + r];
+                    // populate the coverage matrix (bit-packed; one copy,
+                    // not one per row as the dense chart used to require)
+                    for (int w = 0; w < pichart_words; w++) {
+                        pichart_pos[(*foundPI) * pichart_words + w] =
+                            buffer[tid][o].pichart_values[f * pichart_words + w];
                     }
 
                     shared[*foundPI] = shared_count[u] - 1;

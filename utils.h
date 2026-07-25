@@ -12,6 +12,20 @@
 
 #include "debug.h"
 #include "ccubes_threads.h"
+#include "pichart_view.h"
+
+/*
+ * Coverage bitsets (pichart_pos, and the per-thread pichart_values feeding
+ * them) are stored in uint64_t words, so the number of coverage bits packed
+ * per word can never exceed 64 -- shifting a uint64_t by 64 or more is
+ * undefined behaviour, and on arm64 the shift count wraps modulo 64, which
+ * silently aliases row r onto row r-64. The -b switch selects the *implicant*
+ * packing width and is allowed to be 128, so coverage packing must be clamped
+ * independently of it.
+ */
+static inline int coverage_bits_per_word(int bits_per_word) {
+    return bits_per_word > 64 ? 64 : bits_per_word;
+}
 
 void error_message(const char *msg);
 
@@ -61,6 +75,7 @@ typedef struct {
     int OFF_minterms;
 
     int pichart_words;
+    int cov_bits;       // coverage bits packed per pichart_pos word (<= 64)
     int estimPI;
     int foundPI;
     int solmin;
@@ -74,7 +89,6 @@ typedef struct {
     int      *covered;
     int      *last_index;
     int      *k_last_index; // continued at each k
-    int      *pichart;
     uint64_t *pichart_pos;
     uint64_t *implicants_pos;
     uint64_t *implicants_val;
@@ -91,6 +105,17 @@ typedef struct {
     int pool_count;
     int **pool_solutions;
 } PIstorage;
+
+/* Bit-packed chart view over the first `foundPI` columns of an output. */
+static inline PIChartView pi_chart_view(const PIstorage *pi) {
+    PIChartView view;
+    view.bits = pi->pichart_pos;
+    view.words = pi->pichart_words;
+    view.cov_bits = pi->cov_bits;
+    view.rows = pi->ON_minterms;
+    view.cols = pi->foundPI;
+    return view;
+}
 
 typedef struct ThreadBuffer {
     int threads;

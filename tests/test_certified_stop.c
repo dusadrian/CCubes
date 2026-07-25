@@ -19,11 +19,12 @@ static void test_pool_avoids_tied_cover_warning(void) {
         1, 1, 1
     };
     int off_set[3] = {0, 1, 1};
-    int pichart[16] = {
-        1, 1, 0, 0, /* c0 */
-        0, 0, 1, 1, /* c1 */
-        1, 0, 0, 1, /* c2 */
-        0, 1, 1, 0  /* c3 */
+    /* bit-packed, one word per column; bit r = row r */
+    uint64_t pichart_pos[4] = {
+        0x3u, /* c0: rows 0,1 */
+        0xCu, /* c1: rows 2,3 */
+        0x9u, /* c2: rows 0,3 */
+        0x6u  /* c3: rows 1,2 */
     };
     int warning_cover[2] = {0, 1};
     int safe_cover[2] = {2, 3};
@@ -37,7 +38,9 @@ static void test_pool_avoids_tied_cover_warning(void) {
     pi.ON_set = on_set;
     pi.OFF_set = off_set;
     pi.foundPI = 4;
-    pi.pichart = pichart;
+    pi.pichart_pos = pichart_pos;
+    pi.pichart_words = 1;
+    pi.cov_bits = 64;
     pi.solmin = 2;
     pi.pool_count = 2;
     pi.pool_solutions = pool;
@@ -83,33 +86,33 @@ static void make_delayed_pair(
     int ninputs,
     int *on_set,
     int *off_set,
-    int *pichart
+    uint64_t *pichart_pos
 ) {
     memset(pi, 0, sizeof(*pi));
     memset(on_set, 0, (size_t)(2 * ninputs) * sizeof(*on_set));
     memset(off_set, 0, (size_t)ninputs * sizeof(*off_set));
     on_set[ninputs] = 1; /* The two ON rows disagree only at input 0. */
     off_set[1] = 1;      /* Excludes the OFF row from their supercube. */
-    pichart[0] = 1;
-    pichart[1] = 0;
-    pichart[2] = 0;
-    pichart[3] = 1;
+    pichart_pos[0] = 0x1u; /* c0: row 0 */
+    pichart_pos[1] = 0x2u; /* c1: row 1 */
     pi->ON_minterms = 2;
     pi->OFF_minterms = 1;
     pi->ON_set = on_set;
     pi->OFF_set = off_set;
     pi->foundPI = 2;
-    pi->pichart = pichart;
+    pi->pichart_pos = pichart_pos;
+    pi->pichart_words = 1;
+    pi->cov_bits = 64;
     pi->solmin = 2;
 }
 
 static void test_unaffordable_adaptive_warning_stops(void) {
     int on_set[60];
     int off_set[30];
-    int pichart[4];
+    uint64_t pichart_pos[2];
     int selected[2] = {0, 1};
     PIstorage pi;
-    make_delayed_pair(&pi, 30, on_set, off_set, pichart);
+    make_delayed_pair(&pi, 30, on_set, off_set, pichart_pos);
 
     uint64_t estimate = 0;
     assert(!certified_stop_adaptive_work_within_limit(
@@ -165,10 +168,10 @@ static void test_unaffordable_adaptive_warning_stops(void) {
 static void test_affordable_warning_still_certifies(void) {
     int on_set[10];
     int off_set[5];
-    int pichart[4];
+    uint64_t pichart_pos[2];
     int selected[2] = {0, 1};
     PIstorage pi;
-    make_delayed_pair(&pi, 5, on_set, off_set, pichart);
+    make_delayed_pair(&pi, 5, on_set, off_set, pichart_pos);
 
     uint64_t estimate = 0;
     assert(certified_stop_adaptive_work_within_limit(

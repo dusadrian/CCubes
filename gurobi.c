@@ -63,15 +63,15 @@ bool gurobi_license_is_valid(void) {
 }
 
 void gurobi_multiobjective(
-    int pichart[],
-    const int foundPI,
-    const int ON_minterms,
+    const PIChartView *chart,
     double weights[],        // the weights for each individual PI
     const int *initial_solution,
     int initial_solmin,
     int *indices,            // IDs of the selected prime implicants
     int *solmin              // no. of PIs covering the ON_minterms
 ) {
+    const int foundPI = chart ? chart->cols : 0;
+    const int ON_minterms = chart ? chart->rows : 0;
     int error = 0;
     GRBenv      *env        = NULL;
     GRBmodel    *model      = NULL;
@@ -129,7 +129,7 @@ void gurobi_multiobjective(
     for (int i = 0; i < ON_minterms; i++) {
         int nz = 0;
         for (int j = 0; j < foundPI; j++) {
-            if (pichart[i + ON_minterms * j] == 1) {
+            if (chart_covers(chart, j, i)) {
                 ind[nz] = j;
                 coeffs[nz] = 1.0;  // reuse coeffs[] as row coefficients
                 nz++;
@@ -140,9 +140,7 @@ void gurobi_multiobjective(
     }
 
     if (cover_is_feasible(
-        pichart,
-        foundPI,
-        ON_minterms,
+        chart,
         initial_solution,
         initial_solmin
     )) {
@@ -238,9 +236,7 @@ void gurobi_multiobjective(
 
 
 void gurobi_solution_pool(
-    int pichart[],
-    const int foundPI,
-    const int ON_minterms,
+    const PIChartView *chart,
     const int max_pool,      // maximum number of solutions to collect
     double weights[],        // the weights for each individual PI
     const int *initial_solution,
@@ -249,6 +245,8 @@ void gurobi_solution_pool(
     int **pool_solutions,    // array of int* solutions
     int *solmin              // minimal number of PIs covering the ON_minterms
 ) {
+    const int foundPI = chart ? chart->cols : 0;
+    const int ON_minterms = chart ? chart->rows : 0;
     int error = 0;
     GRBenv      *env        = NULL;
     GRBenv      *menv       = NULL; // model's env (for SolutionNumber)
@@ -260,7 +258,8 @@ void gurobi_solution_pool(
     if (pool_count) *pool_count = 0;
     if (solmin) *solmin = 0;
     if (
-        !pichart ||
+        !chart ||
+        !chart->bits ||
         foundPI <= 0 ||
         ON_minterms <= 0 ||
         max_pool <= 0 ||
@@ -345,7 +344,7 @@ void gurobi_solution_pool(
     for (int i = 0; i < ON_minterms; i++) {
         int nz = 0;
         for (int j = 0; j < foundPI; j++) {
-            if (pichart[i + ON_minterms * j] == 1) {
+            if (chart_covers(chart, j, i)) {
                 ind[nz] = j;
                 coeffs[nz] = 1.0;  // reuse coeffs[] as row coefficients
                 nz++;
@@ -356,9 +355,7 @@ void gurobi_solution_pool(
     }
 
     if (cover_is_feasible(
-        pichart,
-        foundPI,
-        ON_minterms,
+        chart,
         initial_solution,
         initial_solmin
     )) {
@@ -525,18 +522,14 @@ bool gurobi_license_is_valid(void) {
 }
 
 void gurobi_multiobjective(
-    int pichart[],
-    const int foundPI,
-    const int ON_minterms,
+    const PIChartView *chart,
     double weights[],
     const int *initial_solution,
     int initial_solmin,
     int *indices,
     int *solmin
 ) {
-    (void)pichart;
-    (void)foundPI;
-    (void)ON_minterms;
+    (void)chart;
     (void)weights;
     (void)initial_solution;
     (void)initial_solmin;
@@ -545,9 +538,7 @@ void gurobi_multiobjective(
 }
 
 void gurobi_solution_pool(
-    int pichart[],
-    const int foundPI,
-    const int ON_minterms,
+    const PIChartView *chart,
     const int max_pool,
     double weights[],
     const int *initial_solution,
@@ -556,8 +547,7 @@ void gurobi_solution_pool(
     int **pool_solutions,
     int *solmin
 ) {
-    (void)pichart;
-    (void)foundPI;
+    (void)chart;
     (void)ON_minterms;
     (void)max_pool;
     (void)weights;

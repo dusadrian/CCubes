@@ -5,6 +5,8 @@
 #include <string.h>
 #include <unistd.h>     // dup, dup2, close
 #include <fcntl.h>
+
+#include "pichart_view.h"
 #ifdef HAVE_GUROBI
     #include "gurobi_c.h"
 #endif
@@ -12,9 +14,7 @@
 bool gurobi_license_is_valid(void);
 
 void gurobi_multiobjective(
-    int pichart[],
-    const int foundPI,
-    const int ON_minterms,
+    const PIChartView *chart,
     double weights[],        // the weights for each individual PI
     const int *initial_solution, // optional validated incumbent column IDs
     int initial_solmin,
@@ -23,9 +23,7 @@ void gurobi_multiobjective(
 );
 
 void gurobi_solution_pool(
-    int pichart[],
-    const int foundPI,
-    const int ON_minterms,
+    const PIChartView *chart,
     const int max_pool,      // maximum number of solutions to collect
     double weights[],        // the weights for each individual PI
     const int *initial_solution, // optional validated incumbent column IDs

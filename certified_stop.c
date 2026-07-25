@@ -176,10 +176,9 @@ static bool pair_joint_in_retained_chart(
     int p,
     int q
 ) {
+    const PIChartView chart = pi_chart_view(pi);
     for (int c = 0; c < pi->foundPI; ++c) {
-        const size_t offset = (size_t)c * (size_t)pi->ON_minterms;
-        if (pi->pichart[offset + (size_t)p] &&
-            pi->pichart[offset + (size_t)q]) {
+        if (chart_covers(&chart, c, p) && chart_covers(&chart, c, q)) {
             return true;
         }
     }
@@ -248,7 +247,7 @@ bool certified_blocking_diagnostic(
 ) {
     if (!pi || !diagnostic || !selected_indices || ninputs <= 0 ||
         level <= 0 || selected_terms <= 0 || pi->ON_minterms <= 0 ||
-        pi->foundPI <= 0 || !pi->pichart) {
+        pi->foundPI <= 0 || !pi->pichart_pos) {
         return false;
     }
 
@@ -265,6 +264,8 @@ bool certified_blocking_diagnostic(
         );
     }
 
+    const PIChartView chart = pi_chart_view(pi);
+
     int *witness = malloc((size_t)selected_terms * sizeof(int));
     if (!witness) return false;
     for (int j = 0; j < selected_terms; ++j) witness[j] = -1;
@@ -279,7 +280,7 @@ bool certified_blocking_diagnostic(
                 free(witness);
                 return false;
             }
-            if (pi->pichart[(size_t)c * (size_t)pi->ON_minterms + (size_t)r]) {
+            if (chart_covers(&chart, c, r)) {
                 owner = j;
                 covering_terms++;
             }

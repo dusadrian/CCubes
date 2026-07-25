@@ -116,7 +116,7 @@ static void lagr_stats_finish(
 }
 
 typedef struct {
-    const int *pichart;
+    const PIChartView *chart;
     int rows;
     int cols;
     int *counts;
@@ -137,7 +137,7 @@ static void lagr_count_col_rows_worker(
         int c = (int)c0;
         int cnt = 0;
         for (int r = 0; r < ctx->rows; ++r) {
-            cnt += ctx->pichart[c * ctx->rows + r];
+            cnt += chart_covers(ctx->chart, c, r) ? 1 : 0;
         }
         ctx->counts[c] = cnt;
     }
@@ -158,14 +158,14 @@ static void lagr_count_row_cols_worker(
         int r = (int)r0;
         int cnt = 0;
         for (int c = 0; c < ctx->cols; ++c) {
-            cnt += ctx->pichart[c * ctx->rows + r];
+            cnt += chart_covers(ctx->chart, c, r) ? 1 : 0;
         }
         ctx->counts[r] = cnt;
     }
 }
 
 typedef struct {
-    const int *pichart;
+    const PIChartView *chart;
     int rows;
     int cols;
     int **out;
@@ -186,7 +186,7 @@ static void lagr_fill_rows_covered_worker(
         int c = (int)c0;
         int k = 0;
         for (int r = 0; r < ctx->rows; ++r) {
-            if (ctx->pichart[c * ctx->rows + r] != 0) {
+            if (chart_covers(ctx->chart, c, r)) {
                 ctx->out[c][k++] = r;
             }
         }
@@ -208,7 +208,7 @@ static void lagr_fill_cols_covering_worker(
         int r = (int)r0;
         int k = 0;
         for (int c = 0; c < ctx->cols; ++c) {
-            if (ctx->pichart[c * ctx->rows + r] != 0) {
+            if (chart_covers(ctx->chart, c, r)) {
                 ctx->out[r][k++] = c;
             }
         }
@@ -295,7 +295,7 @@ Returns:
 */
 
 static int build_adjacency(
-    const int *pichart,
+    const PIChartView *chart,
     int rows, int cols,
     int ***rowsCovered,
     int **rowsCoveredCount,
@@ -310,7 +310,7 @@ static int build_adjacency(
     if (!rcc || !crc) goto oom;
 
     lagr_count_context count_cols = {
-        .pichart = pichart,
+        .chart = chart,
         .rows = rows,
         .cols = cols,
         .counts = rcc
@@ -320,7 +320,7 @@ static int build_adjacency(
     }
 
     lagr_count_context count_rows = {
-        .pichart = pichart,
+        .chart = chart,
         .rows = rows,
         .cols = cols,
         .counts = crc
@@ -351,7 +351,7 @@ static int build_adjacency(
     }
 
     lagr_fill_context fill_rows = {
-        .pichart = pichart,
+        .chart = chart,
         .rows = rows,
         .cols = cols,
         .out = rc
@@ -361,7 +361,7 @@ static int build_adjacency(
     }
 
     lagr_fill_context fill_cols = {
-        .pichart = pichart,
+        .chart = chart,
         .rows = rows,
         .cols = cols,
         .out = cr
@@ -3624,9 +3624,7 @@ static void solve_scp_lagrangian_config(
 }
 
 void solve_scp_lagrangian(
-    int pichart[],
-    const int foundPI,
-    const int ON_minterms,
+    const PIChartView *chart,
     const double weights[],
     int *solution,
     int *solmin,
@@ -3636,8 +3634,10 @@ void solve_scp_lagrangian(
     bool certification_requested
 ) {
     if (solmin) *solmin = -1;
+    const int foundPI = chart ? chart->cols : 0;
+    const int ON_minterms = chart ? chart->rows : 0;
     lagr_stats_begin(ON_minterms, foundPI, 0);
-    if (!pichart || foundPI <= 0 || ON_minterms <= 0 || !solution || !solmin) {
+    if (!chart || !chart->bits || foundPI <= 0 || ON_minterms <= 0 || !solution || !solmin) {
         lagr_stats_finish(-1, -DBL_MAX, -DBL_MAX, -DBL_MAX, 0.0, 0, LAGR_STOP_NO_CANDIDATE);
         return;
     }
@@ -3645,7 +3645,7 @@ void solve_scp_lagrangian(
     int **colsCovering = NULL, *colsCoveringCount = NULL;
 
     int rc_ad = build_adjacency(
-        pichart,
+        chart,
         ON_minterms,
         foundPI,
         &rowsCovered,
@@ -3669,9 +3669,7 @@ void solve_scp_lagrangian(
     int warm_start_accepted =
         warm_start_requested &&
         cover_is_feasible(
-            pichart,
-            foundPI,
-            ON_minterms,
+            chart,
             initial_solution,
             initial_solmin
         );
@@ -3837,9 +3835,7 @@ cleanup:
 }
 
 void solve_scp_lagrangian_pool(
-    int pichart[],
-    const int foundPI,
-    const int ON_minterms,
+    const PIChartView *chart,
     const double weights[],
     int max_pool,
     int *out_pool_count,
@@ -3851,9 +3847,12 @@ void solve_scp_lagrangian_pool(
     bool certification_requested
 ) {
     if (solmin) *solmin = -1;
+    const int foundPI = chart ? chart->cols : 0;
+    const int ON_minterms = chart ? chart->rows : 0;
     lagr_stats_begin(ON_minterms, foundPI, 1);
     if (
-        !pichart ||
+        !chart ||
+        !chart->bits ||
         foundPI <= 0 ||
         ON_minterms <= 0 ||
         !out_pool_count ||
@@ -3868,7 +3867,7 @@ void solve_scp_lagrangian_pool(
     int **colsCovering = NULL, *colsCoveringCount = NULL;
 
     int rc_ad = build_adjacency(
-        pichart,
+        chart,
         ON_minterms,
         foundPI,
         &rowsCovered,
@@ -3897,9 +3896,7 @@ void solve_scp_lagrangian_pool(
     int warm_start_accepted =
         warm_start_requested &&
         cover_is_feasible(
-            pichart,
-            cols,
-            rows,
+            chart,
             initial_solution,
             initial_solmin
         );
