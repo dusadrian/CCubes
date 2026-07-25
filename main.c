@@ -15,6 +15,7 @@
 #include "main.h"
 #include "certified_stop.h"
 #include "checkpoint.h"
+#include "lock_stats.h"
 #include "ccubes_threads.h"
 #include "pool_selection.h"
 
@@ -652,6 +653,12 @@ int main(int argc, char *argv[]) {
     }
     THREADS = ccubes_effective_thread_count(THREADS);
     ccubes_set_thread_count(THREADS);
+
+    /* opt-in (CCUBES_LOCK_STATS=1) profiling of the PI-insertion locks */
+    if (!lock_stats_init(THREADS, noutputs)) {
+        fprintf(stderr, "Error: lock statistics allocation failed\n");
+        return 1;
+    }
 
     // Implement thread-private buffer space
     ThreadBuffer **buffer = (ThreadBuffer**)calloc(THREADS, sizeof(ThreadBuffer*));
@@ -1888,6 +1895,10 @@ int main(int argc, char *argv[]) {
         total_exec_time - pi_generation_time - total_scp_time,
         total_exec_time
     );
+
+    lock_stats_set_generation_seconds(pi_generation_time);
+    lock_stats_report(stderr);
+    lock_stats_free();
 
     DBG_INFO_BLOCK {
         fprintf(debug_out, "all good.\n");

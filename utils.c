@@ -10,6 +10,7 @@
 #include "checkpoint.h"
 #include "lagrangian.h"
 #include "prime_check.h"
+#include "lock_stats.h"
 #include <assert.h>
 #include <errno.h>
 #include <float.h>
@@ -2089,7 +2090,12 @@ int process_task(
 
                 if (redundant) continue;
 
+                uint64_t lock_wait_start = 0, lock_held_start = 0;
+                if (lock_stats_active) lock_wait_start = lock_stats_now_ns();
                 if (output_locks) ccubes_mutex_lock(&output_locks[o]);
+                if (lock_stats_active) {
+                    lock_held_start = lock_stats_now_ns();
+                }
 
                     int *covered = PInfo[o].covered;
                     uint64_t *pichart_pos = PInfo[o].pichart_pos;
@@ -2121,6 +2127,13 @@ int process_task(
                     }
 
                     if (redundant) {
+                        if (lock_stats_active) {
+                            lock_stats_record(
+                                tid, o,
+                                lock_held_start - lock_wait_start,
+                                lock_stats_now_ns() - lock_held_start
+                            );
+                        }
                         if (output_locks) ccubes_mutex_unlock(&output_locks[o]);
                         continue;
                     }
@@ -2180,6 +2193,13 @@ int process_task(
                             : coverage_index_insert_words(coverage_index, coverage_key);
                     }
                     if (!coverage_insert_ok) {
+                        if (lock_stats_active) {
+                            lock_stats_record(
+                                tid, o,
+                                lock_held_start - lock_wait_start,
+                                lock_stats_now_ns() - lock_held_start
+                            );
+                        }
                         if (output_locks) {
                             ccubes_mutex_unlock(&output_locks[o]);
                         }
@@ -2193,6 +2213,13 @@ int process_task(
 
                     (*foundPI)++;
 
+                if (lock_stats_active) {
+                    lock_stats_record(
+                        tid, o,
+                        lock_held_start - lock_wait_start,
+                        lock_stats_now_ns() - lock_held_start
+                    );
+                }
                 if (output_locks) ccubes_mutex_unlock(&output_locks[o]);
             }
         }
