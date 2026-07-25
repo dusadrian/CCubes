@@ -581,6 +581,16 @@ Primary: maximize newCover (minimize number of columns)
 Tie 1: smaller lagr_score (more negative is better)
 Tie 2: higher weight
 Tie 3: smaller index
+
+Bucket queue keyed by newCover (bounded by the largest column degree, so
+few buckets): rather than rescanning every column on every pick,
+a just-covered row's colsCovering list names exactly which columns need
+their newCover decremented, so each one moves down one bucket in O(1) via
+a doubly linked list. The scan for the next pick only walks the (few)
+buckets, and the "current max bucket" cursor only ever moves down over the
+whole run since no column's newCover ever increases, so its total motion
+is bounded by the largest degree, not by cols or by picks.
+
 */
 static void greedy_from_lagr_scores(
     int rows,
@@ -594,74 +604,122 @@ static void greedy_from_lagr_scores(
     int *sol,
     int *sol_len
 ) {
-    (void)colsCovering;
-    (void)colsCoveringCount; /* not used here, but kept for symmetry */
-
     bool *rowCovered = (bool*)calloc((size_t)rows, sizeof(bool));
-    bool *colSelected = (bool*)calloc((size_t)cols, sizeof(bool));
+    int *level = (int*)malloc((size_t)(cols > 0 ? cols : 1) * sizeof(int));
+    int *bnext = (int*)malloc((size_t)(cols > 0 ? cols : 1) * sizeof(int));
+    int *bprev = (int*)malloc((size_t)(cols > 0 ? cols : 1) * sizeof(int));
     int covered = 0, out = 0;
 
-    if (!rowCovered || !colSelected) {
+    if (!rowCovered || !level || !bnext || !bprev) {
         free(rowCovered);
-        free(colSelected);
+        free(level);
+        free(bnext);
+        free(bprev);
         *sol_len = -1;
         return;
     }
 
+    int max_degree = 0;
+    for (int c = 0; c < cols; ++c) {
+        if (rowsCoveredCount[c] > max_degree) max_degree = rowsCoveredCount[c];
+    }
+
+    int *bucket_head = (int*)malloc((size_t)(max_degree + 1) * sizeof(int));
+    if (!bucket_head) {
+        free(rowCovered);
+        free(level);
+        free(bnext);
+        free(bprev);
+        *sol_len = -1;
+        return;
+    }
+    for (int l = 0; l <= max_degree; ++l) bucket_head[l] = -1;
+
+    for (int c = 0; c < cols; ++c) {
+        int deg = rowsCoveredCount[c];
+        if (deg <= 0) {
+            level[c] = 0;
+            continue;
+        }
+        level[c] = deg;
+        bprev[c] = -1;
+        bnext[c] = bucket_head[deg];
+        if (bnext[c] != -1) bprev[bnext[c]] = c;
+        bucket_head[deg] = c;
+    }
+
+    int top = max_degree;
+
     while (covered < rows) {
+        while (top > 0 && bucket_head[top] == -1) --top;
+
+        if (top <= 0 || bucket_head[top] == -1) { /* no column can newly cover any row */
+            free(rowCovered);
+            free(level);
+            free(bnext);
+            free(bprev);
+            free(bucket_head);
+            *sol_len = -1;
+            return;
+        }
+
+        /* every candidate here ties on newCover (== top); break by lagr_score,
+           then weight, then column index, matching the reference scan exactly */
         int best = -1;
-        int bestNew = -1;
         double bestLS = DBL_MAX;
         double bestW = -DBL_MAX;
-
-        for (int c = 0; c < cols; ++c) {
-            if (colSelected[c]) continue;
-
-            int newCover = 0;
-            for (int k = 0; k < rowsCoveredCount[c]; ++k) {
-                int r = rowsCovered[c][k];
-                if (!rowCovered[r]) newCover++;
-            }
-            if (newCover <= 0) continue;
-
+        for (int c = bucket_head[top]; c != -1; c = bnext[c]) {
             double ls = lagr_score ? lagr_score[c] : 0.0;
             double w = weights ? weights[c] : 0.0;
 
             bool better = false;
-            if (newCover > bestNew) better = true;
-            else if (newCover == bestNew) {
-                if (ls < bestLS) {
+            if (best == -1) {
+                better = true;
+            } else if (ls < bestLS) {
+                better = true;
+            } else if (fabs(ls - bestLS) <= EPS) {
+                if (w > bestW) {
                     better = true;
-                } else if (fabs(ls - bestLS) <= EPS) {
-                    if (w > bestW) {
-                        better = true;
-                    } else if (fabs(w - bestW) <= EPS) {
-                        if (best == -1 || c < best) better = true;
-                    }
+                } else if (fabs(w - bestW) <= EPS && c < best) {
+                    better = true;
                 }
             }
             if (better) {
                 best = c;
-                bestNew = newCover;
                 bestLS = ls;
                 bestW = w;
             }
         }
 
-        if (best == -1) { /* cannot cover remaining rows -> infeasible construct */
-            free(rowCovered);
-            free(colSelected);
-            *sol_len = -1;
-            return;
-        }
+        /* unlink best from bucket[top] and retire it */
+        if (bprev[best] != -1) bnext[bprev[best]] = bnext[best]; else bucket_head[top] = bnext[best];
+        if (bnext[best] != -1) bprev[bnext[best]] = bprev[best];
+        level[best] = 0;
 
-        colSelected[best] = true;
         sol[out++] = best;
 
         for (int k = 0; k < rowsCoveredCount[best]; ++k) {
             int r = rowsCovered[best][k];
-            if (!rowCovered[r]) {
-                rowCovered[r] = true; covered++;
+            if (rowCovered[r]) continue;
+            rowCovered[r] = true;
+            ++covered;
+
+            for (int i = 0; i < colsCoveringCount[r]; ++i) {
+                int c = colsCovering[r][i];
+                int lvl = level[c];
+                if (lvl <= 0) continue; /* already selected, or already exhausted */
+
+                if (bprev[c] != -1) bnext[bprev[c]] = bnext[c]; else bucket_head[lvl] = bnext[c];
+                if (bnext[c] != -1) bprev[bnext[c]] = bprev[c];
+
+                --lvl;
+                level[c] = lvl;
+                if (lvl > 0) {
+                    bprev[c] = -1;
+                    bnext[c] = bucket_head[lvl];
+                    if (bnext[c] != -1) bprev[bnext[c]] = c;
+                    bucket_head[lvl] = c;
+                }
             }
         }
     }
@@ -676,7 +734,10 @@ static void greedy_from_lagr_scores(
     );
 
     free(rowCovered);
-    free(colSelected);
+    free(level);
+    free(bnext);
+    free(bprev);
+    free(bucket_head);
 }
 
 /*
@@ -1613,6 +1674,17 @@ typedef struct {
     double weight;
 } PolishCandidate;
 
+/*
+ * Fixed-width row-coverage bitset for the exact-search fast path, covering
+ * up to POLISH_MASK_WORDS * 64 rows. Passed by value like a single uint64_t
+ * used to be, so the recursive search still needs no explicit backtracking:
+ * each call computes its own covered mask and hands it down.
+ */
+#define POLISH_MASK_WORDS 4
+typedef struct {
+    uint64_t w[POLISH_MASK_WORDS];
+} PolishMask;
+
 typedef struct {
     int rows;
     int cols;
@@ -1641,9 +1713,10 @@ typedef struct {
     PolishCandidate *cand_buf;    /* target * max_row_degree entries */
     int max_row_degree;
     int max_cover_static;         /* max rows covered by any usable column */
-    /* bitset fast path (rows <= 64) */
-    const uint64_t *col_mask;     /* per-column row coverage mask, or NULL */
-    uint64_t full_mask;           /* all rows covered */
+    /* bitset fast path (rows <= 64 * POLISH_MASK_WORDS) */
+    const uint64_t *col_mask;     /* per-column row coverage, mask_words each, or NULL */
+    PolishMask full_mask;         /* all rows covered */
+    int mask_words;               /* words of col_mask/full_mask actually in use */
 } PolishSearch;
 
 static int lagr_popcount64(uint64_t x) {
@@ -1669,20 +1742,42 @@ static void polish_sort_candidates(PolishCandidate *candidates, int count) {
         /*
         Wide nodes: a full sort is wasted work — on failure every branch is
         explored regardless of order, and a successful dive follows the front
-        candidates. Selection-sort just the first few positions in O(8n);
-        the tail keeps its deterministic discovery order.
+        candidates. The previous partial selection sort still compared every
+        one of the front 8 slots against the whole remaining range (O(8n)
+        comparisons unconditionally); this streams the front 8 once instead:
+        seed them with a small insertion sort, then give every remaining
+        candidate a single comparison against the current 8th-best, only
+        paying the (rare) shift cost when it actually displaces one of the
+        front 8. Same top-8 set and order as before -- this is the standard
+        streaming top-K argument, not a change in which candidates rank best
+        -- just far fewer comparisons (O(n) with a small constant instead of
+        O(8n)). The bumped-out front candidate is swapped into the vacated
+        tail slot so the full candidate multiset (needed by the caller's
+        subsequent scan over all `count` of them) is preserved either way;
+        only the tail's incidental leftover order differs from before.
         */
-        int front = count < 8 ? count : 8;
-        for (int i = 0; i < front; ++i) {
-            int best = i;
-            for (int j = i + 1; j < count; ++j) {
-                if (polish_candidate_better(&candidates[j], &candidates[best])) best = j;
+        const int front = 8;
+        for (int i = 1; i < front; ++i) {
+            PolishCandidate value = candidates[i];
+            int j = i - 1;
+            while (j >= 0 && polish_candidate_better(&value, &candidates[j])) {
+                candidates[j + 1] = candidates[j];
+                --j;
             }
-            if (best != i) {
-                PolishCandidate tmp = candidates[i];
-                candidates[i] = candidates[best];
-                candidates[best] = tmp;
+            candidates[j + 1] = value;
+        }
+        for (int i = front; i < count; ++i) {
+            if (!polish_candidate_better(&candidates[i], &candidates[front - 1])) continue;
+
+            PolishCandidate incoming = candidates[i];
+            PolishCandidate outgoing = candidates[front - 1];
+            int j = front - 1;
+            while (j > 0 && polish_candidate_better(&incoming, &candidates[j - 1])) {
+                candidates[j] = candidates[j - 1];
+                --j;
             }
+            candidates[j] = incoming;
+            candidates[i] = outgoing;
         }
         return;
     }
@@ -1844,14 +1939,22 @@ static bool polish_search_rec(
     return false;
 }
 
-/* Bitset variant of polish_search_rec for rows <= 64: coverage is a single
-   uint64_t, new-cover checks are popcounts, undo restores the saved mask. */
+/* Bitset variant of polish_search_rec for rows <= 64 * POLISH_MASK_WORDS:
+   coverage is a small fixed-width word array, new-cover checks are
+   popcounts, undo restores the saved mask (no explicit backtrack needed --
+   each call holds its own covered_mask copy). */
 static bool polish_search_rec_bits(
     PolishSearch *search,
     int depth,
-    uint64_t covered_mask
+    PolishMask covered_mask
 ) {
-    if (covered_mask == search->full_mask) {
+    const int words = search->mask_words;
+
+    bool fully_covered = true;
+    for (int w = 0; w < words; ++w) {
+        if (covered_mask.w[w] != search->full_mask.w[w]) { fully_covered = false; break; }
+    }
+    if (fully_covered) {
         int len = search->forced_len + depth;
         int *norm = search->scratch;
 
@@ -1880,8 +1983,12 @@ static bool polish_search_rec_bits(
         return true;
     }
 
-    uint64_t uncovered_mask = search->full_mask & ~covered_mask;
-    int uncovered = lagr_popcount64(uncovered_mask);
+    PolishMask uncovered_mask;
+    int uncovered = 0;
+    for (int w = 0; w < words; ++w) {
+        uncovered_mask.w[w] = search->full_mask.w[w] & ~covered_mask.w[w];
+        uncovered += lagr_popcount64(uncovered_mask.w[w]);
+    }
     int slots_left = search->target - depth;
 
     if (uncovered > slots_left * search->max_cover_static) return false;
@@ -1889,19 +1996,21 @@ static bool polish_search_rec_bits(
     /* MRV row choice: fewest unselected candidates */
     int best_row = -1;
     int best_count = INT_MAX;
-    for (uint64_t m = uncovered_mask; m; m &= m - 1) {
-        int row = __builtin_ctzll(m);
-        int viable = 0;
-        for (int i = 0; i < search->colsCoveringCount[row]; ++i) {
-            int col = search->colsCovering[row][i];
-            if (search->colSelected[col]) continue;
-            ++viable;
-            if (viable >= best_count) break;
-        }
-        if (viable == 0) return false;
-        if (viable < best_count) {
-            best_count = viable;
-            best_row = row;
+    for (int w = 0; w < words; ++w) {
+        for (uint64_t m = uncovered_mask.w[w]; m; m &= m - 1) {
+            int row = w * 64 + __builtin_ctzll(m);
+            int viable = 0;
+            for (int i = 0; i < search->colsCoveringCount[row]; ++i) {
+                int col = search->colsCovering[row][i];
+                if (search->colSelected[col]) continue;
+                ++viable;
+                if (viable >= best_count) break;
+            }
+            if (viable == 0) return false;
+            if (viable < best_count) {
+                best_count = viable;
+                best_row = row;
+            }
         }
     }
     if (best_row < 0) return false;
@@ -1912,7 +2021,11 @@ static bool polish_search_rec_bits(
         int col = search->colsCovering[best_row][i];
         if (search->colSelected[col]) continue;
 
-        int new_cover = lagr_popcount64(search->col_mask[col] & uncovered_mask);
+        const uint64_t *cmask = &search->col_mask[(size_t)col * (size_t)words];
+        int new_cover = 0;
+        for (int w = 0; w < words; ++w) {
+            new_cover += lagr_popcount64(cmask[w] & uncovered_mask.w[w]);
+        }
         if (new_cover <= 0) continue;
 
         candidates[candidate_count++] = (PolishCandidate){
@@ -1932,10 +2045,14 @@ static bool polish_search_rec_bits(
         search->colSelected[col] = 1;
         search->chosen[depth] = col;
 
+        const uint64_t *cmask = &search->col_mask[(size_t)col * (size_t)words];
+        PolishMask next_mask;
+        for (int w = 0; w < words; ++w) next_mask.w[w] = covered_mask.w[w] | cmask[w];
+
         bool stop = polish_search_rec_bits(
             search,
             depth + 1,
-            covered_mask | search->col_mask[col]
+            next_mask
         );
 
         search->colSelected[col] = 0;
@@ -1990,7 +2107,9 @@ static int lagr_bounded_cover_search(
         }
     }
 
-    int use_bits = (rows <= 64 && allowed == NULL);
+    int mask_words = (rows + 63) / 64;
+    int use_bits = (mask_words <= POLISH_MASK_WORDS && allowed == NULL);
+    if (!use_bits) mask_words = 0;
 
     int *coverCount = (int*)calloc((size_t)rows, sizeof(int));
     unsigned char *colSelected = (unsigned char*)calloc((size_t)cols, 1);
@@ -2000,16 +2119,21 @@ static int lagr_bounded_cover_search(
         (size_t)(free_slots > 0 ? free_slots : 1) * (size_t)max_row_degree * sizeof(PolishCandidate)
     );
     uint64_t *col_mask = use_bits
-        ? (uint64_t*)calloc((size_t)cols, sizeof(uint64_t))
+        ? (uint64_t*)calloc((size_t)cols * (size_t)mask_words, sizeof(uint64_t))
+        : NULL;
+    unsigned char *mask_done = use_bits
+        ? (unsigned char*)calloc((size_t)cols, 1)
         : NULL;
 
-    if (!coverCount || !colSelected || !chosen || !scratch || !cand_buf || (use_bits && !col_mask)) {
+    if (!coverCount || !colSelected || !chosen || !scratch || !cand_buf ||
+        (use_bits && (!col_mask || !mask_done))) {
         free(coverCount);
         free(colSelected);
         free(chosen);
         free(scratch);
         free(cand_buf);
         free(col_mask);
+        free(mask_done);
         return 0;
     }
 
@@ -2018,15 +2142,17 @@ static int lagr_bounded_cover_search(
         for (int r = 0; r < rows; ++r) {
             for (int i = 0; i < colsCoveringCount[r]; ++i) {
                 int c = colsCovering[r][i];
-                if (col_mask[c] == 0) {
-                    uint64_t m = 0;
+                if (!mask_done[c]) {
+                    mask_done[c] = 1;
+                    uint64_t *m = &col_mask[(size_t)c * (size_t)mask_words];
                     for (int j = 0; j < rowsCoveredCount[c]; ++j) {
-                        m |= 1ULL << rowsCovered[c][j];
+                        int row = rowsCovered[c][j];
+                        m[row / 64] |= UINT64_C(1) << (row % 64);
                     }
-                    col_mask[c] = m;
                 }
             }
         }
+        free(mask_done);
     }
 
     int covered = 0;
@@ -2069,13 +2195,23 @@ static int lagr_bounded_cover_search(
         .max_row_degree = max_row_degree,
         .max_cover_static = max_cover_static,
         .col_mask = col_mask,
-        .full_mask = (rows >= 64) ? ~0ULL : ((1ULL << rows) - 1ULL)
+        .mask_words = mask_words
     };
+    if (use_bits) {
+        for (int w = 0; w < mask_words; ++w) {
+            int rows_left = rows - w * 64;
+            search.full_mask.w[w] = rows_left >= 64
+                ? UINT64_MAX
+                : (UINT64_C(1) << rows_left) - 1u;
+        }
+    }
 
     if (use_bits) {
-        uint64_t covered_mask = 0;
+        PolishMask covered_mask;
+        memset(&covered_mask, 0, sizeof(covered_mask));
         for (int i = 0; i < forced_len; ++i) {
-            covered_mask |= col_mask[forced[i]];
+            const uint64_t *m = &col_mask[(size_t)forced[i] * (size_t)mask_words];
+            for (int w = 0; w < mask_words; ++w) covered_mask.w[w] |= m[w];
         }
         polish_search_rec_bits(&search, 0, covered_mask);
     } else {

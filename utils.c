@@ -9,6 +9,7 @@
 #include "utils.h"
 #include "checkpoint.h"
 #include "lagrangian.h"
+#include "prime_check.h"
 #include <assert.h>
 #include <errno.h>
 #include <float.h>
@@ -480,12 +481,17 @@ static bool coverage_index_resize(
     return true;
 }
 
-static bool coverage_index_insert_words(
+/*
+ * Inserts a coverage key already known to be absent from the index (the
+ * caller just performed the lookup itself, e.g. to decide redundancy, and
+ * no intervening insert could have changed that under the held output
+ * lock). Skips the redundant re-lookup that coverage_index_insert_words
+ * would otherwise repeat.
+ */
+static bool coverage_index_insert_known_new(
     PICoverageIndex *index,
     const uint64_t *coverage
 ) {
-    if (coverage_index_lookup_words(index, coverage) >= 0) return true;
-
     if (
         index->table_size == 0 ||
         (index->count + 1u) * 10u >= index->table_size * 7u
@@ -509,6 +515,14 @@ static bool coverage_index_insert_words(
     );
     index->count++;
     return true;
+}
+
+static bool coverage_index_insert_words(
+    PICoverageIndex *index,
+    const uint64_t *coverage
+) {
+    if (coverage_index_lookup_words(index, coverage) >= 0) return true;
+    return coverage_index_insert_known_new(index, coverage);
 }
 
 bool build_pi_coverage_indices(
@@ -1612,56 +1626,6 @@ void print_info(const char *INFO_PATH, const int info_level) {
 }
 
 
-static bool projected_cube_is_prime(
-    const PIstorage *pi,
-    int ninputs,
-    const int *support,
-    int level,
-    const uint64_t *value_bits,
-    const int *word_index,
-    const int *bit_index
-) {
-    if (!pi || !support || !value_bits || !word_index || !bit_index || level <= 0) {
-        return false;
-    }
-
-    /*
-     * A consistent cube is prime exactly when deleting any one of its
-     * literals makes it intersect at least one OFF pattern. A zero in an OFF
-     * row is an input dash and therefore matches either binary literal.
-     */
-    for (int removed = 0; removed < level; ++removed) {
-        bool deletion_blocked = false;
-
-        for (int z = 0; z < pi->OFF_minterms; ++z) {
-            bool matches = true;
-            for (int c = 0; c < level; ++c) {
-                if (c == removed) continue;
-
-                int input = support[c];
-                int off_value = pi->OFF_set[(size_t)z * (size_t)ninputs + (size_t)input];
-                int cube_value = 1 + (int)(
-                    (value_bits[word_index[input]] >> bit_index[input]) & 1ULL
-                );
-
-                if (off_value != 0 && off_value != cube_value) {
-                    matches = false;
-                    break;
-                }
-            }
-
-            if (matches) {
-                deletion_blocked = true;
-                break;
-            }
-        }
-
-        if (!deletion_blocked) return false;
-    }
-
-    return true;
-}
-
 int process_task(
     uint64_t task,
     int k,
@@ -2162,6 +2126,7 @@ int process_task(
                      * current-level coverages as workers arrived. Preserve
                      * that behavior with a synchronized hash lookup.
                      */
+                    bool coverage_checked_absent = false;
                     if (
                         !shareable &&
                         coverage_index &&
@@ -2173,6 +2138,7 @@ int process_task(
                                 (size_t)f * (size_t)pichart_words
                             ]
                         ) >= 0;
+                        coverage_checked_absent = !redundant;
                     }
 
                     if (redundant) {
@@ -2229,16 +2195,16 @@ int process_task(
                     }
                     covsum[*foundPI] = u_covsum;
 
-                    if (
-                        coverage_index &&
-                        coverage_index->include_current_level &&
-                        !coverage_index_insert_words(
-                            coverage_index,
-                            &task_pichart_values[
-                                (size_t)f * (size_t)pichart_words
-                            ]
-                        )
-                    ) {
+                    bool coverage_insert_ok = true;
+                    if (coverage_index && coverage_index->include_current_level) {
+                        const uint64_t *coverage_key = &task_pichart_values[
+                            (size_t)f * (size_t)pichart_words
+                        ];
+                        coverage_insert_ok = coverage_checked_absent
+                            ? coverage_index_insert_known_new(coverage_index, coverage_key)
+                            : coverage_index_insert_words(coverage_index, coverage_key);
+                    }
+                    if (!coverage_insert_ok) {
                         if (output_locks) {
                             ccubes_mutex_unlock(&output_locks[o]);
                         }
