@@ -22,6 +22,7 @@
 !examples/
 !examples/**
 !tests/
+!tests/test_effort_policy.sh
 
 temp/
 proofs/

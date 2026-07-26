@@ -18,6 +18,7 @@
 #include "lock_stats.h"
 #include "ccubes_threads.h"
 #include "pool_selection.h"
+#include "plateau_probe.h"
 
 typedef struct {
     int k;
@@ -134,10 +135,10 @@ void help() {
     printf("                             (presolve + Lagrangian bounds + bounded exact search)\n");
     printf("                           1 Gurobi exact\n");
     printf("  -e<number>           : hybrid solver effort level:\n");
-    printf("                           0 (default) fastest heuristic; stop at first plateau\n");
-    printf("                           1 stronger bounds with bounded adaptive certification\n");
-    printf("                           2 strong warm-started bound; full portfolio only for certification\n");
-    printf("  -d                   : deterministic PI ordering\n");
+    printf("                           0 (default) small probe, then stop at first plateau\n");
+    printf("                           1 stronger bounds plus adaptive plateau handling\n");
+    printf("                           2 strong bounds plus a larger plateau probe\n");
+    printf("  -d                   : deterministic PI ordering on multi-thread search\n");
     printf("  -g                   : print the adaptive blocking diagnostic at the first plateau\n");
     printf("  -c                   : require certified exact stopping (point rows only)\n");
     printf("                         (explicitly overrides the -e0 heuristic plateau policy)\n");
@@ -1162,7 +1163,7 @@ int main(int argc, char *argv[]) {
 
                 /* built here: pichart_pos may have been reallocated during
                    this level's generation, and foundPI is now final for k */
-                const PIChartView chart = pi_chart_view(&PInfo[o]);
+                PIChartView chart = pi_chart_view(&PInfo[o]);
 
                 if (*foundPI > 0 && !*ON_set_covered) {
                     bool test_coverage = true;
@@ -1253,6 +1254,123 @@ int main(int argc, char *argv[]) {
                             indices,
                             solmin
                         );
+                    }
+
+                    const bool probe_due =
+                        *solmin > 0 &&
+                        adaptive_stopping_supported &&
+                        *prevsolmin > 1 &&
+                        *prevsolmin <= ON_minterms &&
+                        *solmin >= *prevsolmin &&
+                        stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
+                    if (probe_due) {
+                        const int pre_probe_found = *foundPI;
+                        const uint64_t pair_limit =
+                            HYBRID_EFFORT_LEVEL >= 2
+                                ? UINT64_C(1024)
+                                : UINT64_C(128);
+                        const int candidate_limit =
+                            HYBRID_EFFORT_LEVEL >= 2 ? 128 : 32;
+                        PlateauProbeStats probe_stats;
+
+                        if (!plateau_probe_append_candidates(
+                            &PInfo[o],
+                            ninputs,
+                            implicant_words,
+                            previndices,
+                            *prevsolmin,
+                            bit_index,
+                            word_index,
+                            shifted_mask,
+                            pair_limit,
+                            candidate_limit,
+                            &probe_stats
+                        )) {
+                            fprintf(
+                                stderr,
+                                "Error: plateau probe failed for output %d.\n",
+                                o + 1
+                            );
+                            free(weights);
+                            destroy_output_locks(output_locks, noutputs);
+                            cleanup(PInfo, buffer);
+                            return 1;
+                        }
+
+                        if (probe_stats.candidates_appended > 0) {
+                            PInfo[o].nofpi[k - 1] = *foundPI;
+                            chart = pi_chart_view(&PInfo[o]);
+                            free(weights);
+                            weights = build_cover_weights(
+                                &PInfo[o],
+                                *foundPI,
+                                k,
+                                WEIGHT_PIC
+                            );
+                            if (WEIGHT_PIC > 0 && !weights) {
+                                fprintf(
+                                    stderr,
+                                    "Error: Memory allocation failed for "
+                                    "plateau-probe cover weights\n"
+                                );
+                                destroy_output_locks(output_locks, noutputs);
+                                cleanup(PInfo, buffer);
+                                return 1;
+                            }
+
+                            if (SCP_TYPE == 0) {
+                                solve_scp_lagrangian(
+                                    &chart,
+                                    weights,
+                                    indices,
+                                    solmin,
+                                    HYBRID_EFFORT_LEVEL,
+                                    previndices,
+                                    *prevsolmin,
+                                    CERTIFIED_MODE ||
+                                        blocking_stop_states[o].
+                                            certification_required
+                                );
+                                boundary_exact =
+                                    lagrangian_last_run_proved_optimal();
+                                print_hybrid_stats(o);
+                            }
+                            if (SCP_TYPE == 1) {
+                                gurobi_multiobjective(
+                                    &chart,
+                                    weights,
+                                    previndices,
+                                    *prevsolmin,
+                                    indices,
+                                    solmin
+                                );
+                                boundary_exact = true;
+                            }
+
+                            if (*solmin >= *prevsolmin) {
+                                *foundPI = pre_probe_found;
+                                PInfo[o].nofpi[k - 1] = pre_probe_found;
+                            }
+                        }
+
+                        DBG_INFO_BLOCK {
+                            fprintf(
+                                debug_out,
+                                "CCUBES_PLATEAU_PROBE level=%d output=%d "
+                                "witnesses=%d pairs=%llu compatible=%llu "
+                                "generated=%d appended=%d improved=%s\n",
+                                k,
+                                o + 1,
+                                probe_stats.private_witnesses,
+                                (unsigned long long)
+                                    probe_stats.pairs_examined,
+                                (unsigned long long)
+                                    probe_stats.compatible_pairs,
+                                probe_stats.candidates_generated,
+                                probe_stats.candidates_appended,
+                                *solmin < *prevsolmin ? "yes" : "no"
+                            );
+                        }
                     }
 
                     if (*solmin == 0) {
@@ -1420,7 +1538,7 @@ int main(int argc, char *argv[]) {
 
                 /* built here: pichart_pos may have been reallocated during
                    this level's generation, and foundPI is now final for k */
-                const PIChartView chart = pi_chart_view(&PInfo[o]);
+                PIChartView chart = pi_chart_view(&PInfo[o]);
 
                 if (*foundPI > 0 && !*ON_set_covered) {
                     bool test_coverage = true;
@@ -1523,6 +1641,196 @@ int main(int argc, char *argv[]) {
                             pool_solutions,
                             solmin
                         );
+                    }
+
+                    const bool probe_due =
+                        *solmin > 0 &&
+                        adaptive_stopping_supported &&
+                        PInfo[o].prevsolmin > 1 &&
+                        PInfo[o].prevsolmin <= ON_minterms &&
+                        *solmin >= PInfo[o].prevsolmin &&
+                        stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
+                    if (probe_due) {
+                        const int pre_probe_found = *foundPI;
+                        const uint64_t pair_limit =
+                            HYBRID_EFFORT_LEVEL >= 2
+                                ? UINT64_C(1024)
+                                : UINT64_C(128);
+                        const int candidate_limit =
+                            HYBRID_EFFORT_LEVEL >= 2 ? 128 : 32;
+                        PlateauProbeStats probe_stats;
+
+                        if (!plateau_probe_append_candidates(
+                            &PInfo[o],
+                            ninputs,
+                            implicant_words,
+                            PInfo[o].previndices,
+                            PInfo[o].prevsolmin,
+                            bit_index,
+                            word_index,
+                            shifted_mask,
+                            pair_limit,
+                            candidate_limit,
+                            &probe_stats
+                        )) {
+                            fprintf(
+                                stderr,
+                                "Error: plateau probe failed for output %d.\n",
+                                o + 1
+                            );
+                            free(weights);
+                            destroy_output_locks(output_locks, noutputs);
+                            cleanup(PInfo, buffer);
+                            return 1;
+                        }
+
+                        if (probe_stats.candidates_appended > 0) {
+                            PInfo[o].nofpi[k - 1] = *foundPI;
+                            chart = pi_chart_view(&PInfo[o]);
+                            pool_limit =
+                                automatic_pool_solution_limit(*foundPI);
+                            clear_output_solution_pool(&PInfo[o]);
+                            free(weights);
+                            weights = build_cover_weights(
+                                &PInfo[o],
+                                *foundPI,
+                                k,
+                                WEIGHT_PIC
+                            );
+                            if (WEIGHT_PIC > 0 && !weights) {
+                                fprintf(
+                                    stderr,
+                                    "Error: Memory allocation failed for "
+                                    "plateau-probe cover weights\n"
+                                );
+                                destroy_output_locks(output_locks, noutputs);
+                                cleanup(PInfo, buffer);
+                                return 1;
+                            }
+
+                            if (SCP_TYPE == 0) {
+                                solve_scp_lagrangian_pool(
+                                    &chart,
+                                    weights,
+                                    pool_limit,
+                                    pool_count,
+                                    pool_solutions,
+                                    solmin,
+                                    HYBRID_EFFORT_LEVEL,
+                                    PInfo[o].previndices,
+                                    PInfo[o].prevsolmin,
+                                    CERTIFIED_MODE ||
+                                        blocking_stop_states[o].
+                                            certification_required
+                                );
+                                pool_boundary_exact[o] =
+                                    lagrangian_last_run_proved_optimal();
+                                print_hybrid_stats(o);
+                            }
+                            if (SCP_TYPE == 1) {
+                                gurobi_solution_pool(
+                                    &chart,
+                                    pool_limit,
+                                    weights,
+                                    PInfo[o].previndices,
+                                    PInfo[o].prevsolmin,
+                                    pool_count,
+                                    pool_solutions,
+                                    solmin
+                                );
+                                pool_boundary_exact[o] = true;
+                            }
+
+                            if (*solmin >= PInfo[o].prevsolmin) {
+                                /*
+                                 * The temporary columns did not improve the
+                                 * primary objective. Rebuild the original
+                                 * pool before joint multi-output selection;
+                                 * its entries must not refer to rolled-back
+                                 * probe columns.
+                                 */
+                                *foundPI = pre_probe_found;
+                                PInfo[o].nofpi[k - 1] = pre_probe_found;
+                                chart = pi_chart_view(&PInfo[o]);
+                                pool_limit =
+                                    automatic_pool_solution_limit(*foundPI);
+                                clear_output_solution_pool(&PInfo[o]);
+                                free(weights);
+                                weights = build_cover_weights(
+                                    &PInfo[o],
+                                    *foundPI,
+                                    k,
+                                    WEIGHT_PIC
+                                );
+                                if (WEIGHT_PIC > 0 && !weights) {
+                                    fprintf(
+                                        stderr,
+                                        "Error: Memory allocation failed "
+                                        "while restoring pool weights\n"
+                                    );
+                                    destroy_output_locks(
+                                        output_locks,
+                                        noutputs
+                                    );
+                                    cleanup(PInfo, buffer);
+                                    return 1;
+                                }
+
+                                if (SCP_TYPE == 0) {
+                                    solve_scp_lagrangian_pool(
+                                        &chart,
+                                        weights,
+                                        pool_limit,
+                                        pool_count,
+                                        pool_solutions,
+                                        solmin,
+                                        HYBRID_EFFORT_LEVEL,
+                                        PInfo[o].previndices,
+                                        PInfo[o].prevsolmin,
+                                        CERTIFIED_MODE ||
+                                            blocking_stop_states[o].
+                                                certification_required
+                                    );
+                                    pool_boundary_exact[o] =
+                                        lagrangian_last_run_proved_optimal();
+                                    print_hybrid_stats(o);
+                                }
+                                if (SCP_TYPE == 1) {
+                                    gurobi_solution_pool(
+                                        &chart,
+                                        pool_limit,
+                                        weights,
+                                        PInfo[o].previndices,
+                                        PInfo[o].prevsolmin,
+                                        pool_count,
+                                        pool_solutions,
+                                        solmin
+                                    );
+                                    pool_boundary_exact[o] = true;
+                                }
+                            }
+                        }
+
+                        DBG_INFO_BLOCK {
+                            fprintf(
+                                debug_out,
+                                "CCUBES_PLATEAU_PROBE level=%d output=%d "
+                                "witnesses=%d pairs=%llu compatible=%llu "
+                                "generated=%d appended=%d improved=%s pool\n",
+                                k,
+                                o + 1,
+                                probe_stats.private_witnesses,
+                                (unsigned long long)
+                                    probe_stats.pairs_examined,
+                                (unsigned long long)
+                                    probe_stats.compatible_pairs,
+                                probe_stats.candidates_generated,
+                                probe_stats.candidates_appended,
+                                *solmin < PInfo[o].prevsolmin
+                                    ? "yes"
+                                    : "no"
+                            );
+                        }
                     }
 
 
