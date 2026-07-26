@@ -9,9 +9,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdalign.h> // For alignof
+#include <stdatomic.h>
 
 #include "debug.h"
 #include "ccubes_threads.h"
+#include "subsumption_index.h"
 #include "pichart_view.h"
 
 /*
@@ -140,6 +142,8 @@ typedef struct {
     size_t count;
     int words;
     bool include_current_level;
+    SubsumptionIndex subsumption_index;
+    atomic_uint_fast64_t subsumption_rejections;
 } PICoverageIndex;
 
 /* Binary total-row model required by adaptive and certified stopping. */
@@ -247,6 +251,7 @@ bool build_pi_coverage_indices(
     PIstorage *PInfo,
     int noutputs,
     const int *level_start,
+    int implicant_words,
     bool deterministic_order
 );
 

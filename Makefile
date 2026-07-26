@@ -185,8 +185,8 @@ clean:
 TEST_CFLAGS := -Wall -O2 -I.
 TEST_LIBS   := -lm
 
-.PHONY: test test-cover-validation test-pool-selection test-certified-stop test-projected-cube-prime test-effort-policy
-test: test-cover-validation test-pool-selection test-certified-stop test-projected-cube-prime test-effort-policy
+.PHONY: test test-cover-validation test-pool-selection test-certified-stop test-projected-cube-prime test-subsumption-index test-effort-policy
+test: test-cover-validation test-pool-selection test-certified-stop test-projected-cube-prime test-subsumption-index test-effort-policy
 
 test-cover-validation:
 	$(CC) $(TEST_CFLAGS) tests/test_cover_validation.c cover_validation.c -o /tmp/ccubes_test_cover_validation $(TEST_LIBS)
@@ -203,6 +203,10 @@ test-projected-cube-prime:
 test-certified-stop:
 	$(CC) $(TEST_CFLAGS) tests/test_certified_stop.c certified_stop.c -o /tmp/ccubes_test_certified_stop $(TEST_LIBS)
 	/tmp/ccubes_test_certified_stop
+
+test-subsumption-index:
+	$(CC) $(TEST_CFLAGS) tests/test_subsumption_index.c subsumption_index.c -o /tmp/ccubes_test_subsumption_index $(TEST_LIBS)
+	/tmp/ccubes_test_subsumption_index
 
 test-effort-policy: $(BIN)
 	sh tests/test_effort_policy.sh ./$(BIN) examples/certified_F2.pla

@@ -153,7 +153,7 @@ void print_hybrid_stats(int output_index) {
             "bestZLB=%.6f lastZLB=%.6f iterations=%d stop=%s%s "
             "warm_start_requested=%d warm_start_accepted=%d "
             "effort=%d certification_requested=%d iteration_limit=%d "
-            "portfolio_limit=%d polish_nodes=%ld\n",
+            "portfolio_limit=%d polish_nodes=%ld presolve_cols_removed=%d\n",
             stats->best_zlb,
             stats->last_zlb,
             stats->iterations,
@@ -165,7 +165,8 @@ void print_hybrid_stats(int output_index) {
             stats->certification_requested,
             stats->iteration_limit,
             stats->portfolio_limit,
-            stats->polish_node_limit
+            stats->polish_node_limit,
+            stats->presolve_cols_removed
         );
     }
 }
@@ -508,6 +509,7 @@ static bool coverage_index_insert_known_new(
     size_t pos = (size_t)(
         coverage_words_hash(coverage, index->words) & (uint64_t)mask
     );
+
     while (index->slots[pos] >= 0) pos = (pos + 1u) & mask;
     index->slots[pos] = 1;
     memcpy(
@@ -515,6 +517,7 @@ static bool coverage_index_insert_known_new(
         coverage,
         (size_t)index->words * sizeof(uint64_t)
     );
+
     index->count++;
     return true;
 }
@@ -532,9 +535,18 @@ bool build_pi_coverage_indices(
     PIstorage *PInfo,
     int noutputs,
     const int *level_start,
+    int implicant_words,
     bool deterministic_order
 ) {
-    if (!indices || !PInfo || noutputs < 0 || !level_start) return false;
+    if (
+        !indices ||
+        !PInfo ||
+        noutputs < 0 ||
+        !level_start ||
+        implicant_words <= 0
+    ) {
+        return false;
+    }
 
     *indices = (PICoverageIndex *)calloc(
         (size_t)noutputs,
@@ -546,6 +558,25 @@ bool build_pi_coverage_indices(
         PICoverageIndex *index = &(*indices)[o];
         index->include_current_level = !deterministic_order;
         index->words = PInfo[o].pichart_words;
+        atomic_init(&index->subsumption_rejections, 0);
+
+        int parent_records = level_start[o];
+        if (parent_records < 0) parent_records = 0;
+        if (parent_records > PInfo[o].foundPI) {
+            parent_records = PInfo[o].foundPI;
+        }
+
+        if (!subsumption_index_build(
+            &index->subsumption_index,
+            PInfo[o].implicants_pos,
+            PInfo[o].implicants_val,
+            parent_records,
+            implicant_words
+        )) {
+            destroy_pi_coverage_indices(*indices, noutputs);
+            *indices = NULL;
+            return false;
+        }
 
         int records = deterministic_order
             ? level_start[o]
@@ -585,6 +616,7 @@ void destroy_pi_coverage_indices(
     for (int o = 0; o < noutputs; ++o) {
         free(indices[o].slots);
         free(indices[o].keys);
+        subsumption_index_destroy(&indices[o].subsumption_index);
     }
     free(indices);
 }
@@ -602,11 +634,13 @@ static void copy_pi_record(
         &pi->pichart_pos[(size_t)src * (size_t)pi->pichart_words],
         (size_t)pi->pichart_words * sizeof(uint64_t)
     );
+
     memmove(
         &pi->implicants_pos[(size_t)dst * (size_t)implicant_words],
         &pi->implicants_pos[(size_t)src * (size_t)implicant_words],
         (size_t)implicant_words * sizeof(uint64_t)
     );
+
     memmove(
         &pi->implicants_val[(size_t)dst * (size_t)implicant_words],
         &pi->implicants_val[(size_t)src * (size_t)implicant_words],
@@ -804,11 +838,13 @@ int canonicalize_pi_order(
             &pi->pichart_pos[(size_t)src * (size_t)pichart_words],
             (size_t)pichart_words * sizeof(uint64_t)
         );
+
         memcpy(
             &tmp_implicants_pos[(size_t)dst * (size_t)implicant_words],
             &pi->implicants_pos[(size_t)src * (size_t)implicant_words],
             (size_t)implicant_words * sizeof(uint64_t)
         );
+
         memcpy(
             &tmp_implicants_val[(size_t)dst * (size_t)implicant_words],
             &pi->implicants_val[(size_t)src * (size_t)implicant_words],
@@ -824,21 +860,25 @@ int canonicalize_pi_order(
         tmp_pichart_pos,
         (size_t)n * (size_t)pichart_words * sizeof(uint64_t)
     );
+
     memcpy(
         &pi->implicants_pos[(size_t)level_start * (size_t)implicant_words],
         tmp_implicants_pos,
         (size_t)n * (size_t)implicant_words * sizeof(uint64_t)
     );
+
     memcpy(
         &pi->implicants_val[(size_t)level_start * (size_t)implicant_words],
         tmp_implicants_val,
         (size_t)n * (size_t)implicant_words * sizeof(uint64_t)
     );
+
     memcpy(
         &pi->shared[level_start],
         tmp_shared,
         (size_t)n * sizeof(int)
     );
+
     memcpy(
         &pi->covsum[level_start],
         tmp_covsum,
@@ -957,9 +997,11 @@ void resize(
     if (!array) {
         error_message("NULL array pointer passed to resize.");
     }
+
     if (type < TYPE_BOOL || type > TYPE_DOUBLE) {
         error_message("Invalid type for resizing.");
     }
+
     if (increase <= 0 || size < 0 || nrows <= 0) {
         error_message("Invalid parameters for resizing.");
     }
@@ -1531,12 +1573,14 @@ static bool ensure_thread_buffer_capacity(
         (size_t)capacity * (size_t)pichart_words,
         sizeof(uint64_t)
     );
+
     int *decpos = (int*)calloc((size_t)capacity, sizeof(int));
     int *covsum = (int*)calloc((size_t)capacity, sizeof(int));
     uint64_t *fixed_bits = (uint64_t*)calloc(
         (size_t)capacity * (size_t)implicant_words,
         sizeof(uint64_t)
     );
+
     uint64_t *value_bits = (uint64_t*)calloc(
         (size_t)capacity * (size_t)implicant_words,
         sizeof(uint64_t)
@@ -1961,6 +2005,22 @@ int process_task(
 
         if (pos_seen) free(pos_seen);
 
+        PICoverageIndex *generation_index = coverage_indices
+            ? &coverage_indices[o]
+            : NULL;
+        int generalizing_removals[k];
+        int generalizing_removal_count = generation_index
+            ? subsumption_index_find_generalizing_removals(
+                &generation_index->subsumption_index,
+                fixed_bits,
+                tempk,
+                k,
+                word_index,
+                shifted_mask,
+                generalizing_removals
+            )
+            : 0;
+
         for (int f = 0; f < found; f++) {
             // using bit shifting, store the fixed bits and value bits
             uint64_t value_bits[implicant_words];
@@ -1973,6 +2033,29 @@ int process_task(
                 int value = PInfo[o].ON_set[possible_rows[f] * ninputs + tempk[c]] - 1;
                 // set the relevant bits
                 value_bits[word_index[tempk[c]]] |= ((uint64_t)value << bit_index[tempk[c]]);
+            }
+
+            if (
+                generation_index &&
+                generalizing_removal_count > 0 &&
+                subsumption_index_has_immediate_generalization(
+                    &generation_index->subsumption_index,
+                    fixed_bits,
+                    value_bits,
+                    tempk,
+                    k,
+                    generalizing_removals,
+                    generalizing_removal_count,
+                    word_index,
+                    shifted_mask
+                )
+            ) {
+                atomic_fetch_add_explicit(
+                    &generation_index->subsumption_rejections,
+                    1,
+                    memory_order_relaxed
+                );
+                continue;
             }
 
             uint64_t pichart_values[pichart_words];

@@ -971,6 +971,7 @@ int main(int argc, char *argv[]) {
             PInfo,
             noutputs,
             level_start,
+            implicant_words,
             DETERMINISTIC_PI_ORDER
         )) {
             fprintf(stderr, "Error: failed to build PI coverage indices\n");
@@ -1037,6 +1038,22 @@ int main(int argc, char *argv[]) {
             &last_task_reached,
             memory_order_acquire
         );
+        DBG_INFO_BLOCK {
+            for (int o = 0; o < noutputs; ++o) {
+                uint64_t rejected = atomic_load_explicit(
+                    &coverage_indices[o].subsumption_rejections,
+                    memory_order_relaxed
+                );
+                if (rejected > 0) {
+                    fprintf(
+                        debug_out,
+                        "subsumption rejections, output %d: %llu\n",
+                        o + 1,
+                        (unsigned long long)rejected
+                    );
+                }
+            }
+        }
         ccubes_mutex_destroy(&state_lock);
         destroy_pi_coverage_indices(coverage_indices, noutputs);
 

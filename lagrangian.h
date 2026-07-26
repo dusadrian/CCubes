@@ -29,6 +29,7 @@ typedef struct {
     int warm_start_accepted;
     int effort_level;
     int certification_requested;
+    int presolve_cols_removed;
     int iteration_limit;
     int portfolio_limit;
     long polish_node_limit;

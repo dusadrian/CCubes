@@ -22,7 +22,6 @@
 !examples/
 !examples/**
 !tests/
-!tests/*.c
 
 temp/
 proofs/

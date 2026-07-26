@@ -45,6 +45,7 @@ void lagrangian_reset_stats(void) {
     lagr_last_stats.warm_start_accepted = 0;
     lagr_last_stats.effort_level = 0;
     lagr_last_stats.certification_requested = 0;
+    lagr_last_stats.presolve_cols_removed = 0;
     lagr_last_stats.iteration_limit = 0;
     lagr_last_stats.portfolio_limit = 0;
     lagr_last_stats.polish_node_limit = 0;
@@ -3668,7 +3669,7 @@ void solve_scp_lagrangian(
     }
 
     /* shrink the instance once; benefits every portfolio profile */
-    presolve_dominated_columns(
+    int presolve_removed = presolve_dominated_columns(
         ON_minterms,
         foundPI,
         rowsCovered,
@@ -3812,6 +3813,9 @@ cleanup:
         ? baseline.portfolio_max_profiles
         : 1;
     lagr_last_stats.polish_node_limit = baseline.polish_node_limit;
+    /* assigned here, not at the presolve: solve_scp_lagrangian_config() calls
+       lagr_stats_begin(), which resets the block */
+    lagr_last_stats.presolve_cols_removed = presolve_removed;
     free(candidate);
     free_adjacency(
         rowsCovered,
