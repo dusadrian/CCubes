@@ -20,6 +20,7 @@
 typedef struct {
     int output;
     int column;
+    int literal_count;
     int output_count;
     int last_output;
 } CubeRecord;
@@ -38,6 +39,7 @@ typedef struct {
     int source_index;
     int len;
     int *cube_ids;
+    int literal_count;
     int potential;
     int value_rank;
 } PoolCandidate;
@@ -65,7 +67,35 @@ typedef struct {
     int *current_choice;
     int *best_choice;
     int best_union;
+    int best_literals;
+    const CubeRecord *records;
 } ExactSearch;
+
+static int cube_literal_count(
+    const PIstorage *pinfo,
+    int output,
+    int column,
+    int implicant_words
+) {
+    const uint64_t pair_low_bits = UINT64_C(0x5555555555555555);
+    const uint64_t *position = &pinfo[output].implicants_pos[
+        (size_t)column * (size_t)implicant_words
+    ];
+    int literals = 0;
+
+    for (int word = 0; word < implicant_words; ++word) {
+        /*
+         * Each input occupies one two-bit lane.  A dash has lane 00; either
+         * value of a fixed input has at least one bit set.  Fold each lane
+         * onto its low bit, then count occupied lanes.
+         */
+        uint64_t occupied =
+            (position[word] | (position[word] >> 1u)) &
+            pair_low_bits;
+        literals += __builtin_popcountll(occupied);
+    }
+    return literals;
+}
 
 static uint64_t cube_hash(
     const PIstorage *pinfo,
@@ -210,6 +240,12 @@ static int universe_add(
     universe->records[id] = (CubeRecord){
         .output = output,
         .column = column,
+        .literal_count = cube_literal_count(
+            universe->pinfo,
+            output,
+            column,
+            universe->implicant_words
+        ),
         .output_count = 1,
         .last_output = output
     };
@@ -291,6 +327,26 @@ static bool mark_valuable_candidates(
         outputs[output].candidate[0].value_rank = 0;
         keep_count[output] = 1;
         if (count == 1) continue;
+
+        /*
+         * Pool compaction is allowed to discard candidates with no sharing
+         * opportunity, but the final lexicographic selector still needs the
+         * cheapest literal realization of this output's tied cardinality.
+         */
+        int cheapest = 0;
+        for (int p = 1; p < count; ++p) {
+            if (
+                outputs[output].candidate[p].literal_count <
+                    outputs[output].candidate[cheapest].literal_count
+            ) {
+                cheapest = p;
+            }
+        }
+        if (cheapest != 0) {
+            keep[output][cheapest] = true;
+            outputs[output].candidate[cheapest].value_rank = 1;
+            keep_count[output]++;
+        }
 
         int reference_count = 0;
         for (int other = 0; other < noutputs; ++other) {
@@ -546,6 +602,32 @@ static int candidate_added_cubes(
     return added;
 }
 
+static int candidate_added_literals(
+    const PoolCandidate *candidate,
+    const int *refcount,
+    const CubeRecord *records
+) {
+    int added = 0;
+    for (int i = 0; i < candidate->len; ++i) {
+        int id = candidate->cube_ids[i];
+        if (refcount[id] == 0) added += records[id].literal_count;
+    }
+    return added;
+}
+
+static int candidate_removed_literals(
+    const PoolCandidate *candidate,
+    const int *refcount,
+    const CubeRecord *records
+) {
+    int removed = 0;
+    for (int i = 0; i < candidate->len; ++i) {
+        int id = candidate->cube_ids[i];
+        if (refcount[id] == 1) removed += records[id].literal_count;
+    }
+    return removed;
+}
+
 static int add_candidate(
     const PoolCandidate *candidate,
     int *refcount
@@ -575,17 +657,26 @@ static int selection_union(
     int noutputs,
     const int *choice,
     int cube_count,
-    int *refcount
+    int *refcount,
+    const CubeRecord *records,
+    int *literal_count
 ) {
     memset(refcount, 0, (size_t)cube_count * sizeof(int));
     int distinct = 0;
+    int literals = 0;
     for (int output = 0; output < noutputs; ++output) {
         if (outputs[output].count <= 0 || choice[output] < 0) continue;
+        literals += candidate_added_literals(
+            &outputs[output].candidate[choice[output]],
+            refcount,
+            records
+        );
         distinct += add_candidate(
             &outputs[output].candidate[choice[output]],
             refcount
         );
     }
+    if (literal_count) *literal_count = literals;
     return distinct;
 }
 
@@ -593,9 +684,11 @@ static int coordinate_descent(
     const OutputPool *outputs,
     int noutputs,
     int cube_count,
+    const CubeRecord *records,
     int start_mode,
     int *choice,
-    int *refcount
+    int *refcount,
+    int *literal_count
 ) {
     for (int output = 0; output < noutputs; ++output) {
         int count = outputs[output].count;
@@ -620,12 +713,15 @@ static int coordinate_descent(
         }
     }
 
+    int literals = 0;
     int distinct = selection_union(
         outputs,
         noutputs,
         choice,
         cube_count,
-        refcount
+        refcount,
+        records,
+        &literals
     );
 
     for (int pass = 0; pass < 32; ++pass) {
@@ -635,6 +731,11 @@ static int coordinate_descent(
             if (count <= 1) continue;
 
             int old = choice[output];
+            literals -= candidate_removed_literals(
+                &outputs[output].candidate[old],
+                refcount,
+                records
+            );
             distinct -= remove_candidate(
                 &outputs[output].candidate[old],
                 refcount
@@ -642,25 +743,51 @@ static int coordinate_descent(
 
             int best = old;
             int best_union = INT_MAX;
+            int best_literals = INT_MAX;
             int best_potential = INT_MIN;
             for (int p = 0; p < count; ++p) {
                 int candidate_union = distinct + candidate_added_cubes(
                     &outputs[output].candidate[p],
                     refcount
                 );
+                int candidate_literals =
+                    literals + candidate_added_literals(
+                        &outputs[output].candidate[p],
+                        refcount,
+                        records
+                    );
                 int potential = outputs[output].candidate[p].potential;
                 if (
                     candidate_union < best_union ||
-                    (candidate_union == best_union && potential > best_potential) ||
-                    (candidate_union == best_union && potential == best_potential && p < best)
+                    (
+                        candidate_union == best_union &&
+                        candidate_literals < best_literals
+                    ) ||
+                    (
+                        candidate_union == best_union &&
+                        candidate_literals == best_literals &&
+                        potential > best_potential
+                    ) ||
+                    (
+                        candidate_union == best_union &&
+                        candidate_literals == best_literals &&
+                        potential == best_potential &&
+                        p < best
+                    )
                 ) {
                     best = p;
                     best_union = candidate_union;
+                    best_literals = candidate_literals;
                     best_potential = potential;
                 }
             }
 
             choice[output] = best;
+            literals += candidate_added_literals(
+                &outputs[output].candidate[best],
+                refcount,
+                records
+            );
             distinct += add_candidate(
                 &outputs[output].candidate[best],
                 refcount
@@ -670,17 +797,26 @@ static int coordinate_descent(
         if (!changed) break;
     }
 
+    if (literal_count) *literal_count = literals;
     return distinct;
 }
 
 static void exact_search_recurse(
     ExactSearch *search,
     int depth,
-    int current_union
+    int current_union,
+    int current_literals
 ) {
     if (depth == search->active_count) {
-        if (current_union < search->best_union) {
+        if (
+            current_union < search->best_union ||
+            (
+                current_union == search->best_union &&
+                current_literals < search->best_literals
+            )
+        ) {
             search->best_union = current_union;
+            search->best_literals = current_literals;
             memcpy(
                 search->best_choice,
                 search->current_choice,
@@ -698,11 +834,30 @@ static void exact_search_recurse(
             candidate,
             search->refcount
         );
-        if (next_union >= search->best_union) continue;
+        int next_literals =
+            current_literals + candidate_added_literals(
+                candidate,
+                search->refcount,
+                search->records
+            );
+        if (
+            next_union > search->best_union ||
+            (
+                next_union == search->best_union &&
+                next_literals >= search->best_literals
+            )
+        ) {
+            continue;
+        }
 
         add_candidate(candidate, search->refcount);
         search->current_choice[depth] = p;
-        exact_search_recurse(search, depth + 1, next_union);
+        exact_search_recurse(
+            search,
+            depth + 1,
+            next_union,
+            next_literals
+        );
         remove_candidate(candidate, search->refcount);
     }
 }
@@ -823,6 +978,15 @@ bool select_joint_pool_solutions(
                     break;
                 }
                 candidate->cube_ids[i] = id;
+                if (
+                    candidate->literal_count >
+                    INT_MAX - universe.records[id].literal_count
+                ) {
+                    ok = false;
+                    break;
+                }
+                candidate->literal_count +=
+                    universe.records[id].literal_count;
             }
         }
     }
@@ -886,17 +1050,28 @@ bool select_joint_pool_solutions(
     }
 
     int best_union = INT_MAX;
+    int best_literals = INT_MAX;
     for (int mode = 0; mode < 3; ++mode) {
+        int trial_literals = 0;
         int trial_union = coordinate_descent(
             outputs,
             noutputs,
             universe.count,
+            universe.records,
             mode,
             trial,
-            refcount
+            refcount,
+            &trial_literals
         );
-        if (trial_union < best_union) {
+        if (
+            trial_union < best_union ||
+            (
+                trial_union == best_union &&
+                trial_literals < best_literals
+            )
+        ) {
             best_union = trial_union;
+            best_literals = trial_literals;
             memcpy(choice, trial, (size_t)noutputs * sizeof(int));
         }
     }
@@ -951,10 +1126,13 @@ bool select_joint_pool_solutions(
             .refcount = refcount,
             .current_choice = current_order_choice,
             .best_choice = best_order_choice,
-            .best_union = best_union
+            .best_union = best_union,
+            .best_literals = best_literals,
+            .records = universe.records
         };
-        exact_search_recurse(&search, 0, 0);
+        exact_search_recurse(&search, 0, 0, 0);
         best_union = search.best_union;
+        best_literals = search.best_literals;
         for (int depth = 0; depth < order_count; ++depth) {
             choice[order[depth]] = best_order_choice[depth];
         }
@@ -962,12 +1140,15 @@ bool select_joint_pool_solutions(
         free(best_order_choice);
     }
 
+    int selected_literals = 0;
     int selected_distinct = selection_union(
         outputs,
         noutputs,
         choice,
         universe.count,
-        refcount
+        refcount,
+        universe.records,
+        &selected_literals
     );
     int selected_shared = 0;
     for (int id = 0; id < universe.count; ++id) {
@@ -993,6 +1174,7 @@ bool select_joint_pool_solutions(
         stats->pool_shared_cubes = pool_shared;
         stats->output_connections = connections;
         stats->selected_distinct_cubes = selected_distinct;
+        stats->selected_input_literals = selected_literals;
         stats->selected_shared_cubes = selected_shared;
         stats->sharing_savings = connections - selected_distinct;
         stats->selection_exact = exact;
@@ -1026,6 +1208,7 @@ bool measure_selected_pool_solutions(
     if (connections == 0u) {
         stats->output_connections = 0;
         stats->selected_distinct_cubes = 0;
+        stats->selected_input_literals = 0;
         stats->selected_shared_cubes = 0;
         stats->sharing_savings = 0;
         return true;
@@ -1056,11 +1239,14 @@ bool measure_selected_pool_solutions(
 
     if (ok) {
         int selected_shared = 0;
+        int selected_literals = 0;
         for (int id = 0; id < universe.count; ++id) {
             if (refcount[id] > 1) selected_shared++;
+            selected_literals += universe.records[id].literal_count;
         }
         stats->output_connections = (int)connections;
         stats->selected_distinct_cubes = universe.count;
+        stats->selected_input_literals = selected_literals;
         stats->selected_shared_cubes = selected_shared;
         stats->sharing_savings = (int)connections - universe.count;
     }

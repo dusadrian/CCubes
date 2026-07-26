@@ -14,6 +14,7 @@ typedef struct {
     int pool_shared_cubes;
     int output_connections;
     int selected_distinct_cubes;
+    int selected_input_literals;
     int selected_shared_cubes;
     int sharing_savings;
     bool selection_exact;
@@ -21,8 +22,9 @@ typedef struct {
 
 /*
 Select one candidate cover per output so that their union contains as few
-distinct cubes as possible. Exact enumeration is used for bounded pool
-products; larger products use deterministic multi-start coordinate descent.
+distinct cubes as possible, then as few input literals as possible among
+equal-size unions. Exact enumeration is used for bounded pool products;
+larger products use deterministic multi-start coordinate descent.
 chosen_pool[o] is a pool index, or -1 when the existing indices are the only
 available cover for that output.
 */

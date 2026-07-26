@@ -43,6 +43,7 @@ int main(void) {
     assert(stats.selection_exact);
     assert(stats.output_connections == 3);
     assert(stats.selected_distinct_cubes == 2);
+    assert(stats.selected_input_literals == 2);
     assert(stats.selected_shared_cubes == 1);
     assert(stats.sharing_savings == 1);
     assert(stats.pool_shared_cubes == 3);
@@ -57,6 +58,7 @@ int main(void) {
     assert(measure_selected_pool_solutions(pinfo, 3, 1, &stats));
     assert(stats.output_connections == 3);
     assert(stats.selected_distinct_cubes == 2);
+    assert(stats.selected_input_literals == 2);
     assert(stats.selected_shared_cubes == 1);
     assert(stats.sharing_savings == 1);
 
@@ -138,6 +140,86 @@ int main(void) {
     assert(value_chosen[0] == 0);
     assert(value_chosen[1] == 0);
     assert(stats.selected_distinct_cubes == 1);
+    assert(stats.selected_input_literals == 1);
+
+    /*
+    With one output, sharing cannot distinguish tied one-term covers.  The
+    second candidate fixes one input instead of four, so exact literal cost
+    must replace the solver-ranked first candidate without any extra search.
+    */
+    PIstorage literal_info;
+    memset(&literal_info, 0, sizeof(literal_info));
+    uint64_t literal_positions[2] = {UINT64_C(0xff), UINT64_C(0x03)};
+    uint64_t literal_values[2] = {0u, 0u};
+    int literal_indices[2] = {0, 1};
+    int *literal_pools[2] = {
+        &literal_indices[0],
+        &literal_indices[1]
+    };
+    literal_info.ON_minterms = 1;
+    literal_info.foundPI = 2;
+    literal_info.solmin = 1;
+    literal_info.prevsolmin = 2;
+    literal_info.implicants_pos = literal_positions;
+    literal_info.implicants_val = literal_values;
+    literal_info.pool_count = 2;
+    literal_info.pool_solutions = literal_pools;
+
+    int literal_chosen = -1;
+    assert(select_joint_pool_solutions(
+        &literal_info,
+        1,
+        1,
+        &literal_chosen,
+        &stats
+    ));
+    assert(literal_chosen == 1);
+    assert(stats.selected_distinct_cubes == 1);
+    assert(stats.selected_input_literals == 1);
+
+    /*
+    Literal cost is strictly secondary to sharing.  Choosing the four-literal
+    cube S for both outputs gives one distinct product; choosing their
+    one-literal alternatives U0/U1 would give two.
+    */
+    PIstorage priority_info[2];
+    memset(priority_info, 0, sizeof(priority_info));
+    uint64_t priority_positions[2][2] = {
+        {UINT64_C(0xff), UINT64_C(0x03)}, /* S, U0 */
+        {UINT64_C(0xff), UINT64_C(0x0c)}  /* S, U1 */
+    };
+    uint64_t priority_values[2][2] = {{0u, 0u}, {0u, 0u}};
+    int priority_indices[2][2] = {{0, 1}, {0, 1}};
+    int *priority_pools[2][2];
+    for (int output = 0; output < 2; ++output) {
+        priority_pools[output][0] = &priority_indices[output][0];
+        priority_pools[output][1] = &priority_indices[output][1];
+        priority_info[output].ON_minterms = 1;
+        priority_info[output].foundPI = 2;
+        priority_info[output].solmin = 1;
+        priority_info[output].prevsolmin = 2;
+        priority_info[output].implicants_pos =
+            priority_positions[output];
+        priority_info[output].implicants_val =
+            priority_values[output];
+        priority_info[output].pool_count = 2;
+        priority_info[output].pool_solutions =
+            priority_pools[output];
+    }
+
+    int priority_chosen[2] = {-1, -1};
+    assert(select_joint_pool_solutions(
+        priority_info,
+        2,
+        1,
+        priority_chosen,
+        &stats
+    ));
+    assert(priority_chosen[0] == 0);
+    assert(priority_chosen[1] == 0);
+    assert(stats.selected_distinct_cubes == 1);
+    assert(stats.selected_input_literals == 4);
+    assert(stats.sharing_savings == 1);
 
     puts("pool selection regression: OK");
     return 0;

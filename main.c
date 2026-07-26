@@ -2041,7 +2041,8 @@ int main(int argc, char *argv[]) {
                     "CCUBES_POOL level=%d active_outputs=%d generated=%d "
                     "valuable=%d discarded=%d candidates=%d "
                     "retained_shared=%d pool_shared=%d connections=%d "
-                    "selected_rows=%d selected_shared=%d savings=%d selection=%s\n",
+                    "selected_rows=%d input_literals=%d "
+                    "selected_shared=%d savings=%d selection=%s\n",
                     k,
                     pool_stats.active_outputs,
                     pool_stats.generated_pool_solutions,
@@ -2052,6 +2053,7 @@ int main(int argc, char *argv[]) {
                     pool_stats.pool_shared_cubes,
                     pool_stats.output_connections,
                     pool_stats.selected_distinct_cubes,
+                    pool_stats.selected_input_literals,
                     pool_stats.selected_shared_cubes,
                     pool_stats.sharing_savings,
                     pool_stats.selection_exact ? "exact" : "local"
