@@ -141,7 +141,6 @@ typedef struct {
     size_t table_size;
     size_t count;
     int words;
-    bool include_current_level;
     SubsumptionIndex subsumption_index;
     atomic_uint_fast64_t subsumption_rejections;
 } PICoverageIndex;
@@ -251,8 +250,7 @@ bool build_pi_coverage_indices(
     PIstorage *PInfo,
     int noutputs,
     const int *level_start,
-    int implicant_words,
-    bool deterministic_order
+    int implicant_words
 );
 
 void destroy_pi_coverage_indices(
@@ -264,13 +262,15 @@ int finalize_pi_level(
     PIstorage *PInfo,
     int implicant_words,
     int level_start,
-    bool deterministic_order
+    bool deterministic_order,
+    bool preserve_shared_geometries
 );
 
 int canonicalize_pi_order(
     PIstorage *PInfo,
     int implicant_words,
-    int level_start
+    int level_start,
+    bool preserve_shared_geometries
 );
 
 #endif // UTILS_H

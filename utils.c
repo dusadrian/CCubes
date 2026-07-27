@@ -385,18 +385,91 @@ static void pi_coverage_insert(
     slots[pos] = idx;
 }
 
-static void pi_coverage_replace(
-    PIstorage *pi,
+static uint64_t pi_geometry_hash(
+    const PIstorage *pi,
+    int implicant_words,
+    int idx
+) {
+    const uint64_t FNV_PRIME = 1099511628211ULL;
+    uint64_t hash = 1469598103934665603ULL;
+    const uint64_t *positions = &pi->implicants_pos[
+        (size_t)idx * (size_t)implicant_words
+    ];
+    const uint64_t *values = &pi->implicants_val[
+        (size_t)idx * (size_t)implicant_words
+    ];
+
+    for (int word = 0; word < implicant_words; ++word) {
+        hash ^= positions[word];
+        hash *= FNV_PRIME;
+        hash ^= values[word];
+        hash *= FNV_PRIME;
+    }
+    return hash;
+}
+
+static bool pi_geometry_equal(
+    const PIstorage *pi,
+    int implicant_words,
+    int a,
+    int b
+) {
+    return cmp_u64_words(
+        &pi->implicants_pos[(size_t)a * (size_t)implicant_words],
+        &pi->implicants_pos[(size_t)b * (size_t)implicant_words],
+        implicant_words
+    ) == 0 && cmp_u64_words(
+        &pi->implicants_val[(size_t)a * (size_t)implicant_words],
+        &pi->implicants_val[(size_t)b * (size_t)implicant_words],
+        implicant_words
+    ) == 0;
+}
+
+static int pi_geometry_lookup(
+    const PIstorage *pi,
+    int implicant_words,
     int *slots,
     size_t table_size,
     int idx
 ) {
     size_t mask = table_size - 1u;
-    size_t pos = (size_t)(pi_coverage_hash(pi, idx) & (uint64_t)mask);
+    size_t pos = (size_t)(
+        pi_geometry_hash(pi, implicant_words, idx) & (uint64_t)mask
+    );
 
     while (slots[pos] >= 0) {
-        if (pi_coverage_equal(pi, slots[pos], idx)) {
-            slots[pos] = idx;
+        if (pi_geometry_equal(
+            pi,
+            implicant_words,
+            slots[pos],
+            idx
+        )) {
+            return slots[pos];
+        }
+        pos = (pos + 1u) & mask;
+    }
+    return -1;
+}
+
+static void pi_geometry_insert(
+    const PIstorage *pi,
+    int implicant_words,
+    int *slots,
+    size_t table_size,
+    int idx
+) {
+    size_t mask = table_size - 1u;
+    size_t pos = (size_t)(
+        pi_geometry_hash(pi, implicant_words, idx) & (uint64_t)mask
+    );
+
+    while (slots[pos] >= 0) {
+        if (pi_geometry_equal(
+            pi,
+            implicant_words,
+            slots[pos],
+            idx
+        )) {
             return;
         }
         pos = (pos + 1u) & mask;
@@ -535,8 +608,7 @@ bool build_pi_coverage_indices(
     PIstorage *PInfo,
     int noutputs,
     const int *level_start,
-    int implicant_words,
-    bool deterministic_order
+    int implicant_words
 ) {
     if (
         !indices ||
@@ -556,7 +628,6 @@ bool build_pi_coverage_indices(
 
     for (int o = 0; o < noutputs; ++o) {
         PICoverageIndex *index = &(*indices)[o];
-        index->include_current_level = !deterministic_order;
         index->words = PInfo[o].pichart_words;
         atomic_init(&index->subsumption_rejections, 0);
 
@@ -578,9 +649,7 @@ bool build_pi_coverage_indices(
             return false;
         }
 
-        int records = deterministic_order
-            ? level_start[o]
-            : PInfo[o].foundPI;
+        int records = level_start[o];
         if (records < 0) records = 0;
         if (records > PInfo[o].foundPI) records = PInfo[o].foundPI;
 
@@ -654,7 +723,8 @@ static void copy_pi_record(
 static int prune_duplicate_coverage_in_level(
     PIstorage *pi,
     int implicant_words,
-    int level_start
+    int level_start,
+    bool preserve_shared_geometries
 ) {
     int found = pi->foundPI;
     size_t table_size = 1u;
@@ -662,40 +732,93 @@ static int prune_duplicate_coverage_in_level(
         table_size <<= 1u;
     }
 
-    int *slots = (int *)malloc(table_size * sizeof(int));
-    if (!slots) return 0;
+    int *coverage_slots = (int *)malloc(table_size * sizeof(int));
+    int *geometry_slots = preserve_shared_geometries
+        ? (int *)malloc(table_size * sizeof(int))
+        : NULL;
+    if (!coverage_slots || (preserve_shared_geometries && !geometry_slots)) {
+        free(coverage_slots);
+        free(geometry_slots);
+        return 0;
+    }
 
     for (size_t i = 0; i < table_size; ++i) {
-        slots[i] = -1;
+        coverage_slots[i] = -1;
+        if (geometry_slots) geometry_slots[i] = -1;
     }
 
     for (int i = 0; i < level_start; ++i) {
-        pi_coverage_insert(pi, slots, table_size, i);
+        pi_coverage_insert(pi, coverage_slots, table_size, i);
+        if (geometry_slots) {
+            pi_geometry_insert(
+                pi,
+                implicant_words,
+                geometry_slots,
+                table_size,
+                i
+            );
+        }
     }
 
     int write = level_start;
     for (int read = level_start; read < found; ++read) {
-        int existing = pi_coverage_lookup(pi, slots, table_size, read);
-        if (existing >= 0) {
+        int existing_coverage = pi_coverage_lookup(
+            pi,
+            coverage_slots,
+            table_size,
+            read
+        );
+        int existing_geometry = geometry_slots
+            ? pi_geometry_lookup(
+                pi,
+                implicant_words,
+                geometry_slots,
+                table_size,
+                read
+            )
+            : -1;
+
+        if (existing_geometry >= 0) continue;
+        if (existing_coverage >= 0) {
             /*
-            Keep one shareable representative from the new level even when a
-            lower-level PI has identical local coverage. Current-level records
-            are sorted by sharing count, so later duplicates can be discarded.
-            */
-            if (existing >= level_start || pi->shared[read] <= 0) continue;
+             * Equal local coverage makes unshared cubes interchangeable for
+             * the per-output covering problem. Distinct shareable geometries
+             * are not interchangeable for joint pooling, however: each may
+             * match a different output. Retain those alternatives while still
+             * collapsing exact geometry duplicates.
+             */
+            if (
+                !preserve_shared_geometries ||
+                pi->shared[read] <= 0
+            ) {
+                continue;
+            }
         }
 
         copy_pi_record(pi, write, read, implicant_words);
-        if (existing >= 0) {
-            pi_coverage_replace(pi, slots, table_size, write);
-        } else {
-            pi_coverage_insert(pi, slots, table_size, write);
+        if (existing_coverage < 0) {
+            pi_coverage_insert(
+                pi,
+                coverage_slots,
+                table_size,
+                write
+            );
+        }
+        if (geometry_slots) {
+            pi_geometry_insert(
+                pi,
+                implicant_words,
+                geometry_slots,
+                table_size,
+                write
+            );
         }
         write++;
     }
 
     pi->foundPI = write;
-    free(slots);
+    free(coverage_slots);
+    free(geometry_slots);
     return 1;
 }
 
@@ -770,10 +893,24 @@ int finalize_pi_level(
     PIstorage *PInfo,
     int implicant_words,
     int level_start,
-    bool deterministic_order
+    bool deterministic_order,
+    bool preserve_shared_geometries
 ) {
     if (deterministic_order) {
-        return canonicalize_pi_order(PInfo, implicant_words, level_start);
+        return canonicalize_pi_order(
+            PInfo,
+            implicant_words,
+            level_start,
+            preserve_shared_geometries
+        );
+    }
+    if (!prune_duplicate_coverage_in_level(
+        PInfo,
+        implicant_words,
+        level_start,
+        preserve_shared_geometries
+    )) {
+        return 0;
     }
     return rebuild_pi_buckets(PInfo, level_start);
 }
@@ -781,7 +918,8 @@ int finalize_pi_level(
 int canonicalize_pi_order(
     PIstorage *pi,
     int implicant_words,
-    int level_start
+    int level_start,
+    bool preserve_shared_geometries
 ) {
     if (!pi || pi->foundPI <= 0 || pi->ON_minterms <= 0) return 1;
 
@@ -790,7 +928,15 @@ int canonicalize_pi_order(
 
     int n = pi->foundPI - level_start;
     if (n <= 1) {
-        if (n == 1 && !prune_duplicate_coverage_in_level(pi, implicant_words, level_start)) {
+        if (
+            n == 1 &&
+            !prune_duplicate_coverage_in_level(
+                pi,
+                implicant_words,
+                level_start,
+                preserve_shared_geometries
+            )
+        ) {
             return 0;
         }
         return rebuild_pi_buckets(pi, level_start);
@@ -892,7 +1038,12 @@ int canonicalize_pi_order(
     free(tmp_shared);
     free(tmp_covsum);
 
-    if (!prune_duplicate_coverage_in_level(pi, implicant_words, level_start)) {
+    if (!prune_duplicate_coverage_in_level(
+        pi,
+        implicant_words,
+        level_start,
+        preserve_shared_geometries
+    )) {
         return 0;
     }
 
@@ -2224,16 +2375,15 @@ int process_task(
                  * level index for that exact lookup instead of scanning every
                  * earlier PI while holding the output lock.
                  *
-                 * In deterministic mode the index contains only completed
-                 * levels and is immutable during the worker pass, so this
-                 * lookup is contention-free. Current-level duplicates are
-                 * removed by canonicalize_pi_order after the workers finish.
+                 * The index contains only completed levels and is immutable
+                 * during the worker pass, so this lookup is contention-free.
+                 * Current-level duplicates are removed by finalize_pi_level()
+                 * after all workers finish.
                  */
                 if (
                     !shareable &&
                     !redundant &&
-                    coverage_index &&
-                    !coverage_index->include_current_level
+                    coverage_index
                 ) {
                     redundant = coverage_index_lookup_words(
                         coverage_index,
@@ -2260,38 +2410,6 @@ int process_task(
                     int *foundPI = &PInfo[o].foundPI;
                     int *shared = PInfo[o].shared;
                     int *covsum = PInfo[o].covsum;
-
-                    /*
-                     * Non-deterministic mode historically removed duplicate
-                     * current-level coverages as workers arrived. Preserve
-                     * that behavior with a synchronized hash lookup.
-                     */
-                    bool coverage_checked_absent = false;
-                    if (
-                        !shareable &&
-                        coverage_index &&
-                        coverage_index->include_current_level
-                    ) {
-                        redundant = coverage_index_lookup_words(
-                            coverage_index,
-                            &task_pichart_values[
-                                (size_t)f * (size_t)pichart_words
-                            ]
-                        ) >= 0;
-                        coverage_checked_absent = !redundant;
-                    }
-
-                    if (redundant) {
-                        if (lock_stats_active) {
-                            lock_stats_record(
-                                tid, o,
-                                lock_held_start - lock_wait_start,
-                                lock_stats_now_ns() - lock_held_start
-                            );
-                        }
-                        if (output_locks) ccubes_mutex_unlock(&output_locks[o]);
-                        continue;
-                    }
 
                     // Ensure capacity before writing the next PI
                     if ((*foundPI + 1) > *estimPI) {
@@ -2337,34 +2455,6 @@ int process_task(
                         *max_shared = shared[*foundPI];
                     }
                     covsum[*foundPI] = u_covsum;
-
-                    bool coverage_insert_ok = true;
-                    if (coverage_index && coverage_index->include_current_level) {
-                        const uint64_t *coverage_key = &task_pichart_values[
-                            (size_t)f * (size_t)pichart_words
-                        ];
-                        coverage_insert_ok = coverage_checked_absent
-                            ? coverage_index_insert_known_new(coverage_index, coverage_key)
-                            : coverage_index_insert_words(coverage_index, coverage_key);
-                    }
-                    if (!coverage_insert_ok) {
-                        if (lock_stats_active) {
-                            lock_stats_record(
-                                tid, o,
-                                lock_held_start - lock_wait_start,
-                                lock_stats_now_ns() - lock_held_start
-                            );
-                        }
-                        if (output_locks) {
-                            ccubes_mutex_unlock(&output_locks[o]);
-                        }
-                        free(output_map);
-                        free(covsum_map);
-                        free(found_map);
-                        free(uniquePIs);
-                        free(shared_count);
-                        return 1;
-                    }
 
                     (*foundPI)++;
 

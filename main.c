@@ -316,6 +316,12 @@ int main(int argc, char *argv[]) {
     int SCP_TYPE = 0;
     int HYBRID_EFFORT_LEVEL = 0;
     int POOL_MAX = 1; // collect up to this many solutions
+    /*
+     * Current-level coverage deduplication is always deferred until the level
+     * is complete, keeping the worker-side index immutable and lock-free.
+     * This flag controls only whether records are canonically sorted before
+     * the common pruning/finalization pass.
+     */
     bool DETERMINISTIC_PI_ORDER = env_flag_enabled("CCUBES_DETERMINISTIC");
     PIGeneratorMode PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
     bool CERTIFIED_MODE = false;
@@ -1249,8 +1255,7 @@ int main(int argc, char *argv[]) {
                 PInfo,
                 noutputs,
                 level_start,
-                implicant_words,
-                DETERMINISTIC_PI_ORDER
+                implicant_words
             )) {
                 fprintf(stderr, "Error: failed to build PI coverage indices\n");
                 ccubes_mutex_destroy(&state_lock);
@@ -1355,8 +1360,7 @@ int main(int argc, char *argv[]) {
                     PInfo,
                     noutputs,
                     level_start,
-                    implicant_words,
-                    DETERMINISTIC_PI_ORDER
+                    implicant_words
                 )) {
                     fprintf(stderr, "Error: failed to build PI coverage indices\n");
                     ccubes_mutex_destroy(&state_lock);
@@ -1497,7 +1501,8 @@ int main(int argc, char *argv[]) {
                 &PInfo[o],
                 implicant_words,
                 level_start[o],
-                DETERMINISTIC_PI_ORDER || use_mmcs_level
+                DETERMINISTIC_PI_ORDER,
+                POOL_MAX > 1 || WEIGHT_PIC == 2
             )) {
                 fprintf(
                     stderr,
