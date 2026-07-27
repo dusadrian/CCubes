@@ -23,6 +23,7 @@
 !examples/**
 !tests/
 !tests/test_effort_policy.sh
+!tests/test_mmcs_generator.sh
 
 temp/
 proofs/

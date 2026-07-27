@@ -548,7 +548,6 @@ void gurobi_solution_pool(
     int *solmin
 ) {
     (void)chart;
-    (void)ON_minterms;
     (void)max_pool;
     (void)weights;
     (void)initial_solution;

@@ -19,6 +19,23 @@
 #include "ccubes_threads.h"
 #include "pool_selection.h"
 #include "plateau_probe.h"
+#include "bounded_mmcs.h"
+
+#define CCUBES_AUTO_MMCS_MIN_PROJECTION_TASKS UINT64_C(8192)
+#define CCUBES_AUTO_MMCS_MIN_NODE_BUDGET UINT64_C(8192)
+/*
+ * Ceiling on the break-even budget.  Break-even alone would let a hopeless
+ * trial run as long as projection would; this caps the wasted effort while
+ * still being ~10^4 times the old fixed budget.
+ */
+#define CCUBES_AUTO_MMCS_MAX_NODE_LIMIT UINT64_C(100000000)
+#define CCUBES_AUTO_MMCS_MAX_TRIAL_THREADS 4
+
+typedef enum {
+    PI_GENERATOR_AUTO = 0,
+    PI_GENERATOR_PROJECTION,
+    PI_GENERATOR_MMCS
+} PIGeneratorMode;
 
 typedef struct {
     int k;
@@ -44,6 +61,22 @@ typedef struct {
     atomic_uint_fast64_t *last_task_reached;
     ccubes_mutex *state_lock;
 } PIWorkerContext;
+
+typedef struct {
+    int level;
+    int ninputs;
+    int noutputs;
+    int *bit_index;
+    int *word_index;
+    uint64_t *shifted_mask;
+    int implicant_words;
+    PIstorage *PInfo;
+    BoundedMMCSStats *stats;
+    BoundedMMCSResult *results;
+    uint64_t node_limit;
+    atomic_bool *fallback;
+    atomic_bool *failed;
+} MMCSWorkerContext;
 
 static void pi_search_range_worker(
     uint64_t start,
@@ -121,6 +154,107 @@ static void pi_search_range_worker(
     }
 }
 
+static void mmcs_search_range_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)worker_id;
+    (void)worker_count;
+    MMCSWorkerContext *ctx = (MMCSWorkerContext *)data;
+
+    for (uint64_t task = start; task < end; task += stride) {
+        if (
+            atomic_load_explicit(ctx->failed, memory_order_acquire) ||
+            (
+                ctx->node_limit > 0 &&
+                atomic_load_explicit(ctx->fallback, memory_order_acquire)
+            )
+        ) {
+            break;
+        }
+
+        int output = (int)task;
+        if (
+            output < 0 ||
+            output >= ctx->noutputs ||
+            ctx->PInfo[output].stop_search
+        ) {
+            continue;
+        }
+
+        BoundedMMCSResult result = bounded_mmcs_generate_output_level_limited(
+            &ctx->PInfo[output],
+            ctx->ninputs,
+            ctx->level,
+            ctx->word_index,
+            ctx->bit_index,
+            ctx->shifted_mask,
+            ctx->implicant_words,
+            ctx->node_limit,
+            &ctx->stats[output]
+        );
+        ctx->results[output] = result;
+
+        if (result == BOUNDED_MMCS_ERROR) {
+            fprintf(
+                stderr,
+                "Error: bounded MMCS generation failed for output %d at k=%d\n",
+                output + 1,
+                ctx->level
+            );
+            atomic_store_explicit(ctx->failed, true, memory_order_release);
+            break;
+        }
+        if (result == BOUNDED_MMCS_LIMIT_REACHED) {
+            atomic_store_explicit(ctx->fallback, true, memory_order_release);
+            break;
+        }
+    }
+}
+
+/*
+ * Smallest blocker edge for one output: the least Hamming distance between any
+ * ON row and any OFF row.  mmcs_search() pivots on the smallest uncovered edge
+ * and branches once per allowed vertex in it, so this is the branching factor
+ * at the root and a lower bound on it thereafter.  Computed once per run.
+ */
+static int min_blocker_edge(const PIstorage *pi, int ninputs) {
+    int best = INT_MAX;
+    for (int a = 0; a < pi->ON_minterms; ++a) {
+        const int *on_row = &pi->ON_set[(size_t)a * (size_t)ninputs];
+        for (int b = 0; b < pi->OFF_minterms; ++b) {
+            const int *off_row = &pi->OFF_set[(size_t)b * (size_t)ninputs];
+            int d = 0;
+            for (int i = 0; i < ninputs && d < best; ++i) {
+                if (on_row[i] != off_row[i]) ++d;
+            }
+            if (d > 0 && d < best) best = d;
+        }
+    }
+    return best == INT_MAX ? 1 : best;
+}
+
+/*
+ * Screen: is a branching factor of `b` to depth `k` plausibly within `budget`?
+ * The tree is at most b^k, so this rejects the hopeless cases before any node
+ * is spent.  It deliberately over-estimates -- the pivot edge shrinks as the
+ * search proceeds and canonical forbidding trims branches -- so it is used
+ * only to reject, with the budget making the finer decision.
+ */
+static bool mmcs_branching_plausible(int b, int k, uint64_t budget) {
+    if (b <= 1) return true;
+    uint64_t estimate = 1;
+    for (int i = 0; i < k; ++i) {
+        if (estimate > budget / (uint64_t)b) return false;
+        estimate *= (uint64_t)b;
+    }
+    return true;
+}
+
 void help() {
     printf("Usage: ccubes [options] source.pla [dest.pla]\n");
     printf("Options:\n");
@@ -144,6 +278,8 @@ void help() {
     printf("                         (explicitly overrides the -e0 heuristic plateau policy)\n");
     printf("                         (input-dash rows: heuristic plateau stopping)\n");
     printf("  -p                   : enable automatic equal-cardinality cover pooling\n");
+    printf("  --pi-generator=<name>: PI generator: auto (default), projection, or mmcs\n");
+    printf("                         (projection/mmcs are expert reproducibility overrides)\n");
     printf("  -l<sec>[=<file>]     : time limit to save a checkpoint in the <file>\n");
     printf("  -r=<file>            : resume from checkpoint file\n");
     printf("  -i<level>=<file>     : inspect checkpoint (print progress and metadata)\n");
@@ -181,6 +317,7 @@ int main(int argc, char *argv[]) {
     int HYBRID_EFFORT_LEVEL = 0;
     int POOL_MAX = 1; // collect up to this many solutions
     bool DETERMINISTIC_PI_ORDER = env_flag_enabled("CCUBES_DETERMINISTIC");
+    PIGeneratorMode PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
     bool CERTIFIED_MODE = false;
     bool REPORT_BLOCKING_DIAGNOSTIC = false;
     char *SRC_FILE = NULL;
@@ -290,6 +427,23 @@ int main(int argc, char *argv[]) {
             );
             help();
             return 1;
+        } else if (strncmp(argv[i], "--pi-generator=", 15) == 0) {
+            const char *generator = argv[i] + 15;
+            if (strcmp(generator, "auto") == 0) {
+                PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
+            } else if (strcmp(generator, "projection") == 0) {
+                PI_GENERATOR_MODE = PI_GENERATOR_PROJECTION;
+            } else if (strcmp(generator, "mmcs") == 0) {
+                PI_GENERATOR_MODE = PI_GENERATOR_MMCS;
+            } else {
+                fprintf(
+                    stderr,
+                    "Invalid PI generator: %s (must be auto, projection, or mmcs)\n",
+                    generator
+                );
+                help();
+                return 1;
+            }
         } else if (strncmp(argv[i], "-l", 2) == 0) {
             char *opt = argv[i] + 2;  // string after "-l"
             char *eq  = strchr(opt, '=');
@@ -375,6 +529,22 @@ int main(int argc, char *argv[]) {
     if (!SRC_FILE && !RESUME_PATH) {
         fprintf(stderr, "Error: source .pla file is required.\n");
         help();
+        return 1;
+    }
+
+    if (PI_GENERATOR_MODE == PI_GENERATOR_MMCS && RESUME_PATH) {
+        fprintf(
+            stderr,
+            "Error: the experimental MMCS generator does not yet support checkpoint resume.\n"
+        );
+        return 1;
+    }
+
+    if (PI_GENERATOR_MODE == PI_GENERATOR_MMCS && TIME_LIMIT_SEC > 0.0) {
+        fprintf(
+            stderr,
+            "Error: the experimental MMCS generator does not yet support time-limit checkpoints.\n"
+        );
         return 1;
     }
 
@@ -558,6 +728,30 @@ int main(int argc, char *argv[]) {
         free(chk_coverage_horizon);
         cleanup(PInfo, NULL);
         return 1;
+    }
+
+    if (
+        PI_GENERATOR_MODE == PI_GENERATOR_MMCS &&
+        !adaptive_stopping_supported
+    ) {
+        fprintf(
+            stderr,
+            "Error: the experimental MMCS generator requires fully specified "
+            "binary point rows with nonempty ON and OFF sets.\n"
+        );
+        free(chk_stop_counter);
+        free(chk_coverage_horizon);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+
+    if (PI_GENERATOR_MODE == PI_GENERATOR_MMCS) {
+        fprintf(
+            stderr,
+            "Notice: forcing experimental bounded MMCS-style PI generation.\n"
+        );
+    } else if (PI_GENERATOR_MODE == PI_GENERATOR_PROJECTION) {
+        fprintf(stderr, "Notice: forcing projection PI generation.\n");
     }
 
     if (!adaptive_stopping_supported) {
@@ -919,6 +1113,26 @@ int main(int argc, char *argv[]) {
 
     double scp_time = 0.0, k_scp_time = 0.0, pi_generation_time = 0.0;
 
+    /*
+     * Widest branching factor over all outputs.  A level trial falls back as
+     * soon as any single output exhausts its budget, so the level is only
+     * worth attempting if the hardest output is plausible.
+     */
+    int mmcs_branching = 1;
+    if (PI_GENERATOR_MODE == PI_GENERATOR_AUTO && adaptive_stopping_supported) {
+        for (int o = 0; o < noutputs; ++o) {
+            int b = min_blocker_edge(&PInfo[o], ninputs);
+            if (b > mmcs_branching) mmcs_branching = b;
+        }
+
+        DBG_INFO_BLOCK {
+            fprintf(
+                debug_out,
+                "CCUBES_MMCS_SCREEN branching=%d\n",
+                mmcs_branching
+            );
+        }
+    }
 
     int k;
     for (k = search_level; k <= ninputs; k++) {
@@ -934,7 +1148,69 @@ int main(int argc, char *argv[]) {
         k_scp_time = 0.0; // reset time for this level
         clock_gettime(CLOCK_MONOTONIC, &startk);
 
-        uint64_t maxtasks = nchoosek(ninputs, k);
+        uint64_t projection_tasks = nchoosek(ninputs, k);
+        bool automatic_mmcs_trial =
+            PI_GENERATOR_MODE == PI_GENERATOR_AUTO &&
+            adaptive_stopping_supported &&
+            !RESUME_PATH &&
+            TIME_LIMIT_SEC <= 0.0 &&
+            (
+                projection_tasks == 0 ||
+                projection_tasks > CCUBES_AUTO_MMCS_MIN_PROJECTION_TASKS
+            );
+        bool attempt_mmcs =
+            PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
+            automatic_mmcs_trial;
+        /*
+         * Break-even trial budget.  A search node costs about
+         * O(ninputs * edge_count) and a projection task about
+         * O((|ON| + |OFF|) * k); the row-count factor appears in both, so the
+         * total work compares as
+         *
+         *     nodes * ninputs   vs   C(ninputs, k) * k
+         *
+         * Equating them gives the budget below: abandon MMCS exactly once it
+         * has cost roughly what projection would, making the worst case ~2x
+         * projection while leaving the win unbounded.  A fixed budget cannot
+         * do this -- it is far too generous when C(n,k) is small and far too
+         * mean when C(n,k) is astronomical, which is precisely when MMCS is
+         * the only viable generator.  Divide before multiplying: C(n,k)
+         * reaches 10^9 at n=100, k=6.
+         */
+        uint64_t automatic_mmcs_node_limit = 0;
+        if (automatic_mmcs_trial && projection_tasks > 0) {
+            uint64_t budget = projection_tasks / (uint64_t)ninputs;
+            if (budget > UINT64_MAX / (uint64_t)k) {
+                budget = UINT64_MAX / (uint64_t)k;
+            }
+            budget *= (uint64_t)k;
+            if (budget < CCUBES_AUTO_MMCS_MIN_NODE_BUDGET) {
+                budget = CCUBES_AUTO_MMCS_MIN_NODE_BUDGET;
+            }
+            if (budget > CCUBES_AUTO_MMCS_MAX_NODE_LIMIT) {
+                budget = CCUBES_AUTO_MMCS_MAX_NODE_LIMIT;
+            }
+            /*
+             * Reject up front when the branching factor cannot fit the budget.
+             * Without this the break-even budget is itself the cost of being
+             * wrong, and on wide instances that is paid at every level.
+             */
+            if (!mmcs_branching_plausible(mmcs_branching, k, budget)) {
+                automatic_mmcs_trial = false;
+                attempt_mmcs = PI_GENERATOR_MODE == PI_GENERATOR_MMCS;
+            } else {
+                automatic_mmcs_node_limit = budget;
+            }
+        }
+
+        int mmcs_threads =
+            automatic_mmcs_trial && THREADS > CCUBES_AUTO_MMCS_MAX_TRIAL_THREADS
+                ? CCUBES_AUTO_MMCS_MAX_TRIAL_THREADS
+                : THREADS;
+        bool use_mmcs_level = false;
+        uint64_t maxtasks = attempt_mmcs
+            ? (uint64_t)noutputs
+            : projection_tasks;
         PICoverageIndex *coverage_indices = NULL;
         atomic_bool time_up;
         atomic_init(&time_up, false);
@@ -958,7 +1234,7 @@ int main(int argc, char *argv[]) {
             if (start_task > maxtasks) start_task = maxtasks; // safety
         }
 
-        if (maxtasks == 0) {
+        if (!attempt_mmcs && maxtasks == 0) {
             // overflow, too many tasks
             ccubes_mutex_destroy(&state_lock);
             destroy_output_locks(output_locks, noutputs);
@@ -967,68 +1243,185 @@ int main(int argc, char *argv[]) {
             return(1);
         }
 
-        if (!build_pi_coverage_indices(
-            &coverage_indices,
-            PInfo,
-            noutputs,
-            level_start,
-            implicant_words,
-            DETERMINISTIC_PI_ORDER
-        )) {
-            fprintf(stderr, "Error: failed to build PI coverage indices\n");
-            ccubes_mutex_destroy(&state_lock);
-            destroy_output_locks(output_locks, noutputs);
-            cleanup(PInfo, buffer);
-            return 1;
+        if (!attempt_mmcs) {
+            if (!build_pi_coverage_indices(
+                &coverage_indices,
+                PInfo,
+                noutputs,
+                level_start,
+                implicant_words,
+                DETERMINISTIC_PI_ORDER
+            )) {
+                fprintf(stderr, "Error: failed to build PI coverage indices\n");
+                ccubes_mutex_destroy(&state_lock);
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                return 1;
+            }
         }
 
         DBG_INFO_BLOCK {
             fprintf(debug_out, "\nk: %d\n", k);
-            fprintf(debug_out, "maxtasks: %lld\n", maxtasks);
+            if (attempt_mmcs) {
+                fprintf(debug_out, "output tasks: %llu\n",
+                    (unsigned long long)maxtasks);
+                if (automatic_mmcs_trial) {
+                    fprintf(
+                        debug_out,
+                        "automatic MMCS trial node limit per output: %llu "
+                        "(threads: %d)\n",
+                        (unsigned long long)automatic_mmcs_node_limit,
+                        mmcs_threads
+                    );
+                }
+            } else {
+                fprintf(debug_out, "maxtasks: %llu\n",
+                    (unsigned long long)maxtasks);
+            }
         }
 
-        PIWorkerContext pi_ctx = {
-            .k = k,
-            .ninputs = ninputs,
-            .noutputs = noutputs,
-            .nofvalues = nofvalues,
-            .bit_index = bit_index,
-            .word_index = word_index,
-            .shifted_mask = shifted_mask,
-            .implicant_words = implicant_words,
-            .PInfo = PInfo,
-            .buffer = buffer,
-            .output_locks = output_locks,
-            .coverage_indices = coverage_indices,
-            .max_shared = &max_shared,
-            .increase = increase,
-            .multiplier = &multiplier,
-            .time_limit_sec = TIME_LIMIT_SEC,
-            .base_elapsed = BASE_ELAPSED,
-            .start_time = start,
-            .time_up = &time_up,
-            .time_up_elapsed = &time_up_elapsed,
-            .last_task_reached = &last_task_reached,
-            .state_lock = &state_lock
-        };
-
         clock_gettime(CLOCK_MONOTONIC, &startpi);
-        if (
-            !ccubes_parallel_for(
+        BoundedMMCSStats mmcs_stats[noutputs];
+        memset(mmcs_stats, 0, sizeof(mmcs_stats));
+        BoundedMMCSResult mmcs_results[noutputs];
+        for (int o = 0; o < noutputs; ++o) {
+            mmcs_results[o] = BOUNDED_MMCS_COMPLETE;
+        }
+        atomic_bool mmcs_fallback;
+        atomic_init(&mmcs_fallback, false);
+        atomic_bool mmcs_failed;
+        atomic_init(&mmcs_failed, false);
+
+        if (attempt_mmcs) {
+            MMCSWorkerContext mmcs_ctx = {
+                .level = k,
+                .ninputs = ninputs,
+                .noutputs = noutputs,
+                .bit_index = bit_index,
+                .word_index = word_index,
+                .shifted_mask = shifted_mask,
+                .implicant_words = implicant_words,
+                .PInfo = PInfo,
+                .stats = mmcs_stats,
+                .results = mmcs_results,
+                .node_limit = automatic_mmcs_node_limit,
+                .fallback = &mmcs_fallback,
+                .failed = &mmcs_failed
+            };
+
+            if (!ccubes_parallel_for(
+                0,
+                (uint64_t)noutputs,
+                mmcs_threads,
+                false,
+                mmcs_search_range_worker,
+                &mmcs_ctx
+            ) || atomic_load_explicit(&mmcs_failed, memory_order_acquire)) {
+                fprintf(stderr, "Error: bounded MMCS PI search failed\n");
+                ccubes_mutex_destroy(&state_lock);
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                return 1;
+            }
+
+            bool fallback = atomic_load_explicit(
+                &mmcs_fallback,
+                memory_order_acquire
+            );
+            if (automatic_mmcs_trial && fallback) {
+                /*
+                 * A bounded MMCS level is transactional.  Completed outputs
+                 * may already have appended records, while the limiting
+                 * output appended none.  Reset every output to the common
+                 * level boundary before projection completes the full level.
+                 */
+                for (int o = 0; o < noutputs; ++o) {
+                    PInfo[o].foundPI = level_start[o];
+                }
+                attempt_mmcs = false;
+                maxtasks = projection_tasks;
+                if (maxtasks == 0) {
+                    fprintf(
+                        stderr,
+                        "Error: projection task count overflow after MMCS trial fallback\n"
+                    );
+                    ccubes_mutex_destroy(&state_lock);
+                    destroy_output_locks(output_locks, noutputs);
+                    cleanup(PInfo, buffer);
+                    return 1;
+                }
+                if (!build_pi_coverage_indices(
+                    &coverage_indices,
+                    PInfo,
+                    noutputs,
+                    level_start,
+                    implicant_words,
+                    DETERMINISTIC_PI_ORDER
+                )) {
+                    fprintf(stderr, "Error: failed to build PI coverage indices\n");
+                    ccubes_mutex_destroy(&state_lock);
+                    destroy_output_locks(output_locks, noutputs);
+                    cleanup(PInfo, buffer);
+                    return 1;
+                }
+            } else {
+                use_mmcs_level = true;
+                if (!bounded_mmcs_mark_level_sharing(
+                    PInfo,
+                    noutputs,
+                    level_start,
+                    implicant_words,
+                    &max_shared
+                )) {
+                    fprintf(stderr, "Error: failed to mark MMCS PI sharing\n");
+                    ccubes_mutex_destroy(&state_lock);
+                    destroy_output_locks(output_locks, noutputs);
+                    cleanup(PInfo, buffer);
+                    return 1;
+                }
+            }
+        }
+
+        if (!use_mmcs_level) {
+            PIWorkerContext pi_ctx = {
+                .k = k,
+                .ninputs = ninputs,
+                .noutputs = noutputs,
+                .nofvalues = nofvalues,
+                .bit_index = bit_index,
+                .word_index = word_index,
+                .shifted_mask = shifted_mask,
+                .implicant_words = implicant_words,
+                .PInfo = PInfo,
+                .buffer = buffer,
+                .output_locks = output_locks,
+                .coverage_indices = coverage_indices,
+                .max_shared = &max_shared,
+                .increase = increase,
+                .multiplier = &multiplier,
+                .time_limit_sec = TIME_LIMIT_SEC,
+                .base_elapsed = BASE_ELAPSED,
+                .start_time = start,
+                .time_up = &time_up,
+                .time_up_elapsed = &time_up_elapsed,
+                .last_task_reached = &last_task_reached,
+                .state_lock = &state_lock
+            };
+            if (!ccubes_parallel_for(
                 start_task,
                 maxtasks,
                 THREADS,
                 true,
                 pi_search_range_worker,
                 &pi_ctx
-            )
-        ) {
-            fprintf(stderr, "Error: failed to start workers for PI search\n");
-            destroy_pi_coverage_indices(coverage_indices, noutputs);
-            ccubes_mutex_destroy(&state_lock);
-            destroy_output_locks(output_locks, noutputs);
-            cleanup(PInfo, buffer);
-            return 1;
+            )) {
+                fprintf(stderr, "Error: failed to start workers for PI search\n");
+                destroy_pi_coverage_indices(coverage_indices, noutputs);
+                ccubes_mutex_destroy(&state_lock);
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                return 1;
+            }
         }
 
         HAS_RESUME_LAST_TASK = false; // reset for the next k-level
@@ -1040,19 +1433,60 @@ int main(int argc, char *argv[]) {
             memory_order_acquire
         );
         DBG_INFO_BLOCK {
+            uint64_t mmcs_trial_nodes = 0;
             for (int o = 0; o < noutputs; ++o) {
-                uint64_t rejected = atomic_load_explicit(
-                    &coverage_indices[o].subsumption_rejections,
-                    memory_order_relaxed
-                );
-                if (rejected > 0) {
+                mmcs_trial_nodes += mmcs_stats[o].search_nodes;
+            }
+            if (use_mmcs_level) {
+                for (int o = 0; o < noutputs; ++o) {
                     fprintf(
                         debug_out,
-                        "subsumption rejections, output %d: %llu\n",
+                        "bounded MMCS output %d: nodes=%llu completed=%llu "
+                        "unique=%llu duplicates=%llu\n",
                         o + 1,
-                        (unsigned long long)rejected
+                        (unsigned long long)mmcs_stats[o].search_nodes,
+                        (unsigned long long)mmcs_stats[o].completed_transversals,
+                        (unsigned long long)mmcs_stats[o].unique_cubes,
+                        (unsigned long long)mmcs_stats[o].duplicate_cubes
                     );
                 }
+                fprintf(
+                    debug_out,
+                    "CCUBES_PI_GENERATOR level=%d selected=mmcs "
+                    "trial_nodes=%llu\n",
+                    k,
+                    (unsigned long long)mmcs_trial_nodes
+                );
+            } else {
+                for (int o = 0; o < noutputs; ++o) {
+                    uint64_t rejected = atomic_load_explicit(
+                        &coverage_indices[o].subsumption_rejections,
+                        memory_order_relaxed
+                    );
+                    if (rejected > 0) {
+                        fprintf(
+                            debug_out,
+                            "subsumption rejections, output %d: %llu\n",
+                            o + 1,
+                            (unsigned long long)rejected
+                        );
+                    }
+                }
+                fprintf(
+                    debug_out,
+                    "CCUBES_PI_GENERATOR level=%d selected=projection "
+                    "reason=%s trial_nodes=%llu projection_tasks=%llu\n",
+                    k,
+                    automatic_mmcs_trial
+                        ? "mmcs-node-limit"
+                        : PI_GENERATOR_MODE == PI_GENERATOR_PROJECTION
+                            ? "forced"
+                            : adaptive_stopping_supported
+                                ? "small-support-level"
+                                : "unsupported-model",
+                    (unsigned long long)mmcs_trial_nodes,
+                    (unsigned long long)projection_tasks
+                );
             }
         }
         ccubes_mutex_destroy(&state_lock);
@@ -1063,7 +1497,7 @@ int main(int argc, char *argv[]) {
                 &PInfo[o],
                 implicant_words,
                 level_start[o],
-                DETERMINISTIC_PI_ORDER
+                DETERMINISTIC_PI_ORDER || use_mmcs_level
             )) {
                 fprintf(
                     stderr,
