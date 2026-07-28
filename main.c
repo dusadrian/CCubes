@@ -852,18 +852,48 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (!prepare_off_wildcard_masks(
+        PInfo,
+        ninputs,
+        noutputs,
+        nofvalues
+    )) {
+        fprintf(stderr, "Error: wildcard OFF-mask allocation failed.\n");
+        free(chk_stop_counter);
+        free(chk_coverage_horizon);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+
     DBG_INFO_BLOCK {
         size_t projection_memberships = 0u;
+        int masked_outputs = 0;
+        size_t off_mask_bytes = 0u;
         for (int output = 0; output < noutputs; ++output) {
             projection_memberships +=
                 (size_t)PInfo[output].ON_minterms +
                 (size_t)PInfo[output].OFF_minterms;
+            if (PInfo[output].off_compat_masks) {
+                masked_outputs++;
+                off_mask_bytes +=
+                    (size_t)PInfo[output].off_mask_count *
+                    (size_t)PInfo[output].off_mask_words *
+                    sizeof(uint64_t);
+                off_mask_bytes +=
+                    ((size_t)ninputs + 1u) * sizeof(int);
+            }
         }
         fprintf(
             debug_out,
             "Shared projection rows: %d unique across %zu output memberships\n",
             PInfo[0].projection_row_count,
             projection_memberships
+        );
+        fprintf(
+            debug_out,
+            "Wildcard OFF masks: %d DC-bearing outputs, %zu bytes\n",
+            masked_outputs,
+            off_mask_bytes
         );
     }
 

@@ -1571,6 +1571,127 @@ bool prepare_shared_projection_rows(
     return true;
 }
 
+static void clear_off_wildcard_masks(
+    PIstorage *PInfo,
+    int noutputs
+) {
+    if (!PInfo || noutputs <= 0) return;
+    for (int output = 0; output < noutputs; ++output) {
+        free(PInfo[output].off_mask_offsets);
+        free(PInfo[output].off_compat_masks);
+        PInfo[output].off_mask_offsets = NULL;
+        PInfo[output].off_compat_masks = NULL;
+        PInfo[output].off_mask_words = 0;
+        PInfo[output].off_mask_count = 0;
+    }
+}
+
+bool prepare_off_wildcard_masks(
+    PIstorage *PInfo,
+    int ninputs,
+    int noutputs,
+    const int *nofvalues
+) {
+    if (
+        !PInfo ||
+        !nofvalues ||
+        ninputs <= 0 ||
+        noutputs <= 0
+    ) {
+        return false;
+    }
+    clear_off_wildcard_masks(PInfo, noutputs);
+
+    size_t mask_count = 0u;
+    for (int input = 0; input < ninputs; ++input) {
+        if (nofvalues[input] < 1) return false;
+        size_t values = (size_t)(nofvalues[input] - 1);
+        if (values > (size_t)INT_MAX - mask_count) return false;
+        mask_count += values;
+    }
+    if (mask_count == 0u || mask_count > (size_t)INT_MAX) {
+        return true;
+    }
+
+    for (int output = 0; output < noutputs; ++output) {
+        PIstorage *pi = &PInfo[output];
+        bool has_dc = false;
+        size_t cells =
+            (size_t)pi->OFF_minterms * (size_t)ninputs;
+        for (size_t cell = 0; cell < cells; ++cell) {
+            if (pi->OFF_set[cell] == 0) {
+                has_dc = true;
+                break;
+            }
+        }
+        if (!has_dc) continue;
+
+        int words = (pi->OFF_minterms + 63) / 64;
+        if (
+            words <= 0 ||
+            mask_count > SIZE_MAX / (size_t)words
+        ) {
+            clear_off_wildcard_masks(PInfo, noutputs);
+            return false;
+        }
+        size_t mask_words = mask_count * (size_t)words;
+        if (mask_words > SIZE_MAX / sizeof(uint64_t)) {
+            clear_off_wildcard_masks(PInfo, noutputs);
+            return false;
+        }
+
+        pi->off_mask_offsets = (int *)malloc(
+            ((size_t)ninputs + 1u) * sizeof(int)
+        );
+        pi->off_compat_masks = (uint64_t *)calloc(
+            mask_words,
+            sizeof(uint64_t)
+        );
+        if (!pi->off_mask_offsets || !pi->off_compat_masks) {
+            clear_off_wildcard_masks(PInfo, noutputs);
+            return false;
+        }
+
+        int offset = 0;
+        for (int input = 0; input < ninputs; ++input) {
+            pi->off_mask_offsets[input] = offset;
+            offset += nofvalues[input] - 1;
+        }
+        pi->off_mask_offsets[ninputs] = offset;
+        pi->off_mask_words = words;
+        pi->off_mask_count = (int)mask_count;
+
+        for (int row = 0; row < pi->OFF_minterms; ++row) {
+            int word = row / 64;
+            uint64_t bit = UINT64_C(1) << (row % 64);
+            for (int input = 0; input < ninputs; ++input) {
+                int off_value =
+                    pi->OFF_set[(size_t)row * (size_t)ninputs + input];
+                int value_begin = off_value == 0 ? 1 : off_value;
+                int value_end = off_value == 0
+                    ? nofvalues[input] - 1
+                    : off_value;
+                if (
+                    value_begin < 1 ||
+                    value_end >= nofvalues[input]
+                ) {
+                    clear_off_wildcard_masks(PInfo, noutputs);
+                    return false;
+                }
+                for (int value = value_begin; value <= value_end; ++value) {
+                    int mask =
+                        pi->off_mask_offsets[input] + value - 1;
+                    pi->off_compat_masks[
+                        (size_t)mask * (size_t)words + (size_t)word
+                    ] |= bit;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 void write_pla_file(
     const char *filename,
     PIstorage *PInfo
@@ -1717,6 +1838,8 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
         if (o == 0) free(PInfo[o].projection_rows);
         free(PInfo[o].ON_projection_ids);
         free(PInfo[o].OFF_projection_ids);
+        free(PInfo[o].off_mask_offsets);
+        free(PInfo[o].off_compat_masks);
         free(PInfo[o].ON_set);
         free(PInfo[o].OFF_set);
         free(PInfo[o].covered);
@@ -1989,6 +2112,48 @@ void print_info(const char *INFO_PATH, const int info_level) {
     cleanup(pi_tmp, dummy);
 }
 
+static bool candidate_matches_wildcard_off(
+    const PIstorage *pi,
+    const int *on_row,
+    const int *support,
+    int support_size
+) {
+    assert(pi);
+    assert(on_row);
+    assert(support);
+    assert(support_size > 0);
+    assert(pi->off_mask_words > 0);
+    assert(pi->off_mask_offsets);
+    assert(pi->off_compat_masks);
+
+    int first_input = support[0];
+    int first_value = on_row[first_input];
+    int first_mask =
+        pi->off_mask_offsets[first_input] + first_value - 1;
+    assert(first_value > 0);
+    assert(first_mask >= 0 && first_mask < pi->off_mask_count);
+
+    const uint64_t *first_words = &pi->off_compat_masks[
+        (size_t)first_mask * (size_t)pi->off_mask_words
+    ];
+    for (int word = 0; word < pi->off_mask_words; ++word) {
+        uint64_t matches = first_words[word];
+        for (int c = 1; c < support_size && matches != 0; ++c) {
+            int input = support[c];
+            int value = on_row[input];
+            int mask = pi->off_mask_offsets[input] + value - 1;
+            assert(value > 0);
+            assert(mask >= 0 && mask < pi->off_mask_count);
+            matches &= pi->off_compat_masks[
+                (size_t)mask * (size_t)pi->off_mask_words +
+                (size_t)word
+            ];
+        }
+        if (matches != 0) return true;
+    }
+    return false;
+}
+
 
 int process_task(
     uint64_t task,
@@ -2125,13 +2290,18 @@ int process_task(
         int pichart_words = PInfo[o].pichart_words;
         int *cov_word_index = PInfo[o].cov_word_index;
         uint64_t *shifted_cov_mask = PInfo[o].shifted_cov_mask;
+        bool use_off_masks = PInfo[o].off_compat_masks != NULL;
 
         ThreadBuffer *ts = &buffer[tid][o];
         // allocate vectors of decimal numbers for the ON-set and OFF-set rows
         int *decpos = (int *) calloc((size_t)ON_minterms, sizeof(int));
-        int *decneg = (int *) calloc((size_t)OFF_minterms, sizeof(int));
-        if (!decpos || !decneg) {
+        int *decneg = use_off_masks
+            ? NULL
+            : (int *)calloc((size_t)OFF_minterms, sizeof(int));
+        if (!decpos || (!use_off_masks && !decneg)) {
             fprintf(stderr, "Error: Memory allocation failed for decimal position arrays\n");
+            free(decpos);
+            free(decneg);
             return 1;
         }
 
@@ -2185,73 +2355,80 @@ int process_task(
         bool dc_off_rows[OFF_minterms];
         int off_count = 0;
 
-        // initialize don't-care flags to false
-        for (int r = 0; r < OFF_minterms; r++) {
-            dc_off_rows[r] = false;
-        }
-
-        // OFF-set O(1) dedup using the same mbase and space_size as ON-set
-        bool *off_seen = (bool*)calloc((size_t)space_size, sizeof(bool));
-        bool use_off_seen = (off_seen != NULL);
-
-        for (int r = 0; r < OFF_minterms; r++) {
-            if (off_count >= space_size) break;
-
-            int acc = 0;
-            bool has_dc = false;
-
-            if (
-                use_shared_projection &&
-                PInfo[o].OFF_projection_ids
-            ) {
-                int row_id = PInfo[o].OFF_projection_ids[r];
-                acc = projection_codes[row_id];
-                has_dc = projection_has_dc[row_id] != 0;
-            } else {
-                for (int c = 0; c < k; c++) {
-                    int value =
-                        PInfo[o].OFF_set[r * ninputs + tempk[c]];
-                    if (value == 0) has_dc = true;
-                    acc += value * mbase[c];
-                }
+        if (!use_off_masks) {
+            // initialize don't-care flags to false
+            for (int r = 0; r < OFF_minterms; r++) {
+                dc_off_rows[r] = false;
             }
 
-            decneg[r] = acc;
-            dc_off_rows[r] = has_dc;
+            // OFF-set O(1) dedup using the same mbase and space_size as ON-set
+            bool *off_seen = (bool*)calloc(
+                (size_t)space_size,
+                sizeof(bool)
+            );
+            bool use_off_seen = (off_seen != NULL);
 
-            size_t off_index = (size_t)acc; // normalized index in 0..space_size-1
-            assert(off_index < (size_t)space_size);
+            for (int r = 0; r < OFF_minterms; r++) {
+                if (off_count >= space_size) break;
 
-            // O(1) uniqueness check using off_index; fallback to O(n) if allocation failed
-            if (use_off_seen && off_index < (size_t)space_size) {
-                if (off_seen[off_index]) {
-                    continue; // duplicate OFF row pattern
-                }
+                int acc = 0;
+                bool has_dc = false;
 
-                off_seen[off_index] = true;
-                unique_off_rows[off_count++] = r;
-            } else {
-                bool unique = true;
-                for (int prev = 0; prev < off_count; prev++) {
-                    if (decneg[unique_off_rows[prev]] == acc) {
-                        unique = false;
-                        break;
+                if (
+                    use_shared_projection &&
+                    PInfo[o].OFF_projection_ids
+                ) {
+                    int row_id = PInfo[o].OFF_projection_ids[r];
+                    acc = projection_codes[row_id];
+                    has_dc = projection_has_dc[row_id] != 0;
+                } else {
+                    for (int c = 0; c < k; c++) {
+                        int value =
+                            PInfo[o].OFF_set[
+                                r * ninputs + tempk[c]
+                            ];
+                        if (value == 0) has_dc = true;
+                        acc += value * mbase[c];
                     }
                 }
 
-                if (unique) {
+                decneg[r] = acc;
+                dc_off_rows[r] = has_dc;
+
+                size_t off_index = (size_t)acc;
+                assert(off_index < (size_t)space_size);
+
+                // O(1) uniqueness check; fallback to O(n) if allocation failed
+                if (use_off_seen && off_index < (size_t)space_size) {
+                    if (off_seen[off_index]) {
+                        continue;
+                    }
+
+                    off_seen[off_index] = true;
                     unique_off_rows[off_count++] = r;
+                } else {
+                    bool unique = true;
+                    for (int prev = 0; prev < off_count; prev++) {
+                        if (decneg[unique_off_rows[prev]] == acc) {
+                            unique = false;
+                            break;
+                        }
+                    }
+
+                    if (unique) {
+                        unique_off_rows[off_count++] = r;
+                    }
                 }
             }
-        }
 
-        if (off_seen) free(off_seen);
+            free(off_seen);
 
-        // If the OFF-set already spans the entire space, no ON row can be valid
-        if (off_count >= space_size) {
-            free(decpos);
-            free(decneg);
-            continue; // next output
+            // If the OFF-set spans the space, no ON row can be valid.
+            if (off_count >= space_size) {
+                free(decpos);
+                free(decneg);
+                continue;
+            }
         }
 
         int possible_rows[ON_minterms];
@@ -2300,25 +2477,42 @@ int process_task(
 
             // check if the row is different from any OFF-set row
             bool valid_row = true;
-            for (int roff = 0; roff < off_count; roff++) {
-                bool different = false;
-                if (dc_off_rows[unique_off_rows[roff]]) {
-                    for (int c = 0; c < k; c++) {
-                        int v_ON = PInfo[o].ON_set[r * ninputs + tempk[c]];
+            if (use_off_masks) {
+                const int *on_row = &PInfo[o].ON_set[
+                    (size_t)r * (size_t)ninputs
+                ];
+                valid_row = !candidate_matches_wildcard_off(
+                    &PInfo[o],
+                    on_row,
+                    tempk,
+                    k
+                );
+            } else {
+                for (int roff = 0; roff < off_count; roff++) {
+                    bool different = false;
+                    if (dc_off_rows[unique_off_rows[roff]]) {
+                        for (int c = 0; c < k; c++) {
+                            int v_ON = PInfo[o].ON_set[
+                                r * ninputs + tempk[c]
+                            ];
+                            int v_OFF = PInfo[o].OFF_set[
+                                unique_off_rows[roff] * ninputs +
+                                tempk[c]
+                            ];
 
-                        int v_OFF = PInfo[o].OFF_set[unique_off_rows[roff] * ninputs + tempk[c]];
-
-                        if (v_OFF != 0 && v_OFF != v_ON) {
-                            different = true;
-                            break;
+                            if (v_OFF != 0 && v_OFF != v_ON) {
+                                different = true;
+                                break;
+                            }
                         }
+                    } else {
+                        different =
+                            decpos[r] != decneg[unique_off_rows[roff]];
                     }
-                } else {
-                    different = decpos[r] != decneg[unique_off_rows[roff]];
-                }
-                if (!different) {
-                    valid_row = false;
-                    break;
+                    if (!different) {
+                        valid_row = false;
+                        break;
+                    }
                 }
             }
 

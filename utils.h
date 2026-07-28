@@ -98,6 +98,16 @@ typedef struct {
     int      *projection_rows;
     int      *ON_projection_ids;
     int      *OFF_projection_ids;
+    /*
+     * DC-bearing OFF sets use compatibility masks indexed by
+     * (input, non-DC value). A bit is set when the OFF row has that value or
+     * a wildcard at the input. Fully specified outputs leave these fields
+     * empty and retain the decoded-index validation path.
+     */
+    int       off_mask_words;
+    int       off_mask_count;
+    int      *off_mask_offsets;
+    uint64_t *off_compat_masks;
     int      *covered;
     int      *last_index;
     int      *k_last_index; // continued at each k
@@ -220,6 +230,13 @@ bool prepare_shared_projection_rows(
     PIstorage *PInfo,
     int ninputs,
     int noutputs
+);
+
+bool prepare_off_wildcard_masks(
+    PIstorage *PInfo,
+    int ninputs,
+    int noutputs,
+    const int *nofvalues
 );
 
 void write_pla_file(

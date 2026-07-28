@@ -185,8 +185,8 @@ clean:
 TEST_CFLAGS := -Wall -O2 -I.
 TEST_LIBS   := -lm
 
-.PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
-test: test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+.PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+test: test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
 
 test-cover-validation:
 	$(CC) $(TEST_CFLAGS) tests/test_cover_validation.c cover_validation.c -o /tmp/ccubes_test_cover_validation $(TEST_LIBS)
@@ -206,6 +206,10 @@ test-pi-finalization:
 test-projection-cache:
 	$(CC) $(TEST_CFLAGS) -DCCUBES_TESTING tests/test_projection_cache.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_projection_cache $(TEST_LIBS)
 	/tmp/ccubes_test_projection_cache
+
+test-wildcard-off-masks:
+	$(CC) $(TEST_CFLAGS) -DCCUBES_TESTING tests/test_wildcard_off_masks.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_wildcard_off_masks $(TEST_LIBS)
+	/tmp/ccubes_test_wildcard_off_masks
 
 test-nchoosek:
 	$(CC) $(TEST_CFLAGS) tests/test_nchoosek.c binomial.c -o /tmp/ccubes_test_nchoosek $(TEST_LIBS)
