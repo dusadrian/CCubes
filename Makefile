@@ -216,7 +216,7 @@ test-nchoosek:
 	/tmp/ccubes_test_nchoosek
 
 test-projected-cube-prime:
-	$(CC) $(TEST_CFLAGS) tests/test_projected_cube_prime.c prime_check.c -o /tmp/ccubes_test_projected_cube_prime $(TEST_LIBS)
+	$(CC) $(TEST_CFLAGS) tests/test_projected_cube_prime.c prime_check.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c subsumption_index.c -o /tmp/ccubes_test_projected_cube_prime $(TEST_LIBS)
 	/tmp/ccubes_test_projected_cube_prime
 
 test-certified-stop:

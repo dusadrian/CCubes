@@ -44,7 +44,7 @@ The MMCS-style backend forms the OFF-row difference hypergraph for each ON row a
 
 Current-level duplicate coverage is pruned after each generation level by default. During generation the coverage index therefore contains completed levels only and remains immutable, avoiding synchronized hash updates in the worker hot path. When pooling (`-p`) or sharing weights (`-w2`) are enabled, distinct shareable cube geometries are retained even when their local ON coverage is identical, because they may support different cross-output combinations. The optional `-d` switch additionally canonicalizes PI ordering for reproducible experiments; it does not enable or disable pruning.
 
-Projection validation builds wildcard-aware OFF-row bit masks only for outputs whose OFF set contains input dashes. Fully specified outputs retain the decoded-index validation path, so they do not pay the mask allocation or intersection cost.
+Projection validation builds wildcard-aware OFF-row bit masks only for outputs whose OFF set contains input dashes. The same masks accelerate primality checks for shareable projected cubes. Fully specified outputs retain the decoded-index validation and scalar primality paths, so they do not pay the mask allocation or intersection cost.
 
 There is a minimal help system integrated into CCubes. Users can enable diagnostic logging with `-dbg<level>`; this provides insights into the minimization process and can be useful for troubleshooting. The debug levels are preliminary, and more detailed logging functionality will be added in the future.
 

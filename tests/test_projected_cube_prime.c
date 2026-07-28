@@ -22,6 +22,30 @@ static void set_cube_bit(uint64_t *value_bits, const int *word_index, const int 
     }
 }
 
+static void prepare_masks(
+    PIstorage *pi,
+    int ninputs
+) {
+    int nofvalues[ninputs];
+    for (int input = 0; input < ninputs; ++input) {
+        nofvalues[input] = 3;
+    }
+    assert(prepare_off_wildcard_masks(
+        pi,
+        ninputs,
+        1,
+        nofvalues
+    ));
+    assert(pi->off_compat_masks);
+}
+
+static void free_masks(PIstorage *pi) {
+    free(pi->off_mask_offsets);
+    free(pi->off_compat_masks);
+    pi->off_mask_offsets = NULL;
+    pi->off_compat_masks = NULL;
+}
+
 int main(void) {
     // level=2 cube on inputs {0,1}, both literals fixed to value 1.
     // OFF row A conflicts on input1 only (blocks removing literal 0).
@@ -53,6 +77,119 @@ int main(void) {
         pi_a.OFF_minterms = 1;
         pi_a.OFF_set = off_a_only;
         assert(projected_cube_is_prime(&pi_a, ninputs, support, 2, value_bits, word_index, bit_index) == false);
+    }
+
+    /*
+     * DC-bearing rows exercise the mask path. Each row mismatches the cube on
+     * the literal whose removal it blocks, while wildcard positions among the
+     * remaining literals must match either cube value.
+     */
+    {
+        int ninputs = 4;
+        int support[] = {0, 1, 2};
+        int word_index[4], bit_index[4];
+        build_layout(ninputs, word_index, bit_index);
+        uint64_t value_bits[1] = {0};
+        int off_prime[] = {
+            2, 0, 1, 0,
+            0, 2, 1, 0,
+            1, 0, 2, 0
+        };
+
+        PIstorage pi;
+        memset(&pi, 0, sizeof(pi));
+        pi.OFF_minterms = 3;
+        pi.OFF_set = off_prime;
+        assert(projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            3,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        prepare_masks(&pi, ninputs);
+        assert(projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            3,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        free_masks(&pi);
+
+        pi.OFF_minterms = 2;
+        assert(!projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            3,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        prepare_masks(&pi, ninputs);
+        assert(!projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            3,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        free_masks(&pi);
+    }
+
+    /*
+     * Put the two deletion blockers on opposite sides of a 64-row boundary.
+     * The scalar and two-word mask paths must agree.
+     */
+    {
+        int ninputs = 3;
+        int support[] = {0, 1};
+        int word_index[3], bit_index[3];
+        build_layout(ninputs, word_index, bit_index);
+        uint64_t value_bits[1] = {0};
+        int off_rows[65 * 3];
+        for (int row = 0; row < 65; ++row) {
+            off_rows[row * 3] = 2;
+            off_rows[row * 3 + 1] = 2;
+            off_rows[row * 3 + 2] = 0;
+        }
+        off_rows[0] = 2;
+        off_rows[1] = 1;
+        off_rows[64 * 3] = 1;
+        off_rows[64 * 3 + 1] = 2;
+
+        PIstorage pi;
+        memset(&pi, 0, sizeof(pi));
+        pi.OFF_minterms = 65;
+        pi.OFF_set = off_rows;
+        assert(projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            2,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        prepare_masks(&pi, ninputs);
+        assert(pi.off_mask_words == 2);
+        assert(projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            2,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        free_masks(&pi);
     }
 
     // Empty OFF set: no row can ever block a removal, so a cube with any
@@ -109,6 +246,32 @@ int main(void) {
         pi.OFF_minterms = 0;
         pi.OFF_set = NULL;
         assert(projected_cube_is_prime(&pi, ninputs, support, 1, value_bits, word_index, bit_index) == false);
+    }
+
+    // The level-1 empty-intersection rule is identical on a DC-bearing mask.
+    {
+        int ninputs = 2;
+        int support[] = {0};
+        int word_index[2], bit_index[2];
+        build_layout(ninputs, word_index, bit_index);
+        uint64_t value_bits[1] = {0};
+        int off_row[] = {2, 0};
+
+        PIstorage pi;
+        memset(&pi, 0, sizeof(pi));
+        pi.OFF_minterms = 1;
+        pi.OFF_set = off_row;
+        prepare_masks(&pi, ninputs);
+        assert(projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            1,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        free_masks(&pi);
     }
 
     // Invalid inputs (null pointers, level<=0) must fail closed.
