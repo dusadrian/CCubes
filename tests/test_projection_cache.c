@@ -67,6 +67,40 @@ int main(void) {
     assert(pi.foundPI == 0);
     assert(output_buffer.validation_attempts == 1);
 
+    int *task_row_codes = output_buffer.task_row_codes;
+    uint32_t *task_seen_stamps = output_buffer.task_seen_stamps;
+    uint32_t first_seen_epoch = output_buffer.task_seen_epoch;
+    assert(task_row_codes != NULL);
+    assert(task_seen_stamps != NULL);
+
+    /*
+     * A second task reuses both worker-owned allocations but takes fresh
+     * epochs, so the rejected assignment must be validated once again.
+     */
+    assert(process_task(
+        0,
+        1,
+        1,
+        1,
+        nofvalues,
+        bit_index,
+        word_index,
+        shifted_mask,
+        1,
+        &pi,
+        buffers,
+        0,
+        NULL,
+        NULL,
+        &max_shared,
+        16,
+        &multiplier
+    ) == 0);
+    assert(output_buffer.task_row_codes == task_row_codes);
+    assert(output_buffer.task_seen_stamps == task_seen_stamps);
+    assert(output_buffer.task_seen_epoch > first_seen_epoch);
+    assert(output_buffer.validation_attempts == 2);
+
     free(output_buffer.pichart_values);
     free(output_buffer.decpos);
     free(output_buffer.covsum);
@@ -74,6 +108,8 @@ int main(void) {
     free(output_buffer.value_bits);
     free(output_buffer.projection_codes);
     free(output_buffer.projection_has_dc);
+    free(output_buffer.task_row_codes);
+    free(output_buffer.task_seen_stamps);
     free(pi.projection_rows);
     free(pi.ON_projection_ids);
     free(pi.OFF_projection_ids);

@@ -1883,6 +1883,8 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
             free(buffer[t][o].value_bits);
             free(buffer[t][o].projection_codes);
             free(buffer[t][o].projection_has_dc);
+            free(buffer[t][o].task_row_codes);
+            free(buffer[t][o].task_seen_stamps);
         }
         free(buffer[t]);
     }
@@ -2001,6 +2003,107 @@ static bool ensure_projection_buffer_capacity(
     buffer->projection_has_dc = has_dc;
     buffer->projection_capacity = capacity;
     return true;
+}
+
+/*
+ * Row projections are consumed one output at a time, so one worker-owned
+ * array can hold both the current ON and OFF codes. Candidate records remain
+ * per output because they must survive until cross-output sharing is merged.
+ */
+static bool ensure_task_row_capacity(
+    ThreadBuffer *workspace,
+    size_t needed
+) {
+    if (!workspace || needed == 0) return false;
+    if (
+        workspace->task_row_capacity >= needed &&
+        workspace->task_row_codes
+    ) {
+        return true;
+    }
+
+    size_t capacity =
+        workspace->task_row_capacity > 0
+            ? workspace->task_row_capacity
+            : 64u;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2u) {
+            capacity = needed;
+            break;
+        }
+        capacity *= 2u;
+    }
+    if (capacity > SIZE_MAX / sizeof(int)) return false;
+
+    int *codes = (int *)malloc(capacity * sizeof(int));
+    if (!codes) return false;
+
+    free(workspace->task_row_codes);
+    workspace->task_row_codes = codes;
+    workspace->task_row_capacity = capacity;
+    return true;
+}
+
+/*
+ * A generation stamp replaces allocating and clearing projected-space
+ * visited arrays for every output of every support. OFF deduplication and ON
+ * candidate discovery take successive epochs in the same worker-owned table.
+ */
+static bool ensure_task_seen_capacity(
+    ThreadBuffer *workspace,
+    size_t needed
+) {
+    if (!workspace || needed == 0) return false;
+    if (
+        workspace->task_seen_capacity >= needed &&
+        workspace->task_seen_stamps
+    ) {
+        return true;
+    }
+
+    size_t capacity =
+        workspace->task_seen_capacity > 0
+            ? workspace->task_seen_capacity
+            : 64u;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2u) {
+            capacity = needed;
+            break;
+        }
+        capacity *= 2u;
+    }
+    if (capacity > SIZE_MAX / sizeof(uint32_t)) return false;
+
+    uint32_t *stamps = (uint32_t *)calloc(
+        capacity,
+        sizeof(uint32_t)
+    );
+    if (!stamps) return false;
+
+    free(workspace->task_seen_stamps);
+    workspace->task_seen_stamps = stamps;
+    workspace->task_seen_capacity = capacity;
+    workspace->task_seen_epoch = 0;
+    return true;
+}
+
+static uint32_t begin_task_seen_epoch(ThreadBuffer *workspace) {
+    assert(
+        workspace &&
+        workspace->task_seen_stamps &&
+        workspace->task_seen_capacity > 0
+    );
+
+    workspace->task_seen_epoch++;
+    if (workspace->task_seen_epoch == 0) {
+        memset(
+            workspace->task_seen_stamps,
+            0,
+            workspace->task_seen_capacity * sizeof(uint32_t)
+        );
+        workspace->task_seen_epoch = 1;
+    }
+    return workspace->task_seen_epoch;
 }
 
 char *prefix_basename(const char *filepath, const char *prefix) {
@@ -2293,17 +2396,31 @@ int process_task(
         bool use_off_masks = PInfo[o].off_compat_masks != NULL;
 
         ThreadBuffer *ts = &buffer[tid][o];
-        // allocate vectors of decimal numbers for the ON-set and OFF-set rows
-        int *decpos = (int *) calloc((size_t)ON_minterms, sizeof(int));
-        int *decneg = use_off_masks
-            ? NULL
-            : (int *)calloc((size_t)OFF_minterms, sizeof(int));
-        if (!decpos || (!use_off_masks && !decneg)) {
+        ThreadBuffer *workspace = &buffer[tid][0];
+        size_t row_codes_needed = (size_t)ON_minterms;
+        if (!use_off_masks) {
+            if (
+                (size_t)OFF_minterms >
+                SIZE_MAX - row_codes_needed
+            ) {
+                fprintf(stderr, "Error: decimal position size overflow\n");
+                return 1;
+            }
+            row_codes_needed += (size_t)OFF_minterms;
+        }
+        if (!ensure_task_row_capacity(workspace, row_codes_needed)) {
             fprintf(stderr, "Error: Memory allocation failed for decimal position arrays\n");
-            free(decpos);
-            free(decneg);
             return 1;
         }
+        int *decpos = workspace->task_row_codes;
+        int *decneg = use_off_masks
+            ? NULL
+            : workspace->task_row_codes + ON_minterms;
+
+        bool use_seen_stamps = ensure_task_seen_capacity(
+            workspace,
+            (size_t)space_size
+        );
 
         int max_candidates = space_size < ON_minterms ? space_size : ON_minterms;
         if (!ensure_thread_buffer_capacity(
@@ -2312,8 +2429,6 @@ int process_task(
             pichart_words,
             implicant_words
         )) {
-            free(decpos);
-            free(decneg);
             fprintf(stderr, "Error: candidate buffer allocation failed\n");
             return 1;
         }
@@ -2362,11 +2477,9 @@ int process_task(
             }
 
             // OFF-set O(1) dedup using the same mbase and space_size as ON-set
-            bool *off_seen = (bool*)calloc(
-                (size_t)space_size,
-                sizeof(bool)
-            );
-            bool use_off_seen = (off_seen != NULL);
+            uint32_t off_seen_epoch = use_seen_stamps
+                ? begin_task_seen_epoch(workspace)
+                : 0;
 
             for (int r = 0; r < OFF_minterms; r++) {
                 if (off_count >= space_size) break;
@@ -2399,12 +2512,19 @@ int process_task(
                 assert(off_index < (size_t)space_size);
 
                 // O(1) uniqueness check; fallback to O(n) if allocation failed
-                if (use_off_seen && off_index < (size_t)space_size) {
-                    if (off_seen[off_index]) {
+                if (
+                    use_seen_stamps &&
+                    off_index < (size_t)space_size
+                ) {
+                    if (
+                        workspace->task_seen_stamps[off_index] ==
+                        off_seen_epoch
+                    ) {
                         continue;
                     }
 
-                    off_seen[off_index] = true;
+                    workspace->task_seen_stamps[off_index] =
+                        off_seen_epoch;
                     unique_off_rows[off_count++] = r;
                 } else {
                     bool unique = true;
@@ -2421,12 +2541,8 @@ int process_task(
                 }
             }
 
-            free(off_seen);
-
             // If the OFF-set spans the space, no ON row can be valid.
             if (off_count >= space_size) {
-                free(decpos);
-                free(decneg);
                 continue;
             }
         }
@@ -2435,9 +2551,9 @@ int process_task(
         int found = 0;
 
         // Use a visited set keyed by normalized decpos (0..space_size - 1) to skip duplicates
-        bool *pos_seen = (bool*)calloc((size_t)space_size, sizeof(bool));
-        // If allocation fails, we fallback to scanning duplicates (unlikely and still safe)
-        bool use_seen = (pos_seen != NULL);
+        uint32_t pos_seen_epoch = use_seen_stamps
+            ? begin_task_seen_epoch(workspace)
+            : 0;
 
         for (int r = 0; r < ON_minterms; r++) {
             if (found >= space_size) break; // Early stop: all potential PIs already found
@@ -2446,8 +2562,14 @@ int process_task(
             size_t on_index = (size_t)(decpos[r] - mbase_sum);
             assert(on_index < (size_t)space_size);
 
-            if (use_seen && on_index < (size_t)space_size) {
-                if (pos_seen[on_index]) {
+            if (
+                use_seen_stamps &&
+                on_index < (size_t)space_size
+            ) {
+                if (
+                    workspace->task_seen_stamps[on_index] ==
+                    pos_seen_epoch
+                ) {
                     continue; // accepted or rejected assignment already examined
                 }
                 /*
@@ -2455,9 +2577,13 @@ int process_task(
                  * ON row supplied it. Mark it before OFF validation so a
                  * rejected assignment is cached as well as an accepted one.
                  */
-                pos_seen[on_index] = true;
+                workspace->task_seen_stamps[on_index] =
+                    pos_seen_epoch;
             }
-            if (!use_seen || on_index >= (size_t)space_size) {
+            if (
+                !use_seen_stamps ||
+                on_index >= (size_t)space_size
+            ) {
                 // O(n) fallback: check previously selected rows for duplicate decpos
                 bool duplicate = false;
 
@@ -2525,8 +2651,6 @@ int process_task(
                 break; // also guard after increment
             }
         }
-
-        if (pos_seen) free(pos_seen);
 
         PICoverageIndex *generation_index = coverage_indices
             ? &coverage_indices[o]
@@ -2613,9 +2737,6 @@ int process_task(
             (*task_found)++;
 
         } // end of found loop
-
-        free(decpos);
-        free(decneg);
     } // end of outputs loop
 
     // Identify unique PIs across all outputs, and determine which are shared

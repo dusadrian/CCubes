@@ -150,6 +150,11 @@ typedef struct ThreadBuffer {
     int      *projection_codes;
     unsigned char *projection_has_dc;
     int       projection_capacity;
+    int      *task_row_codes;
+    size_t    task_row_capacity;
+    uint32_t *task_seen_stamps;
+    size_t    task_seen_capacity;
+    uint32_t  task_seen_epoch;
     int       found;
 #ifdef CCUBES_TESTING
     uint64_t  validation_attempts;

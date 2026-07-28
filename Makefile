@@ -83,7 +83,13 @@ endif
 # Sources and target
 SRC  := $(wildcard *.c)
 OBJ  := $(SRC:.c=.o)
+DEP  := $(OBJ:.o=.d)
 BIN  := ccubes
+
+# Track project-header dependencies so incremental builds cannot mix object
+# files compiled against different structure layouts.
+CFLAGS   += -MMD -MP
+CXXFLAGS += -MMD -MP
 
 # Try OpenMP first, then pthreads, then serial fallback.
 # Disable OpenMP with DISABLE_OMP=1; disable pthread fallback with USE_PTHREAD=0.
@@ -178,7 +184,9 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJ) $(BIN)
+	rm -f $(OBJ) $(DEP) $(BIN)
+
+-include $(DEP)
 
 # Unit tests link only the module under test, so they stay fast and do not
 # need the Gurobi or OpenMP configuration above.

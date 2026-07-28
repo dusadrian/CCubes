@@ -126,6 +126,8 @@ static RunResult run_case(bool use_masks) {
     free(output_buffer.covsum);
     free(output_buffer.fixed_bits);
     free(output_buffer.value_bits);
+    free(output_buffer.task_row_codes);
+    free(output_buffer.task_seen_stamps);
 
     return result;
 }
