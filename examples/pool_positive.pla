@@ -1,0 +1,17 @@
+# Three outputs with equal-cardinality cover alternatives.
+# Each output has a different pair of adjacent ON minterms, while the
+# alternatives expose the common cubes 00-, 0-0, and -00.
+.i 3
+.o 3
+.ilb a b c
+.ob f1 f2 f3
+.type fr
+000 111
+001 110
+010 101
+011 000
+100 011
+101 000
+110 000
+111 000
+.e

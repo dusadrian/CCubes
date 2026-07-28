@@ -185,8 +185,8 @@ clean:
 TEST_CFLAGS := -Wall -O2 -I.
 TEST_LIBS   := -lm
 
-.PHONY: test test-cover-validation test-pool-selection test-pi-finalization test-projection-cache test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
-test: test-cover-validation test-pool-selection test-pi-finalization test-projection-cache test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+.PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+test: test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
 
 test-cover-validation:
 	$(CC) $(TEST_CFLAGS) tests/test_cover_validation.c cover_validation.c -o /tmp/ccubes_test_cover_validation $(TEST_LIBS)
@@ -195,6 +195,9 @@ test-cover-validation:
 test-pool-selection:
 	$(CC) $(TEST_CFLAGS) tests/test_pool_selection.c pool_selection.c -o /tmp/ccubes_test_pool_selection $(TEST_LIBS)
 	/tmp/ccubes_test_pool_selection
+
+test-pool-policy: $(BIN)
+	sh tests/test_pool_policy.sh ./$(BIN) examples/pool_positive.pla
 
 test-pi-finalization:
 	$(CC) $(TEST_CFLAGS) tests/test_pi_finalization.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_pi_finalization $(TEST_LIBS)

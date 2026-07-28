@@ -36,6 +36,18 @@ bool select_joint_pool_solutions(
     PoolSelectionStats *stats
 );
 
+/*
+Repeat the coordination pass after generation has stopped, using the final
+pool retained by every output rather than excluding already committed outputs.
+*/
+bool select_final_joint_pool_solutions(
+    const PIstorage *pinfo,
+    int noutputs,
+    int implicant_words,
+    int *chosen_pool,
+    PoolSelectionStats *stats
+);
+
 /* Refresh the selected-union fields after a tied cover is replaced in-place. */
 bool measure_selected_pool_solutions(
     const PIstorage *pinfo,

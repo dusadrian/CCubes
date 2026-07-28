@@ -551,19 +551,40 @@ static void compact_valuable_candidates(
     free(keep);
 }
 
-static CandidateShape candidate_shape(const PIstorage *pi) {
+static CandidateShape candidate_shape(
+    const PIstorage *pi,
+    bool include_stopped
+) {
     CandidateShape shape = {0};
     /*
     A stopped output has already committed its final indices.  Other outputs
     may continue to later PI levels, but their joint-pool pass must not reopen
     or replace this cover with a pool retained from an earlier boundary.
     */
-    if (!pi || pi->stop_search || pi->solmin <= 0) return shape;
+    if (!pi || (!include_stopped && pi->stop_search) || pi->solmin <= 0) {
+        return shape;
+    }
 
     bool incumbent_valid =
         pi->prevsolmin > 0 &&
         pi->prevsolmin <= pi->ON_minterms &&
         pi->previndices != NULL;
+
+    if (include_stopped && pi->stop_search) {
+        shape.len = pi->solmin;
+        shape.pool_count = pi->pool_count;
+        if (shape.pool_count > 0) {
+            shape.count = shape.pool_count;
+            if (incumbent_valid && pi->prevsolmin == pi->solmin) {
+                shape.count++;
+                shape.append_incumbent = true;
+            }
+        } else {
+            shape.count = 1;
+            shape.current_fallback = true;
+        }
+        return shape;
+    }
 
     if (incumbent_valid && pi->prevsolmin < pi->solmin) {
         shape.count = 1;
@@ -888,12 +909,13 @@ static void sort_output_order(
     }
 }
 
-bool select_joint_pool_solutions(
+static bool select_joint_pool_solutions_impl(
     const PIstorage *pinfo,
     int noutputs,
     int implicant_words,
     int *chosen_pool,
-    PoolSelectionStats *stats
+    PoolSelectionStats *stats,
+    bool include_stopped
 ) {
     if (!pinfo || noutputs <= 0 || implicant_words <= 0 || !chosen_pool) {
         return false;
@@ -906,7 +928,10 @@ bool select_joint_pool_solutions(
     int active_outputs = 0;
     int total_pool_solutions = 0;
     for (int output = 0; output < noutputs; ++output) {
-        CandidateShape shape = candidate_shape(&pinfo[output]);
+        CandidateShape shape = candidate_shape(
+            &pinfo[output],
+            include_stopped
+        );
         if (shape.count <= 0 || shape.len <= 0) continue;
         if ((size_t)shape.count > (SIZE_MAX - occurrence_count) / (size_t)shape.len) return false;
         occurrence_count += (size_t)shape.count * (size_t)shape.len;
@@ -932,7 +957,10 @@ bool select_joint_pool_solutions(
 
     bool ok = true;
     for (int output = 0; output < noutputs && ok; ++output) {
-        CandidateShape shape = candidate_shape(&pinfo[output]);
+        CandidateShape shape = candidate_shape(
+            &pinfo[output],
+            include_stopped
+        );
         if (shape.count <= 0 || shape.len <= 0) continue;
 
         outputs[output].count = shape.count;
@@ -1187,6 +1215,40 @@ bool select_joint_pool_solutions(
     free_output_pools(outputs, noutputs);
     universe_destroy(&universe);
     return true;
+}
+
+bool select_joint_pool_solutions(
+    const PIstorage *pinfo,
+    int noutputs,
+    int implicant_words,
+    int *chosen_pool,
+    PoolSelectionStats *stats
+) {
+    return select_joint_pool_solutions_impl(
+        pinfo,
+        noutputs,
+        implicant_words,
+        chosen_pool,
+        stats,
+        false
+    );
+}
+
+bool select_final_joint_pool_solutions(
+    const PIstorage *pinfo,
+    int noutputs,
+    int implicant_words,
+    int *chosen_pool,
+    PoolSelectionStats *stats
+) {
+    return select_joint_pool_solutions_impl(
+        pinfo,
+        noutputs,
+        implicant_words,
+        chosen_pool,
+        stats,
+        true
+    );
 }
 
 bool measure_selected_pool_solutions(

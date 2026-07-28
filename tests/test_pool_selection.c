@@ -86,6 +86,60 @@ int main(void) {
     assert(stats.output_connections == 2);
 
     /*
+    Once every output has stopped, a final pass must reopen only the retained
+    final pools so outputs which reached their plateau at different levels can
+    still coordinate. The ordinary in-level selector continues to ignore them.
+    */
+    PIstorage final_info[2];
+    memset(final_info, 0, sizeof(final_info));
+    uint64_t final_positions[2][2] = {
+        {1u, 2u}, /* A, B */
+        {4u, 1u}  /* C, A */
+    };
+    uint64_t final_values[2][2] = {{0u, 0u}, {0u, 0u}};
+    int final_indices[2][2] = {{0, 1}, {0, 1}};
+    int *final_pools[2][2];
+    int final_selected[2] = {0, 0};
+    for (int output = 0; output < 2; ++output) {
+        final_pools[output][0] = &final_indices[output][0];
+        final_pools[output][1] = &final_indices[output][1];
+        final_info[output].ON_minterms = 1;
+        final_info[output].foundPI = 2;
+        final_info[output].solmin = 1;
+        final_info[output].prevsolmin = 1;
+        final_info[output].stop_search = true;
+        final_info[output].implicants_pos = final_positions[output];
+        final_info[output].implicants_val = final_values[output];
+        final_info[output].pool_count = 2;
+        final_info[output].pool_solutions = final_pools[output];
+        final_info[output].indices = &final_selected[output];
+        final_info[output].previndices = &final_selected[output];
+    }
+
+    int final_chosen[2] = {-1, -1};
+    assert(select_joint_pool_solutions(
+        final_info,
+        2,
+        1,
+        final_chosen,
+        &stats
+    ));
+    assert(stats.active_outputs == 0);
+    assert(select_final_joint_pool_solutions(
+        final_info,
+        2,
+        1,
+        final_chosen,
+        &stats
+    ));
+    assert(stats.active_outputs == 2);
+    assert(stats.output_connections == 2);
+    assert(stats.selected_distinct_cubes == 1);
+    assert(stats.sharing_savings == 1);
+    assert(final_chosen[0] == 0);
+    assert(final_chosen[1] == 1);
+
+    /*
     Pool value is marginal, not a raw candidate count.  Once output 0's
     preferred A cover already matches the only candidate for output 1, its
     unrelated alternatives add no cross-output compatibility.  The first ten

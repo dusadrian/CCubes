@@ -37,6 +37,92 @@ typedef enum {
     PI_GENERATOR_MMCS
 } PIGeneratorMode;
 
+/*
+ * Keep the ordinary sharing-aware incumbent in a boundary pool.  Pool
+ * enumeration deliberately skips column dominance so that locally
+ * interchangeable cubes remain available for cross-output coordination; that
+ * makes it slower and can leave a weaker incumbent under bounded effort.
+ * Seeding the pool with the ordinary solution makes pooling a secondary
+ * objective: it may replace the incumbent only with an equal- or
+ * lower-cardinality cover.
+ */
+static bool pool_prepend_solution(
+    int **pool_solutions,
+    int *pool_count,
+    int pool_limit,
+    const int *solution,
+    int solution_len
+) {
+    if (
+        !pool_solutions ||
+        !pool_count ||
+        pool_limit <= 0 ||
+        !solution ||
+        solution_len <= 0
+    ) {
+        return false;
+    }
+
+    int *normalized = (int *)malloc((size_t)solution_len * sizeof(int));
+    if (!normalized) return false;
+    memcpy(
+        normalized,
+        solution,
+        (size_t)solution_len * sizeof(int)
+    );
+
+    for (int i = 1; i < solution_len; ++i) {
+        int value = normalized[i];
+        int j = i - 1;
+        while (j >= 0 && normalized[j] > value) {
+            normalized[j + 1] = normalized[j];
+            --j;
+        }
+        normalized[j + 1] = value;
+    }
+
+    for (int p = 0; p < *pool_count; ++p) {
+        if (
+            memcmp(
+                pool_solutions[p],
+                normalized,
+                (size_t)solution_len * sizeof(int)
+            ) == 0
+        ) {
+            free(normalized);
+            if (p > 0) {
+                int *existing = pool_solutions[p];
+                memmove(
+                    &pool_solutions[1],
+                    &pool_solutions[0],
+                    (size_t)p * sizeof(int *)
+                );
+                pool_solutions[0] = existing;
+            }
+            return true;
+        }
+    }
+
+    int retained = *pool_count;
+    if (retained >= pool_limit) {
+        retained = pool_limit - 1;
+        free(pool_solutions[retained]);
+        pool_solutions[retained] = NULL;
+    } else {
+        (*pool_count)++;
+    }
+
+    if (retained > 0) {
+        memmove(
+            &pool_solutions[1],
+            &pool_solutions[0],
+            (size_t)retained * sizeof(int *)
+        );
+    }
+    pool_solutions[0] = normalized;
+    return true;
+}
+
 typedef struct {
     int k;
     int ninputs;
@@ -2052,20 +2138,6 @@ int main(int argc, char *argv[]) {
 
                 if (*ON_set_covered && !PInfo[o].stop_search) {
                     clear_output_solution_pool(&PInfo[o]);
-                    int pool_limit =
-                        automatic_pool_solution_limit(*foundPI);
-                    DBG_INFO_BLOCK {
-                        fprintf(
-                            debug_out,
-                            "CCUBES_POOL_BUDGET level=%d output=%d "
-                            "chart_cols=%d limit=%d\n",
-                            k,
-                            o + 1,
-                            *foundPI,
-                            pool_limit
-                        );
-                    }
-
                     double *weights = build_cover_weights(
                         &PInfo[o],
                         *foundPI,
@@ -2079,15 +2151,34 @@ int main(int argc, char *argv[]) {
                         return 1;
                     }
 
+                    int *indices = PInfo[o].indices;
+                    int *baseline_indices = (int *)malloc(
+                        (size_t)ON_minterms * sizeof(int)
+                    );
+                    if (!baseline_indices) {
+                        fprintf(
+                            stderr,
+                            "Error: Memory allocation failed for pool baseline\n"
+                        );
+                        free(weights);
+                        destroy_output_locks(output_locks, noutputs);
+                        cleanup(PInfo, buffer);
+                        return 1;
+                    }
+
                     clock_gettime(CLOCK_MONOTONIC, &startg);
 
-                    if (SCP_TYPE == 0) { // Bundled hybrid solver with solution pool
-                        solve_scp_lagrangian_pool(
+                    /*
+                     * Establish the ordinary sharing-aware incumbent first.
+                     * This path may use column dominance because it needs only
+                     * one cover. Alternative discovery remains deferred until
+                     * the boundary is about to plateau.
+                     */
+                    if (SCP_TYPE == 0) {
+                        solve_scp_lagrangian(
                             &chart,
                             weights,
-                            pool_limit,
-                            pool_count,
-                            pool_solutions,
+                            indices,
                             solmin,
                             HYBRID_EFFORT_LEVEL,
                             PInfo[o].prevsolmin > 0 &&
@@ -2105,10 +2196,9 @@ int main(int argc, char *argv[]) {
                         print_hybrid_stats(o);
                     }
 
-                    if (SCP_TYPE == 1) { // Gurobi: solution pool
-                        gurobi_solution_pool(
+                    if (SCP_TYPE == 1) {
+                        gurobi_multiobjective(
                             &chart,
-                            pool_limit,
                             weights,
                             PInfo[o].prevsolmin > 0 &&
                                 PInfo[o].prevsolmin <= ON_minterms
@@ -2118,11 +2208,33 @@ int main(int argc, char *argv[]) {
                                 PInfo[o].prevsolmin <= ON_minterms
                                     ? PInfo[o].prevsolmin
                                     : 0,
-                            pool_count,
-                            pool_solutions,
+                            indices,
                             solmin
                         );
+                        pool_boundary_exact[o] = true;
                     }
+
+                    if (*solmin <= 0 || *solmin > ON_minterms) {
+                        DBG_ERROR_BLOCK {
+                            fprintf(
+                                debug_out,
+                                "Error: solving the minterm coverage failed.\n"
+                            );
+                        }
+                        free(baseline_indices);
+                        free(weights);
+                        destroy_output_locks(output_locks, noutputs);
+                        cleanup(PInfo, buffer);
+                        return 1;
+                    }
+
+                    int baseline_solmin = *solmin;
+                    memcpy(
+                        baseline_indices,
+                        indices,
+                        (size_t)baseline_solmin * sizeof(int)
+                    );
+                    bool baseline_exact = pool_boundary_exact[o];
 
                     const bool probe_due =
                         *solmin > 0 &&
@@ -2160,6 +2272,7 @@ int main(int argc, char *argv[]) {
                                 o + 1
                             );
                             free(weights);
+                            free(baseline_indices);
                             destroy_output_locks(output_locks, noutputs);
                             cleanup(PInfo, buffer);
                             return 1;
@@ -2168,9 +2281,6 @@ int main(int argc, char *argv[]) {
                         if (probe_stats.candidates_appended > 0) {
                             PInfo[o].nofpi[k - 1] = *foundPI;
                             chart = pi_chart_view(&PInfo[o]);
-                            pool_limit =
-                                automatic_pool_solution_limit(*foundPI);
-                            clear_output_solution_pool(&PInfo[o]);
                             free(weights);
                             weights = build_cover_weights(
                                 &PInfo[o],
@@ -2184,22 +2294,21 @@ int main(int argc, char *argv[]) {
                                     "Error: Memory allocation failed for "
                                     "plateau-probe cover weights\n"
                                 );
+                                free(baseline_indices);
                                 destroy_output_locks(output_locks, noutputs);
                                 cleanup(PInfo, buffer);
                                 return 1;
                             }
 
                             if (SCP_TYPE == 0) {
-                                solve_scp_lagrangian_pool(
+                                solve_scp_lagrangian(
                                     &chart,
                                     weights,
-                                    pool_limit,
-                                    pool_count,
-                                    pool_solutions,
+                                    indices,
                                     solmin,
                                     HYBRID_EFFORT_LEVEL,
-                                    PInfo[o].previndices,
-                                    PInfo[o].prevsolmin,
+                                    baseline_indices,
+                                    baseline_solmin,
                                     CERTIFIED_MODE ||
                                         blocking_stop_states[o].
                                             certification_required
@@ -2209,33 +2318,28 @@ int main(int argc, char *argv[]) {
                                 print_hybrid_stats(o);
                             }
                             if (SCP_TYPE == 1) {
-                                gurobi_solution_pool(
+                                gurobi_multiobjective(
                                     &chart,
-                                    pool_limit,
                                     weights,
-                                    PInfo[o].previndices,
-                                    PInfo[o].prevsolmin,
-                                    pool_count,
-                                    pool_solutions,
+                                    baseline_indices,
+                                    baseline_solmin,
+                                    indices,
                                     solmin
                                 );
                                 pool_boundary_exact[o] = true;
                             }
 
                             if (*solmin >= PInfo[o].prevsolmin) {
-                                /*
-                                 * The temporary columns did not improve the
-                                 * primary objective. Rebuild the original
-                                 * pool before joint multi-output selection;
-                                 * its entries must not refer to rolled-back
-                                 * probe columns.
-                                 */
                                 *foundPI = pre_probe_found;
                                 PInfo[o].nofpi[k - 1] = pre_probe_found;
                                 chart = pi_chart_view(&PInfo[o]);
-                                pool_limit =
-                                    automatic_pool_solution_limit(*foundPI);
-                                clear_output_solution_pool(&PInfo[o]);
+                                *solmin = baseline_solmin;
+                                memcpy(
+                                    indices,
+                                    baseline_indices,
+                                    (size_t)baseline_solmin * sizeof(int)
+                                );
+                                pool_boundary_exact[o] = baseline_exact;
                                 free(weights);
                                 weights = build_cover_weights(
                                     &PInfo[o],
@@ -2249,45 +2353,13 @@ int main(int argc, char *argv[]) {
                                         "Error: Memory allocation failed "
                                         "while restoring pool weights\n"
                                     );
+                                    free(baseline_indices);
                                     destroy_output_locks(
                                         output_locks,
                                         noutputs
                                     );
                                     cleanup(PInfo, buffer);
                                     return 1;
-                                }
-
-                                if (SCP_TYPE == 0) {
-                                    solve_scp_lagrangian_pool(
-                                        &chart,
-                                        weights,
-                                        pool_limit,
-                                        pool_count,
-                                        pool_solutions,
-                                        solmin,
-                                        HYBRID_EFFORT_LEVEL,
-                                        PInfo[o].previndices,
-                                        PInfo[o].prevsolmin,
-                                        CERTIFIED_MODE ||
-                                            blocking_stop_states[o].
-                                                certification_required
-                                    );
-                                    pool_boundary_exact[o] =
-                                        lagrangian_last_run_proved_optimal();
-                                    print_hybrid_stats(o);
-                                }
-                                if (SCP_TYPE == 1) {
-                                    gurobi_solution_pool(
-                                        &chart,
-                                        pool_limit,
-                                        weights,
-                                        PInfo[o].previndices,
-                                        PInfo[o].prevsolmin,
-                                        pool_count,
-                                        pool_solutions,
-                                        solmin
-                                    );
-                                    pool_boundary_exact[o] = true;
                                 }
                             }
                         }
@@ -2314,14 +2386,120 @@ int main(int argc, char *argv[]) {
                         }
                     }
 
+                    /*
+                     * Pool discovery is useful only at a boundary which may
+                     * terminate the output search. Earlier improvements need
+                     * only their ordinary incumbent and avoid the expensive
+                     * alternative-preserving solve.
+                     */
+                    const bool pool_due =
+                        *solmin > 0 &&
+                        PInfo[o].prevsolmin > 0 &&
+                        PInfo[o].prevsolmin <= ON_minterms &&
+                        *solmin >= PInfo[o].prevsolmin &&
+                        stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
 
-                    if (*solmin == 0) {
-                        DBG_ERROR_BLOCK {
-                            fprintf(debug_out, "Error: solving the minterm coverage failed.\n");
+                    if (pool_due) {
+                        baseline_solmin = *solmin;
+                        memcpy(
+                            baseline_indices,
+                            indices,
+                            (size_t)baseline_solmin * sizeof(int)
+                        );
+                        baseline_exact = pool_boundary_exact[o];
+
+                        int pool_limit =
+                            automatic_pool_solution_limit(*foundPI);
+                        DBG_INFO_BLOCK {
+                            fprintf(
+                                debug_out,
+                                "CCUBES_POOL_BUDGET level=%d output=%d "
+                                "chart_cols=%d limit=%d phase=plateau\n",
+                                k,
+                                o + 1,
+                                *foundPI,
+                                pool_limit
+                            );
                         }
-                        destroy_output_locks(output_locks, noutputs);
-                        cleanup(PInfo, buffer);
-                        return 1;
+
+                        if (SCP_TYPE == 0) {
+                            solve_scp_lagrangian_pool(
+                                &chart,
+                                weights,
+                                pool_limit,
+                                pool_count,
+                                pool_solutions,
+                                solmin,
+                                HYBRID_EFFORT_LEVEL,
+                                baseline_indices,
+                                baseline_solmin,
+                                CERTIFIED_MODE ||
+                                    blocking_stop_states[o].
+                                        certification_required
+                            );
+                            pool_boundary_exact[o] =
+                                baseline_exact ||
+                                lagrangian_last_run_proved_optimal();
+                            print_hybrid_stats(o);
+                        }
+
+                        if (SCP_TYPE == 1) {
+                            gurobi_solution_pool(
+                                &chart,
+                                pool_limit,
+                                weights,
+                                baseline_indices,
+                                baseline_solmin,
+                                pool_count,
+                                pool_solutions,
+                                solmin
+                            );
+                            pool_boundary_exact[o] = true;
+                        }
+
+                        if (
+                            *solmin <= 0 ||
+                            *solmin > baseline_solmin ||
+                            (*pool_count <= 0 && *solmin < baseline_solmin)
+                        ) {
+                            clear_output_solution_pool(&PInfo[o]);
+                            *solmin = baseline_solmin;
+                            pool_boundary_exact[o] = baseline_exact;
+                        }
+
+                        if (*solmin == baseline_solmin) {
+                            if (!pool_prepend_solution(
+                                pool_solutions,
+                                pool_count,
+                                pool_limit,
+                                baseline_indices,
+                                baseline_solmin
+                            )) {
+                                fprintf(
+                                    stderr,
+                                    "Error: unable to retain the ordinary "
+                                    "incumbent in the solution pool\n"
+                                );
+                                free(baseline_indices);
+                                free(weights);
+                                destroy_output_locks(
+                                    output_locks,
+                                    noutputs
+                                );
+                                cleanup(PInfo, buffer);
+                                return 1;
+                            }
+                        }
+                    } else {
+                        DBG_INFO_BLOCK {
+                            fprintf(
+                                debug_out,
+                                "CCUBES_POOL_DEFER level=%d output=%d "
+                                "reason=primary-improved\n",
+                                k,
+                                o + 1
+                            );
+                        }
                     }
 
                     clock_gettime(CLOCK_MONOTONIC, &endg);
@@ -2333,6 +2511,7 @@ int main(int argc, char *argv[]) {
 
                     pool_execution_time[o] = execution_time;
 
+                    free(baseline_indices);
                     free(weights);
                 }
 
@@ -2594,6 +2773,71 @@ int main(int argc, char *argv[]) {
             debug_close();
             return 1;
         }
+    }
+
+    if (POOL_MAX > 1) {
+        int *chosen_idx = (int *)calloc((size_t)noutputs, sizeof(int));
+        PoolSelectionStats final_pool_stats;
+        if (
+            !chosen_idx ||
+            !select_final_joint_pool_solutions(
+                PInfo,
+                noutputs,
+                implicant_words,
+                chosen_idx,
+                &final_pool_stats
+            )
+        ) {
+            fprintf(stderr, "Error: final coordinated pool selection failed\n");
+            free(chosen_idx);
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            debug_close();
+            return 1;
+        }
+
+        for (int o = 0; o < noutputs; ++o) {
+            if (chosen_idx[o] < 0) continue;
+            int *selected = PInfo[o].pool_solutions[chosen_idx[o]];
+            for (int i = 0; i < PInfo[o].solmin; ++i) {
+                PInfo[o].indices[i] = selected[i];
+                PInfo[o].previndices[i] = selected[i];
+            }
+        }
+
+        if (!measure_selected_pool_solutions(
+            PInfo,
+            noutputs,
+            implicant_words,
+            &final_pool_stats
+        )) {
+            fprintf(stderr, "Error: final coordinated pool measurement failed\n");
+            free(chosen_idx);
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            debug_close();
+            return 1;
+        }
+
+        DBG_INFO_BLOCK {
+            fprintf(
+                debug_out,
+                "CCUBES_POOL_FINAL generated=%d valuable=%d discarded=%d "
+                "connections=%d selected_rows=%d input_literals=%d "
+                "selected_shared=%d savings=%d selection=%s\n",
+                final_pool_stats.generated_pool_solutions,
+                final_pool_stats.valuable_pool_solutions,
+                final_pool_stats.discarded_pool_solutions,
+                final_pool_stats.output_connections,
+                final_pool_stats.selected_distinct_cubes,
+                final_pool_stats.selected_input_literals,
+                final_pool_stats.selected_shared_cubes,
+                final_pool_stats.sharing_savings,
+                final_pool_stats.selection_exact ? "exact" : "local"
+            );
+        }
+
+        free(chosen_idx);
     }
 
     free(certified_states);
