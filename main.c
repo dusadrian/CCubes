@@ -751,6 +751,48 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /*
+     * The PLA reader stores the same input row independently in each
+     * output-specific ON/OFF partition. Build one immutable row table before
+     * starting workers so each support can be projected once across outputs.
+     * Checkpoints deliberately omit this derived layout, so resume rebuilds it
+     * here from the restored ON/OFF sets as well.
+     */
+    if (!prepare_shared_projection_rows(PInfo, ninputs, noutputs)) {
+        fprintf(stderr, "Error: shared projection-layout allocation failed.\n");
+        free(chk_stop_counter);
+        free(chk_coverage_horizon);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+
+    DBG_INFO_BLOCK {
+        size_t projection_memberships = 0u;
+        for (int output = 0; output < noutputs; ++output) {
+            projection_memberships +=
+                (size_t)PInfo[output].ON_minterms +
+                (size_t)PInfo[output].OFF_minterms;
+        }
+        fprintf(
+            debug_out,
+            "Shared projection rows: %d unique across %zu output memberships\n",
+            PInfo[0].projection_row_count,
+            projection_memberships
+        );
+    }
+
+    /*
+     * Worker-side support unranking calls nchoosek repeatedly. Build the
+     * read-only Pascal table before any PI-generation threads can start.
+     */
+    if (!nchoosek_prepare(ninputs)) {
+        fprintf(stderr, "Error: binomial lookup-table allocation failed.\n");
+        free(chk_stop_counter);
+        free(chk_coverage_horizon);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+
     if (PI_GENERATOR_MODE == PI_GENERATOR_MMCS) {
         fprintf(
             stderr,

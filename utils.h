@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 
 #include "debug.h"
+#include "binomial.h"
 #include "ccubes_threads.h"
 #include "subsumption_index.h"
 #include "pichart_view.h"
@@ -88,6 +89,15 @@ typedef struct {
     // Input data
     int      *ON_set;
     int      *OFF_set;
+    /*
+     * Exact input rows are shared across output-specific ON/OFF partitions.
+     * projection_rows is owned only by PInfo[0]; every output owns its two
+     * row-id maps into that common table.
+     */
+    int       projection_row_count;
+    int      *projection_rows;
+    int      *ON_projection_ids;
+    int      *OFF_projection_ids;
     int      *covered;
     int      *last_index;
     int      *k_last_index; // continued at each k
@@ -127,7 +137,13 @@ typedef struct ThreadBuffer {
     int      *covsum;
     uint64_t *fixed_bits;
     uint64_t *value_bits;
+    int      *projection_codes;
+    unsigned char *projection_has_dc;
+    int       projection_capacity;
     int       found;
+#ifdef CCUBES_TESTING
+    uint64_t  validation_attempts;
+#endif
 } ThreadBuffer;
 
 /*
@@ -157,11 +173,6 @@ bool heuristic_pattern_model_supported(
     const PIstorage *PInfo,
     int ninputs,
     int noutputs
-);
-
-uint64_t nchoosek(
-    int n,
-    int k
 );
 
 void resize(
@@ -203,6 +214,12 @@ void read_pla_file(
     int *noutputs,
     int **nofvalues,
     int *max_value
+);
+
+bool prepare_shared_projection_rows(
+    PIstorage *PInfo,
+    int ninputs,
+    int noutputs
 );
 
 void write_pla_file(

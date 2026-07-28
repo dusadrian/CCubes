@@ -185,8 +185,8 @@ clean:
 TEST_CFLAGS := -Wall -O2 -I.
 TEST_LIBS   := -lm
 
-.PHONY: test test-cover-validation test-pool-selection test-pi-finalization test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
-test: test-cover-validation test-pool-selection test-pi-finalization test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+.PHONY: test test-cover-validation test-pool-selection test-pi-finalization test-projection-cache test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+test: test-cover-validation test-pool-selection test-pi-finalization test-projection-cache test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
 
 test-cover-validation:
 	$(CC) $(TEST_CFLAGS) tests/test_cover_validation.c cover_validation.c -o /tmp/ccubes_test_cover_validation $(TEST_LIBS)
@@ -197,8 +197,16 @@ test-pool-selection:
 	/tmp/ccubes_test_pool_selection
 
 test-pi-finalization:
-	$(CC) $(TEST_CFLAGS) tests/test_pi_finalization.c utils.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_pi_finalization $(TEST_LIBS)
+	$(CC) $(TEST_CFLAGS) tests/test_pi_finalization.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_pi_finalization $(TEST_LIBS)
 	/tmp/ccubes_test_pi_finalization
+
+test-projection-cache:
+	$(CC) $(TEST_CFLAGS) -DCCUBES_TESTING tests/test_projection_cache.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_projection_cache $(TEST_LIBS)
+	/tmp/ccubes_test_projection_cache
+
+test-nchoosek:
+	$(CC) $(TEST_CFLAGS) tests/test_nchoosek.c binomial.c -o /tmp/ccubes_test_nchoosek $(TEST_LIBS)
+	/tmp/ccubes_test_nchoosek
 
 test-projected-cube-prime:
 	$(CC) $(TEST_CFLAGS) tests/test_projected_cube_prime.c prime_check.c -o /tmp/ccubes_test_projected_cube_prime $(TEST_LIBS)

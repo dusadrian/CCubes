@@ -1055,88 +1055,6 @@ void error_message(const char *msg) {
     exit(EXIT_FAILURE);
 }
 
-// Use 128-bit unsigned integers if available (GCC/Clang on 64-bit platforms)
-#if defined(__GNUC__) && defined(__SIZEOF_INT128__)
-    typedef __uint128_t big_uint;
-    #define BIG_UINT_AVAILABLE 1
-#else
-    #define BIG_UINT_AVAILABLE 0
-#endif
-
-/**
- * Compute the binomial coefficient "n choose k" (nCk) with overflow protection.
- *
- * If __uint128_t is available, performs 128-bit intermediate multiplication to
- * support very large inputs, returning 0 if the result exceeds 64-bit capacity.
- *
- * If only 64-bit integers are available, performs step-by-step overflow checks
- * and also returns 0 on any overflow risk.
- */
-uint64_t nchoosek(int n, int k) {
-    if (k < 0 || n < 0 || k > n) {
-        return 0;
-    }
-
-    if (k == 0 || k == n) {
-        return 1;
-    }
-    // now k is always > 0
-
-    // Take advantage of symmetry: C(n, k) == C(n, n-k)
-    if (k > n - k) {
-        k = n - k;
-    }
-
-#if BIG_UINT_AVAILABLE
-
-    big_uint result = 1;
-
-    for (int i = 0; i < k; i++) {
-        /**
-         * Safe unsigned math: result *= (n - i) / (i + 1)
-         *
-         * Cast operands *before* the subtraction/addition to
-         * avoid any signed-to-unsigned conversion that triggers
-         * -Wsign-conversion warnings.
-         *
-         * The loop guarantees that:
-         * 0 <= i < k <= n - k < n
-         */
-        result *= (big_uint)n - (big_uint)i;
-        result /= (big_uint)i + (big_uint)1;
-    }
-
-    // Check if final result exceeds uint64_t capacity
-    if (result > (big_uint)ULLONG_MAX) {
-        return 0;
-    }
-
-    return (uint64_t)result;
-
-#else
-
-    uint64_t result = 1;
-
-    for (int i = 0; i < k; i++) {
-        int diff = n - i;
-        if (diff <= 0 || result > ULLONG_MAX / (uint64_t)diff) {
-            return 0; // multiplication would overflow
-        }
-        result *= (uint64_t)diff;
-
-        int denom = i + 1;
-        if (denom <= 0 || result % (uint64_t)denom != 0) {
-            return 0; // division would be imprecise or overflow
-        }
-        result /= (uint64_t)denom;
-    }
-
-    return result;
-
-#endif
-}
-
-
 void resize(
     void **array,
     ArrayType type,
@@ -1499,6 +1417,160 @@ void read_pla_file(
     fclose(file);
 }
 
+static uint64_t projection_row_hash(const int *row, int ninputs) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (int input = 0; input < ninputs; ++input) {
+        hash ^= (uint64_t)(unsigned int)row[input];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void clear_shared_projection_rows(
+    PIstorage *PInfo,
+    int noutputs
+) {
+    if (!PInfo || noutputs <= 0) return;
+    free(PInfo[0].projection_rows);
+    for (int output = 0; output < noutputs; ++output) {
+        PInfo[output].projection_rows = NULL;
+        PInfo[output].projection_row_count = 0;
+        free(PInfo[output].ON_projection_ids);
+        free(PInfo[output].OFF_projection_ids);
+        PInfo[output].ON_projection_ids = NULL;
+        PInfo[output].OFF_projection_ids = NULL;
+    }
+}
+
+bool prepare_shared_projection_rows(
+    PIstorage *PInfo,
+    int ninputs,
+    int noutputs
+) {
+    if (!PInfo || ninputs <= 0 || noutputs <= 0) return false;
+    clear_shared_projection_rows(PInfo, noutputs);
+
+    size_t memberships = 0u;
+    for (int output = 0; output < noutputs; ++output) {
+        size_t rows =
+            (size_t)PInfo[output].ON_minterms +
+            (size_t)PInfo[output].OFF_minterms;
+        if (rows > SIZE_MAX - memberships) return false;
+        memberships += rows;
+    }
+    if (
+        memberships == 0u ||
+        memberships > (size_t)INT_MAX ||
+        memberships > SIZE_MAX / (size_t)ninputs
+    ) {
+        return false;
+    }
+
+    size_t table_size = 16u;
+    while (table_size < memberships * 2u) {
+        if (table_size > SIZE_MAX / 2u) return false;
+        table_size <<= 1u;
+    }
+
+    int *slots = (int *)malloc(table_size * sizeof(int));
+    int *rows = (int *)malloc(
+        memberships * (size_t)ninputs * sizeof(int)
+    );
+    if (!slots || !rows) {
+        free(slots);
+        free(rows);
+        return false;
+    }
+    for (size_t slot = 0; slot < table_size; ++slot) slots[slot] = -1;
+
+    for (int output = 0; output < noutputs; ++output) {
+        if (PInfo[output].ON_minterms > 0) {
+            PInfo[output].ON_projection_ids = (int *)malloc(
+                (size_t)PInfo[output].ON_minterms * sizeof(int)
+            );
+        }
+        if (PInfo[output].OFF_minterms > 0) {
+            PInfo[output].OFF_projection_ids = (int *)malloc(
+                (size_t)PInfo[output].OFF_minterms * sizeof(int)
+            );
+        }
+        if (
+            (PInfo[output].ON_minterms > 0 &&
+                !PInfo[output].ON_projection_ids) ||
+            (PInfo[output].OFF_minterms > 0 &&
+                !PInfo[output].OFF_projection_ids)
+        ) {
+            free(slots);
+            free(rows);
+            PInfo[0].projection_rows = NULL;
+            clear_shared_projection_rows(PInfo, noutputs);
+            return false;
+        }
+    }
+
+    int row_count = 0;
+    for (int output = 0; output < noutputs; ++output) {
+        for (int partition = 0; partition < 2; ++partition) {
+            int count = partition == 0
+                ? PInfo[output].ON_minterms
+                : PInfo[output].OFF_minterms;
+            const int *source = partition == 0
+                ? PInfo[output].ON_set
+                : PInfo[output].OFF_set;
+            int *ids = partition == 0
+                ? PInfo[output].ON_projection_ids
+                : PInfo[output].OFF_projection_ids;
+
+            for (int source_row = 0; source_row < count; ++source_row) {
+                const int *row = &source[
+                    (size_t)source_row * (size_t)ninputs
+                ];
+                size_t mask = table_size - 1u;
+                size_t slot =
+                    (size_t)(projection_row_hash(row, ninputs) & mask);
+
+                while (slots[slot] >= 0) {
+                    int candidate = slots[slot];
+                    if (
+                        memcmp(
+                            &rows[(size_t)candidate * (size_t)ninputs],
+                            row,
+                            (size_t)ninputs * sizeof(int)
+                        ) == 0
+                    ) {
+                        break;
+                    }
+                    slot = (slot + 1u) & mask;
+                }
+
+                if (slots[slot] < 0) {
+                    if ((size_t)row_count >= memberships) {
+                        free(slots);
+                        free(rows);
+                        PInfo[0].projection_rows = NULL;
+                        clear_shared_projection_rows(PInfo, noutputs);
+                        return false;
+                    }
+                    memcpy(
+                        &rows[(size_t)row_count * (size_t)ninputs],
+                        row,
+                        (size_t)ninputs * sizeof(int)
+                    );
+                    slots[slot] = row_count++;
+                }
+                ids[source_row] = slots[slot];
+            }
+        }
+    }
+
+    free(slots);
+    PInfo[0].projection_rows = rows;
+    for (int output = 0; output < noutputs; ++output) {
+        PInfo[output].projection_row_count = row_count;
+    }
+    return true;
+}
+
 void write_pla_file(
     const char *filename,
     PIstorage *PInfo
@@ -1642,6 +1714,9 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
 
     int noutputs = PInfo[0].outputs;
     for (int o = 0; o < noutputs; o++) {
+        if (o == 0) free(PInfo[o].projection_rows);
+        free(PInfo[o].ON_projection_ids);
+        free(PInfo[o].OFF_projection_ids);
         free(PInfo[o].ON_set);
         free(PInfo[o].OFF_set);
         free(PInfo[o].covered);
@@ -1683,6 +1758,8 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
             free(buffer[t][o].covsum);
             free(buffer[t][o].fixed_bits);
             free(buffer[t][o].value_bits);
+            free(buffer[t][o].projection_codes);
+            free(buffer[t][o].projection_has_dc);
         }
         free(buffer[t]);
     }
@@ -1757,6 +1834,49 @@ static bool ensure_thread_buffer_capacity(
     buffer->fixed_bits = fixed_bits;
     buffer->value_bits = value_bits;
     buffer->capacity = capacity;
+    return true;
+}
+
+static bool ensure_projection_buffer_capacity(
+    ThreadBuffer *buffer,
+    int needed
+) {
+    if (!buffer || needed <= 0) return false;
+    if (
+        buffer->projection_capacity >= needed &&
+        buffer->projection_codes &&
+        buffer->projection_has_dc
+    ) {
+        return true;
+    }
+
+    int capacity =
+        buffer->projection_capacity > 0
+            ? buffer->projection_capacity
+            : 16;
+    while (capacity < needed) {
+        if (capacity > INT_MAX / 2) {
+            capacity = needed;
+            break;
+        }
+        capacity *= 2;
+    }
+
+    int *codes = (int *)malloc((size_t)capacity * sizeof(int));
+    unsigned char *has_dc = (unsigned char *)malloc(
+        (size_t)capacity * sizeof(unsigned char)
+    );
+    if (!codes || !has_dc) {
+        free(codes);
+        free(has_dc);
+        return false;
+    }
+
+    free(buffer->projection_codes);
+    free(buffer->projection_has_dc);
+    buffer->projection_codes = codes;
+    buffer->projection_has_dc = has_dc;
+    buffer->projection_capacity = capacity;
     return true;
 }
 
@@ -1937,6 +2057,62 @@ int process_task(
         fixed_bits[word_index[tempk[c]]] |= shifted_mask[tempk[c]]; // for implicants_pos
     }
 
+    /*
+     * The support and mixed-radix layout are task-wide. More importantly, the
+     * same source input row is usually present in every output-specific ON/OFF
+     * partition. Project each distinct row once, then map those codes into the
+     * per-output partitions below.
+     */
+    int mbase[k];
+    mbase[0] = 1;
+    for (int i = 1; i < k; i++) {
+        mbase[i] = mbase[i - 1] * nofvalues[tempk[i - 1]];
+    }
+
+    int space_size = 1;
+    for (int i = 0; i < k; i++) {
+        space_size *= nofvalues[tempk[i]];
+    }
+    if (space_size < 1) space_size = 1;
+
+    int mbase_sum = 0;
+    for (int i = 0; i < k; i++) {
+        mbase_sum += mbase[i];
+    }
+
+    int projection_row_count = PInfo[0].projection_row_count;
+    const int *projection_rows = PInfo[0].projection_rows;
+    bool use_shared_projection =
+        projection_row_count > 0 &&
+        projection_rows != NULL &&
+        ensure_projection_buffer_capacity(
+            &buffer[tid][0],
+            projection_row_count
+        );
+    int *projection_codes = use_shared_projection
+        ? buffer[tid][0].projection_codes
+        : NULL;
+    unsigned char *projection_has_dc = use_shared_projection
+        ? buffer[tid][0].projection_has_dc
+        : NULL;
+
+    if (use_shared_projection) {
+        for (int row = 0; row < projection_row_count; ++row) {
+            int acc = 0;
+            bool has_dc = false;
+            const int *values = &projection_rows[
+                (size_t)row * (size_t)ninputs
+            ];
+            for (int c = 0; c < k; ++c) {
+                int value = values[tempk[c]];
+                if (value == 0) has_dc = true;
+                acc += value * mbase[c];
+            }
+            projection_codes[row] = acc;
+            projection_has_dc[row] = has_dc ? 1u : 0u;
+        }
+    }
+
     int max_found = 0;
     for (int o = 0; o < noutputs; o++) {
         int ON_minterms = PInfo[o].ON_minterms;
@@ -1951,9 +2127,6 @@ int process_task(
         uint64_t *shifted_cov_mask = PInfo[o].shifted_cov_mask;
 
         ThreadBuffer *ts = &buffer[tid][o];
-
-
-
         // allocate vectors of decimal numbers for the ON-set and OFF-set rows
         int *decpos = (int *) calloc((size_t)ON_minterms, sizeof(int));
         int *decneg = (int *) calloc((size_t)OFF_minterms, sizeof(int));
@@ -1961,24 +2134,6 @@ int process_task(
             fprintf(stderr, "Error: Memory allocation failed for decimal position arrays\n");
             return 1;
         }
-
-        // create the vector of multiple bases, useful when calculating the decimal representation
-        // of a particular combination of columns, for each row
-        int mbase[k];
-        mbase[0] = 1; // the first number is _always_ equal to 1, irrespective of the number of values in a certain input
-
-        // calculate the vector of multiple bases, for example if we have k = 3 (three inputs) with
-        // 2, 3 and 2 values then mbase will be [1, 2, 6] from: 1, 1 * 2 = 2, 2 * 3 = 6
-        for (int i = 1; i < k; i++) {
-            mbase[i] = mbase[i - 1] * nofvalues[tempk[i - 1]];
-        }
-
-        // Compute the total number of potential PIs for this combination: T = prod(v_s)
-        int space_size = 1;
-        for (int i = 0; i < k; i++) {
-            space_size *= nofvalues[tempk[i]];
-        }
-        if (space_size < 1) space_size = 1;
 
         int max_candidates = space_size < ON_minterms ? space_size : ON_minterms;
         if (!ensure_thread_buffer_capacity(
@@ -1995,15 +2150,20 @@ int process_task(
         uint64_t *task_pichart_values = ts->pichart_values;
         int *task_found = &ts->found;
 
-        // Sum of mixed-radix bases (for normalizing decpos to 0..T-1 when values are 1..v)
-        int mbase_sum = 0;
-        for (int i = 0; i < k; i++) {
-            mbase_sum += mbase[i];
-        }
-
         // First pass: compute decpos for all ON rows (0 means invalid due to DC on selected inputs)
         // TODO: explore the potential of DC values compared to the OFF-set rows
         for (int r = 0; r < ON_minterms; r++) {
+            if (
+                use_shared_projection &&
+                PInfo[o].ON_projection_ids
+            ) {
+                int row_id = PInfo[o].ON_projection_ids[r];
+                decpos[r] = projection_has_dc[row_id]
+                    ? 0
+                    : projection_codes[row_id];
+                continue;
+            }
+
             int acc = 0;
             bool valid = true;
 
@@ -2040,10 +2200,20 @@ int process_task(
             int acc = 0;
             bool has_dc = false;
 
-            for (int c = 0; c < k; c++) {
-                int value = PInfo[o].OFF_set[r * ninputs + tempk[c]];
-                if (value == 0) has_dc = true;
-                acc += value * mbase[c];
+            if (
+                use_shared_projection &&
+                PInfo[o].OFF_projection_ids
+            ) {
+                int row_id = PInfo[o].OFF_projection_ids[r];
+                acc = projection_codes[row_id];
+                has_dc = projection_has_dc[row_id] != 0;
+            } else {
+                for (int c = 0; c < k; c++) {
+                    int value =
+                        PInfo[o].OFF_set[r * ninputs + tempk[c]];
+                    if (value == 0) has_dc = true;
+                    acc += value * mbase[c];
+                }
             }
 
             decneg[r] = acc;
@@ -2099,8 +2269,16 @@ int process_task(
             size_t on_index = (size_t)(decpos[r] - mbase_sum);
             assert(on_index < (size_t)space_size);
 
-            if (use_seen && on_index < (size_t)space_size && pos_seen[on_index]) {
-                continue; // duplicate pattern already seen
+            if (use_seen && on_index < (size_t)space_size) {
+                if (pos_seen[on_index]) {
+                    continue; // accepted or rejected assignment already examined
+                }
+                /*
+                 * Validity depends on the projected assignment, not on which
+                 * ON row supplied it. Mark it before OFF validation so a
+                 * rejected assignment is cached as well as an accepted one.
+                 */
+                pos_seen[on_index] = true;
             }
             if (!use_seen || on_index >= (size_t)space_size) {
                 // O(n) fallback: check previously selected rows for duplicate decpos
@@ -2115,6 +2293,10 @@ int process_task(
 
                 if (duplicate) continue;
             }
+
+#ifdef CCUBES_TESTING
+            ts->validation_attempts++;
+#endif
 
             // check if the row is different from any OFF-set row
             bool valid_row = true;
@@ -2144,10 +2326,6 @@ int process_task(
 
             possible_rows[found++] = r;
             max_found++;
-
-            if (use_seen && on_index < (size_t)space_size) {
-                pos_seen[on_index] = true;
-            }
 
             if (found >= space_size) {
                 break; // also guard after increment
