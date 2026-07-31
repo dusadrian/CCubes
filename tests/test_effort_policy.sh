@@ -48,12 +48,11 @@ grep -q "warm_start_requested=1 warm_start_accepted=1" "$work/e2.log"
 "$ccubes" -d -s0 -e0 -c -dbg1 "$fixture" "$work/e0_certified.pla" \
     >"$work/e0_certified.log" 2>&1
 grep -q \
-    "CCUBES_PLATEAU_PROBE level=2 output=1 .* appended=1 improved=yes" \
+    "CCUBES_PI_GENERATOR level=1 selected=complete-mmcs" \
     "$work/e0_certified.log"
-if grep -q "^k: 3$" "$work/e0_certified.log"; then
-    echo "-e0 -c did not use the plateau probe's earlier one-term cover" >&2
-    exit 1
-fi
+grep -q \
+    "CCUBES_CERTIFICATE output=1 scope=global method=cardinality-floor status=certified level=1 cover=1" \
+    "$work/e0_certified.log"
 
 "$ccubes" -d -s0 -e2 -c -dbg1 "$fixture" "$work/e2_certified.pla" \
     >"$work/e2_certified.log" 2>&1
@@ -61,7 +60,10 @@ grep -q \
     "effort=2 certification_requested=1 iteration_limit=5000 portfolio_limit=6 polish_nodes=2000000" \
     "$work/e2_certified.log"
 grep -q \
-    "CCUBES_PLATEAU_PROBE level=2 output=1 .* appended=1 improved=yes" \
+    "CCUBES_PI_GENERATOR level=1 selected=complete-mmcs" \
+    "$work/e2_certified.log"
+grep -q \
+    "CCUBES_CERTIFICATE output=1 scope=global method=cardinality-floor status=certified level=1 cover=1" \
     "$work/e2_certified.log"
 
 echo "hybrid effort stopping policy regression: OK"

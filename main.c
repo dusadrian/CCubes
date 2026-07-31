@@ -34,7 +34,8 @@
 typedef enum {
     PI_GENERATOR_AUTO = 0,
     PI_GENERATOR_PROJECTION,
-    PI_GENERATOR_MMCS
+    PI_GENERATOR_MMCS,
+    PI_GENERATOR_COMPLETE_MMCS
 } PIGeneratorMode;
 
 /*
@@ -150,6 +151,7 @@ typedef struct {
 
 typedef struct {
     int level;
+    bool complete_chart;
     int ninputs;
     int noutputs;
     int *bit_index;
@@ -159,6 +161,7 @@ typedef struct {
     PIstorage *PInfo;
     BoundedMMCSStats *stats;
     BoundedMMCSResult *results;
+    double *elapsed_seconds;
     uint64_t node_limit;
     atomic_bool *fallback;
     atomic_bool *failed;
@@ -272,17 +275,37 @@ static void mmcs_search_range_worker(
             continue;
         }
 
-        BoundedMMCSResult result = bounded_mmcs_generate_output_level_limited(
-            &ctx->PInfo[output],
-            ctx->ninputs,
-            ctx->level,
-            ctx->word_index,
-            ctx->bit_index,
-            ctx->shifted_mask,
-            ctx->implicant_words,
-            ctx->node_limit,
-            &ctx->stats[output]
-        );
+        struct timespec task_start;
+        struct timespec task_end;
+        clock_gettime(CLOCK_MONOTONIC, &task_start);
+        BoundedMMCSResult result = ctx->complete_chart
+            ? bounded_mmcs_generate_output_all_limited(
+                &ctx->PInfo[output],
+                ctx->ninputs,
+                ctx->word_index,
+                ctx->bit_index,
+                ctx->shifted_mask,
+                ctx->implicant_words,
+                ctx->node_limit,
+                &ctx->stats[output]
+            )
+            : bounded_mmcs_generate_output_level_limited(
+                &ctx->PInfo[output],
+                ctx->ninputs,
+                ctx->level,
+                ctx->word_index,
+                ctx->bit_index,
+                ctx->shifted_mask,
+                ctx->implicant_words,
+                ctx->node_limit,
+                &ctx->stats[output]
+            );
+        clock_gettime(CLOCK_MONOTONIC, &task_end);
+        if (ctx->elapsed_seconds) {
+            ctx->elapsed_seconds[output] =
+                (task_end.tv_sec - task_start.tv_sec) +
+                (task_end.tv_nsec - task_start.tv_nsec) / 1e9;
+        }
         ctx->results[output] = result;
 
         if (result == BOUNDED_MMCS_ERROR) {
@@ -360,12 +383,13 @@ void help() {
     printf("                           2 strong bounds plus a larger plateau probe\n");
     printf("  -d                   : deterministic PI ordering on multi-thread search\n");
     printf("  -g                   : print the adaptive blocking diagnostic at the first plateau\n");
-    printf("  -c                   : require certified exact stopping (point rows only)\n");
-    printf("                         (explicitly overrides the -e0 heuristic plateau policy)\n");
-    printf("                         (input-dash rows: heuristic plateau stopping)\n");
+    printf("  -c                   : certify a global minimum cover by complete-prime\n");
+    printf("                         enumeration plus an exact complete-chart solve\n");
+    printf("                         (fully specified binary point rows only)\n");
     printf("  -p                   : enable automatic equal-cardinality cover pooling\n");
-    printf("  --pi-generator=<name>: PI generator: auto (default), projection, or mmcs\n");
-    printf("                         (projection/mmcs are expert reproducibility overrides)\n");
+    printf("  --pi-generator=<name>: PI generator: auto (default), projection, mmcs,\n");
+    printf("                         or complete-mmcs (the generator selected by -c)\n");
+    printf("                         (non-auto modes are expert reproducibility overrides)\n");
     printf("  -l<sec>[=<file>]     : time limit to save a checkpoint in the <file>\n");
     printf("  -r=<file>            : resume from checkpoint file\n");
     printf("  -i<level>=<file>     : inspect checkpoint (print progress and metadata)\n");
@@ -410,6 +434,7 @@ int main(int argc, char *argv[]) {
      */
     bool DETERMINISTIC_PI_ORDER = env_flag_enabled("CCUBES_DETERMINISTIC");
     PIGeneratorMode PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
+    bool COMPLETE_MMCS_DEFAULTED = false;
     bool CERTIFIED_MODE = false;
     bool REPORT_BLOCKING_DIAGNOSTIC = false;
     char *SRC_FILE = NULL;
@@ -527,10 +552,13 @@ int main(int argc, char *argv[]) {
                 PI_GENERATOR_MODE = PI_GENERATOR_PROJECTION;
             } else if (strcmp(generator, "mmcs") == 0) {
                 PI_GENERATOR_MODE = PI_GENERATOR_MMCS;
+            } else if (strcmp(generator, "complete-mmcs") == 0) {
+                PI_GENERATOR_MODE = PI_GENERATOR_COMPLETE_MMCS;
             } else {
                 fprintf(
                     stderr,
-                    "Invalid PI generator: %s (must be auto, projection, or mmcs)\n",
+                    "Invalid PI generator: %s (must be auto, projection, "
+                    "mmcs, or complete-mmcs)\n",
                     generator
                 );
                 help();
@@ -594,6 +622,26 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /*
+     * Certified mode has one production proof: complete transactional prime
+     * enumeration followed by an exact solve of the complete chart.  The
+     * former support-horizon certificate is intentionally no longer
+     * selectable.
+     */
+    if (CERTIFIED_MODE) {
+        if (PI_GENERATOR_MODE == PI_GENERATOR_AUTO) {
+            PI_GENERATOR_MODE = PI_GENERATOR_COMPLETE_MMCS;
+            COMPLETE_MMCS_DEFAULTED = true;
+        } else if (PI_GENERATOR_MODE != PI_GENERATOR_COMPLETE_MMCS) {
+            fprintf(
+                stderr,
+                "Error: -c uses complete-prime certification and cannot be "
+                "combined with projection or bounded-level MMCS.\n"
+            );
+            return 1;
+        }
+    }
+
     #ifdef HAVE_GUROBI
         if (SCP_TYPE == 1) {
             gurobi_ok = gurobi_license_is_valid();
@@ -624,7 +672,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (PI_GENERATOR_MODE == PI_GENERATOR_MMCS && RESUME_PATH) {
+    if (
+        (
+            PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
+            PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS
+        ) &&
+        RESUME_PATH
+    ) {
         fprintf(
             stderr,
             "Error: the experimental MMCS generator does not yet support checkpoint resume.\n"
@@ -632,10 +686,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (PI_GENERATOR_MODE == PI_GENERATOR_MMCS && TIME_LIMIT_SEC > 0.0) {
+    if (
+        (
+            PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
+            PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS
+        ) &&
+        TIME_LIMIT_SEC > 0.0
+    ) {
         fprintf(
             stderr,
             "Error: the experimental MMCS generator does not yet support time-limit checkpoints.\n"
+        );
+        return 1;
+    }
+
+    if (PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS && !CERTIFIED_MODE) {
+        fprintf(
+            stderr,
+            "Error: --pi-generator=complete-mmcs is a global certification "
+            "mode and requires -c.\n"
         );
         return 1;
     }
@@ -653,8 +722,6 @@ int main(int argc, char *argv[]) {
     int *nofvalues = NULL;
     int ninputs = 0, noutputs = 0, max_value = 0;
     int *chk_stop_counter = NULL; // resume: stop counters per output
-    int *chk_coverage_horizon = NULL;
-    bool chk_certified_mode = false;
     // Keep loaded bit parameters accessible outside the resume block
     int chk_value_bit_width_saved = 0;
     int chk_implicant_words_saved = 0;
@@ -693,9 +760,7 @@ int main(int argc, char *argv[]) {
                 &chk_dst_path,
                 &chk_elapsed_total,
                 &chk_elapsed_scp,
-                &chk_last_task,
-                &chk_certified_mode,
-                &chk_coverage_horizon
+                &chk_last_task
             ) != 0
         ) {
             fprintf(stderr, "Error: failed to load checkpoint from %s\n", RESUME_PATH);
@@ -716,7 +781,6 @@ int main(int argc, char *argv[]) {
         }
 
         (void)chk_MAX_LEVELS;
-        CERTIFIED_MODE = CERTIFIED_MODE || chk_certified_mode;
         WEIGHT_PIC = chk_WEIGHT_PIC;
         SCP_TYPE = chk_SCP_TYPE;
         POOL_MAX = chk_POOL_MAX;
@@ -793,7 +857,7 @@ int main(int argc, char *argv[]) {
         SCP_TYPE == 0 &&
         HYBRID_EFFORT_LEVEL == 0 &&
         !CERTIFIED_MODE;
-    const bool adaptive_escalation_enabled =
+    const bool adaptive_warning_enabled =
         adaptive_stopping_supported &&
         !fast_hybrid_heuristic &&
         !CERTIFIED_MODE;
@@ -805,7 +869,6 @@ int main(int argc, char *argv[]) {
             "for every output.\n"
         );
         free(chk_stop_counter);
-        free(chk_coverage_horizon);
         cleanup(PInfo, NULL);
         return 1;
     }
@@ -813,17 +876,19 @@ int main(int argc, char *argv[]) {
     if (!adaptive_stopping_supported && CERTIFIED_MODE) {
         fprintf(
             stderr,
-            "Error: -c certified stopping requires fully specified binary point rows; "
-            "input-dash pattern rows support heuristic stopping only.\n"
+            "Error: -c certified stopping requires nonconflicting, fully "
+            "specified binary point rows with nonempty ON and OFF sets.\n"
         );
         free(chk_stop_counter);
-        free(chk_coverage_horizon);
         cleanup(PInfo, NULL);
         return 1;
     }
 
     if (
-        PI_GENERATOR_MODE == PI_GENERATOR_MMCS &&
+        (
+            PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
+            PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS
+        ) &&
         !adaptive_stopping_supported
     ) {
         fprintf(
@@ -832,7 +897,6 @@ int main(int argc, char *argv[]) {
             "binary point rows with nonempty ON and OFF sets.\n"
         );
         free(chk_stop_counter);
-        free(chk_coverage_horizon);
         cleanup(PInfo, NULL);
         return 1;
     }
@@ -847,7 +911,6 @@ int main(int argc, char *argv[]) {
     if (!prepare_shared_projection_rows(PInfo, ninputs, noutputs)) {
         fprintf(stderr, "Error: shared projection-layout allocation failed.\n");
         free(chk_stop_counter);
-        free(chk_coverage_horizon);
         cleanup(PInfo, NULL);
         return 1;
     }
@@ -860,7 +923,6 @@ int main(int argc, char *argv[]) {
     )) {
         fprintf(stderr, "Error: wildcard OFF-mask allocation failed.\n");
         free(chk_stop_counter);
-        free(chk_coverage_horizon);
         cleanup(PInfo, NULL);
         return 1;
     }
@@ -904,7 +966,6 @@ int main(int argc, char *argv[]) {
     if (!nchoosek_prepare(ninputs)) {
         fprintf(stderr, "Error: binomial lookup-table allocation failed.\n");
         free(chk_stop_counter);
-        free(chk_coverage_horizon);
         cleanup(PInfo, NULL);
         return 1;
     }
@@ -913,6 +974,13 @@ int main(int argc, char *argv[]) {
         fprintf(
             stderr,
             "Notice: forcing experimental bounded MMCS-style PI generation.\n"
+        );
+    } else if (PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS) {
+        fprintf(
+            stderr,
+            COMPLETE_MMCS_DEFAULTED
+                ? "Notice: -c uses complete-prime MMCS certification.\n"
+                : "Notice: using complete-prime MMCS certification.\n"
         );
     } else if (PI_GENERATOR_MODE == PI_GENERATOR_PROJECTION) {
         fprintf(stderr, "Notice: forcing projection PI generation.\n");
@@ -943,43 +1011,13 @@ int main(int argc, char *argv[]) {
     if (!certified_states) {
         fprintf(stderr, "Error: stopping-state allocation failed.\n");
         free(chk_stop_counter);
-        free(chk_coverage_horizon);
         cleanup(PInfo, NULL);
         return 1;
     }
 
     for (int o = 0; o < noutputs; ++o) {
         certified_stop_state_reset(&certified_states[o]);
-        if (chk_coverage_horizon) {
-            certified_states[o].coverage_horizon = chk_coverage_horizon[o];
-        }
-        if (CERTIFIED_MODE && !certified_stop_state_prepare(
-            &certified_states[o],
-            &PInfo[o],
-            ninputs
-        )) {
-            fprintf(stderr, "Error: certified-horizon initialization failed.\n");
-            free(chk_stop_counter);
-            free(chk_coverage_horizon);
-            free(certified_states);
-            cleanup(PInfo, NULL);
-            return 1;
-        }
-        if (CERTIFIED_MODE) {
-            DBG_INFO_BLOCK {
-                fprintf(
-                    debug_out,
-                    "Certified output %d: agreement horizon Amax=%d, cover LB=%d\n",
-                    o + 1,
-                    certified_states[o].agreement_horizon,
-                    certified_states[o].cover_lower_bound
-                );
-            }
-        }
     }
-    free(chk_coverage_horizon);
-    chk_coverage_horizon = NULL;
-
     uint64_t VALUE_BIT_MASK = (1ULL << value_bit_width) - 1ULL;
 
     // Ensure pichart_words are aligned with the coverage packing width
@@ -1137,53 +1175,14 @@ int main(int argc, char *argv[]) {
         }
         if (adaptive_stopping_supported && RESUME_PATH && stop_counter[o] > 0) {
             blocking_stop_states[o].reported = true;
-            if (fast_hybrid_heuristic && !PInfo[o].stop_search) {
+            if (!PInfo[o].stop_search) {
                 PInfo[o].stop_search = true;
                 fprintf(
                     stderr,
-                    "Notice: output %d resumed under -e0; accepting the stored "
-                    "plateau without automatic certification.\n",
+                    "Notice: output %d resumed at a stored heuristic plateau; "
+                    "use a fresh -c run for global certification.\n",
                     o + 1
                 );
-            } else if (adaptive_escalation_enabled && !PInfo[o].stop_search) {
-                blocking_stop_states[o].certification_required = true;
-                if (!certified_stop_state_prepare(
-                    &certified_states[o],
-                    &PInfo[o],
-                    ninputs
-                )) {
-                    fprintf(stderr, "Error: failed to restore adaptive certification state.\n");
-                    free(certified_states);
-                    cleanup(PInfo, buffer);
-                    return 1;
-                }
-                blocking_stop_states[o].certification_horizon =
-                    certified_stop_horizon(&certified_states[o]);
-                const int estimate_from_level = RESUME_K > 0 ? RESUME_K - 1 : 0;
-                blocking_stop_states[o].certification_required =
-                    certified_stop_adaptive_work_within_limit(
-                        ninputs,
-                        estimate_from_level,
-                        blocking_stop_states[o].certification_horizon,
-                        CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT,
-                        &blocking_stop_states[o].estimated_remaining_tasks
-                    );
-                if (!blocking_stop_states[o].certification_required) {
-                    blocking_stop_states[o].escalation_suppressed = true;
-                    blocking_stop_states[o].task_estimate_capped = true;
-                    PInfo[o].stop_search = true;
-                    fprintf(
-                        stderr,
-                        "CCUBES_ADAPTIVE output=%d level=%d action=warn-stop "
-                        "horizon=%d remaining_position_tasks=%llu estimate_capped=1 "
-                        "limit=%llu reason=resume-budget\n",
-                        o + 1,
-                        RESUME_K,
-                        blocking_stop_states[o].certification_horizon,
-                        (unsigned long long)blocking_stop_states[o].estimated_remaining_tasks,
-                        (unsigned long long)CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT
-                    );
-                }
             }
         }
 
@@ -1276,6 +1275,10 @@ int main(int argc, char *argv[]) {
     }
 
     double scp_time = 0.0, k_scp_time = 0.0, pi_generation_time = 0.0;
+    double certification_enumeration_wall_time = 0.0;
+    double certification_enumeration_worker_time = 0.0;
+    double certification_chart_solve_time = 0.0;
+    uint64_t certification_prime_count = 0;
 
     /*
      * Widest branching factor over all outputs.  A level trial falls back as
@@ -1300,6 +1303,8 @@ int main(int argc, char *argv[]) {
 
     int k;
     for (k = search_level; k <= ninputs; k++) {
+        const bool complete_mmcs_chart =
+            PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS;
         int level_start[noutputs];
         for (int o = 0; o < noutputs; ++o) {
             int start_pi = (k > 1 && PInfo[o].nofpi) ? PInfo[o].nofpi[k - 2] : 0;
@@ -1324,6 +1329,7 @@ int main(int argc, char *argv[]) {
             );
         bool attempt_mmcs =
             PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
+            complete_mmcs_chart ||
             automatic_mmcs_trial;
         /*
          * Break-even trial budget.  A search node costs about
@@ -1361,7 +1367,9 @@ int main(int argc, char *argv[]) {
              */
             if (!mmcs_branching_plausible(mmcs_branching, k, budget)) {
                 automatic_mmcs_trial = false;
-                attempt_mmcs = PI_GENERATOR_MODE == PI_GENERATOR_MMCS;
+                attempt_mmcs =
+                    PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
+                    complete_mmcs_chart;
             } else {
                 automatic_mmcs_node_limit = budget;
             }
@@ -1447,6 +1455,8 @@ int main(int argc, char *argv[]) {
         BoundedMMCSStats mmcs_stats[noutputs];
         memset(mmcs_stats, 0, sizeof(mmcs_stats));
         BoundedMMCSResult mmcs_results[noutputs];
+        double mmcs_elapsed_seconds[noutputs];
+        memset(mmcs_elapsed_seconds, 0, sizeof(mmcs_elapsed_seconds));
         for (int o = 0; o < noutputs; ++o) {
             mmcs_results[o] = BOUNDED_MMCS_COMPLETE;
         }
@@ -1458,6 +1468,7 @@ int main(int argc, char *argv[]) {
         if (attempt_mmcs) {
             MMCSWorkerContext mmcs_ctx = {
                 .level = k,
+                .complete_chart = complete_mmcs_chart,
                 .ninputs = ninputs,
                 .noutputs = noutputs,
                 .bit_index = bit_index,
@@ -1467,6 +1478,7 @@ int main(int argc, char *argv[]) {
                 .PInfo = PInfo,
                 .stats = mmcs_stats,
                 .results = mmcs_results,
+                .elapsed_seconds = mmcs_elapsed_seconds,
                 .node_limit = automatic_mmcs_node_limit,
                 .fallback = &mmcs_fallback,
                 .failed = &mmcs_failed
@@ -1614,9 +1626,10 @@ int main(int argc, char *argv[]) {
                 }
                 fprintf(
                     debug_out,
-                    "CCUBES_PI_GENERATOR level=%d selected=mmcs "
+                    "CCUBES_PI_GENERATOR level=%d selected=%s "
                     "trial_nodes=%llu\n",
                     k,
+                    complete_mmcs_chart ? "complete-mmcs" : "mmcs",
                     (unsigned long long)mmcs_trial_nodes
                 );
             } else {
@@ -1655,7 +1668,16 @@ int main(int argc, char *argv[]) {
         destroy_pi_coverage_indices(coverage_indices, noutputs);
 
         for (int o = 0; o < noutputs; ++o) {
-            if (!finalize_pi_level(
+            if (complete_mmcs_chart) {
+                /*
+                 * Keep every complete-chart geometry. Cross-level coverage
+                 * equivalents can differ in support and secondary weight, so
+                 * ordinary same-level coverage pruning is not valid here.
+                 */
+                certified_stop_observe_complete_prime_chart(
+                    &certified_states[o]
+                );
+            } else if (!finalize_pi_level(
                 &PInfo[o],
                 implicant_words,
                 level_start[o],
@@ -1678,6 +1700,37 @@ int main(int argc, char *argv[]) {
             (endpi.tv_nsec - startpi.tv_nsec) / 1e9;
         pi_generation_time += k_pi_generation_time;
 
+        if (complete_mmcs_chart) {
+            certification_enumeration_wall_time += k_pi_generation_time;
+            uint64_t level_primes = 0;
+            double level_worker_seconds = 0.0;
+            for (int o = 0; o < noutputs; ++o) {
+                level_primes += (uint64_t)PInfo[o].foundPI;
+                level_worker_seconds += mmcs_elapsed_seconds[o];
+                fprintf(
+                    stderr,
+                    "CCUBES_CERTIFICATION_ENUMERATION output=%d "
+                    "primes=%d nodes=%llu seconds=%.6f\n",
+                    o + 1,
+                    PInfo[o].foundPI,
+                    (unsigned long long)mmcs_stats[o].search_nodes,
+                    mmcs_elapsed_seconds[o]
+                );
+            }
+            certification_prime_count += level_primes;
+            certification_enumeration_worker_time += level_worker_seconds;
+            fprintf(
+                stderr,
+                "CCUBES_CERTIFICATION_TIMING phase=enumeration "
+                "wall_seconds=%.6f worker_seconds=%.6f outputs=%d "
+                "primes=%llu\n",
+                k_pi_generation_time,
+                level_worker_seconds,
+                noutputs,
+                (unsigned long long)level_primes
+            );
+        }
+
         if (TIME_LIMIT_SEC > 0 && level_time_up) {
             if (!CHK_SAVE_PATH) {
                 if (RESUME_PATH) {
@@ -1696,11 +1749,6 @@ int main(int argc, char *argv[]) {
                 tmp_dst_alloc = prefix_basename(SRC_FILE, "ccubes_");
                 dst_to_save = tmp_dst_alloc; // may be NULL on OOM
             }
-            int checkpoint_coverage[noutputs];
-            for (int o = 0; o < noutputs; ++o) {
-                checkpoint_coverage[o] = certified_states[o].coverage_horizon;
-            }
-
             if (
                 save_checkpoint(
                     CHK_SAVE_PATH,
@@ -1720,9 +1768,7 @@ int main(int argc, char *argv[]) {
                     dst_to_save,
                     time_up_elapsed,
                     BASE_SCP + scp_time,
-                    last_task_reached_value,
-                    CERTIFIED_MODE,
-                    checkpoint_coverage
+                    last_task_reached_value
                 ) == 0
             ) {
                 double pct = (double)last_task_reached_value * 100.0 / (double)maxtasks;
@@ -1783,27 +1829,28 @@ int main(int argc, char *argv[]) {
                     *ON_set_covered = test_coverage;
                 }
 
-                if (adaptive_stopping_supported) {
-                    certified_stop_observe_coverage(
-                        &certified_states[o],
-                        k,
-                        *ON_set_covered
-                    );
-                }
-
-
                 if (*ON_set_covered && !PInfo[o].stop_search) {
                     bool boundary_exact = SCP_TYPE == 1;
                     DBG_TRACE_BLOCK {
                         fprintf(debug_out, "Output %d, found PIs: %d", o + 1, *foundPI);
                     }
 
-                    double *weights = build_cover_weights(
-                        &PInfo[o],
-                        *foundPI,
-                        k,
-                        WEIGHT_PIC
-                    );
+                    double *weights = complete_mmcs_chart
+                        ? build_complete_cover_weights(
+                            &PInfo[o],
+                            *foundPI,
+                            ninputs,
+                            implicant_words,
+                            word_index,
+                            shifted_mask,
+                            WEIGHT_PIC
+                        )
+                        : build_cover_weights(
+                            &PInfo[o],
+                            *foundPI,
+                            k,
+                            WEIGHT_PIC
+                        );
                     if (WEIGHT_PIC > 0 && !weights) {
                         fprintf(stderr, "Error: Memory allocation failed for cover weights\n");
                         destroy_output_locks(output_locks, noutputs);
@@ -1814,9 +1861,6 @@ int main(int argc, char *argv[]) {
                     clock_gettime(CLOCK_MONOTONIC, &startg);
 
                     if (SCP_TYPE == 0) { // Bundled hybrid solver
-                        bool certification_requested =
-                            CERTIFIED_MODE ||
-                            blocking_stop_states[o].certification_required;
                         const int *initial_solution =
                             *prevsolmin > 0 &&
                             *prevsolmin <= ON_minterms
@@ -1830,7 +1874,7 @@ int main(int argc, char *argv[]) {
                             HYBRID_EFFORT_LEVEL,
                             initial_solution,
                             initial_solution ? *prevsolmin : 0,
-                            certification_requested
+                            CERTIFIED_MODE
                         );
                         boundary_exact = lagrangian_last_run_proved_optimal();
                         print_hybrid_stats(o);
@@ -1898,12 +1942,22 @@ int main(int argc, char *argv[]) {
                             PInfo[o].nofpi[k - 1] = *foundPI;
                             chart = pi_chart_view(&PInfo[o]);
                             free(weights);
-                            weights = build_cover_weights(
-                                &PInfo[o],
-                                *foundPI,
-                                k,
-                                WEIGHT_PIC
-                            );
+                            weights = complete_mmcs_chart
+                                ? build_complete_cover_weights(
+                                    &PInfo[o],
+                                    *foundPI,
+                                    ninputs,
+                                    implicant_words,
+                                    word_index,
+                                    shifted_mask,
+                                    WEIGHT_PIC
+                                )
+                                : build_cover_weights(
+                                    &PInfo[o],
+                                    *foundPI,
+                                    k,
+                                    WEIGHT_PIC
+                                );
                             if (WEIGHT_PIC > 0 && !weights) {
                                 fprintf(
                                     stderr,
@@ -1924,9 +1978,7 @@ int main(int argc, char *argv[]) {
                                     HYBRID_EFFORT_LEVEL,
                                     previndices,
                                     *prevsolmin,
-                                    CERTIFIED_MODE ||
-                                        blocking_stop_states[o].
-                                            certification_required
+                                    CERTIFIED_MODE
                                 );
                                 boundary_exact =
                                     lagrangian_last_run_proved_optimal();
@@ -1987,6 +2039,22 @@ int main(int argc, char *argv[]) {
 
                     k_scp_time += execution_time;
 
+                    if (complete_mmcs_chart) {
+                        certification_chart_solve_time += execution_time;
+                        fprintf(
+                            stderr,
+                            "CCUBES_CERTIFICATION_CHART output=%d rows=%d "
+                            "primes=%d cover=%d boundary_exact=%d "
+                            "seconds=%.6f\n",
+                            o + 1,
+                            ON_minterms,
+                            *foundPI,
+                            *solmin,
+                            boundary_exact ? 1 : 0,
+                            execution_time
+                        );
+                    }
+
                     DBG_TRACE_BLOCK {
                         fprintf(debug_out, " (SCP %.3fs)", execution_time);
                     }
@@ -2014,9 +2082,7 @@ int main(int argc, char *argv[]) {
                             previndices[i] = indices[i];
                         }
 
-                        if (!blocking_stop_states[o].certification_required) {
-                            stop_counter[o] = 0;
-                        }
+                        stop_counter[o] = 0;
 
                         DBG_TRACE_BLOCK {
                             if (!PInfo[o].stop_search) {
@@ -2052,9 +2118,8 @@ int main(int argc, char *argv[]) {
 
                     if (adaptive_stopping_supported && !certified_blocking_observe_plateau(
                         &blocking_stop_states[o],
-                        &certified_states[o],
                         REPORT_BLOCKING_DIAGNOSTIC,
-                        adaptive_escalation_enabled,
+                        adaptive_warning_enabled,
                         plateau_triggered,
                         stderr,
                         o + 1,
@@ -2073,7 +2138,6 @@ int main(int argc, char *argv[]) {
                     }
                     PInfo[o].stop_search = certified_stop_policy_decision(
                         certified_states ? &certified_states[o] : NULL,
-                        &blocking_stop_states[o],
                         CERTIFIED_MODE,
                         plateau_triggered,
                         k,
@@ -2158,22 +2222,24 @@ int main(int argc, char *argv[]) {
                     *ON_set_covered = test_coverage;
                 }
 
-                if (adaptive_stopping_supported) {
-                    certified_stop_observe_coverage(
-                        &certified_states[o],
-                        k,
-                        *ON_set_covered
-                    );
-                }
-
                 if (*ON_set_covered && !PInfo[o].stop_search) {
                     clear_output_solution_pool(&PInfo[o]);
-                    double *weights = build_cover_weights(
-                        &PInfo[o],
-                        *foundPI,
-                        k,
-                        WEIGHT_PIC
-                    );
+                    double *weights = complete_mmcs_chart
+                        ? build_complete_cover_weights(
+                            &PInfo[o],
+                            *foundPI,
+                            ninputs,
+                            implicant_words,
+                            word_index,
+                            shifted_mask,
+                            WEIGHT_PIC
+                        )
+                        : build_cover_weights(
+                            &PInfo[o],
+                            *foundPI,
+                            k,
+                            WEIGHT_PIC
+                        );
                     if (WEIGHT_PIC > 0 && !weights) {
                         fprintf(stderr, "Error: Memory allocation failed for cover weights\n");
                         destroy_output_locks(output_locks, noutputs);
@@ -2219,8 +2285,7 @@ int main(int argc, char *argv[]) {
                                 PInfo[o].prevsolmin <= ON_minterms
                                     ? PInfo[o].prevsolmin
                                     : 0,
-                            CERTIFIED_MODE ||
-                                blocking_stop_states[o].certification_required
+                            CERTIFIED_MODE
                         );
                         pool_boundary_exact[o] = lagrangian_last_run_proved_optimal();
                         print_hybrid_stats(o);
@@ -2312,12 +2377,22 @@ int main(int argc, char *argv[]) {
                             PInfo[o].nofpi[k - 1] = *foundPI;
                             chart = pi_chart_view(&PInfo[o]);
                             free(weights);
-                            weights = build_cover_weights(
-                                &PInfo[o],
-                                *foundPI,
-                                k,
-                                WEIGHT_PIC
-                            );
+                            weights = complete_mmcs_chart
+                                ? build_complete_cover_weights(
+                                    &PInfo[o],
+                                    *foundPI,
+                                    ninputs,
+                                    implicant_words,
+                                    word_index,
+                                    shifted_mask,
+                                    WEIGHT_PIC
+                                )
+                                : build_cover_weights(
+                                    &PInfo[o],
+                                    *foundPI,
+                                    k,
+                                    WEIGHT_PIC
+                                );
                             if (WEIGHT_PIC > 0 && !weights) {
                                 fprintf(
                                     stderr,
@@ -2339,9 +2414,7 @@ int main(int argc, char *argv[]) {
                                     HYBRID_EFFORT_LEVEL,
                                     baseline_indices,
                                     baseline_solmin,
-                                    CERTIFIED_MODE ||
-                                        blocking_stop_states[o].
-                                            certification_required
+                                    CERTIFIED_MODE
                                 );
                                 pool_boundary_exact[o] =
                                     lagrangian_last_run_proved_optimal();
@@ -2371,12 +2444,22 @@ int main(int argc, char *argv[]) {
                                 );
                                 pool_boundary_exact[o] = baseline_exact;
                                 free(weights);
-                                weights = build_cover_weights(
-                                    &PInfo[o],
-                                    *foundPI,
-                                    k,
-                                    WEIGHT_PIC
-                                );
+                                weights = complete_mmcs_chart
+                                    ? build_complete_cover_weights(
+                                        &PInfo[o],
+                                        *foundPI,
+                                        ninputs,
+                                        implicant_words,
+                                        word_index,
+                                        shifted_mask,
+                                        WEIGHT_PIC
+                                    )
+                                    : build_cover_weights(
+                                        &PInfo[o],
+                                        *foundPI,
+                                        k,
+                                        WEIGHT_PIC
+                                    );
                                 if (WEIGHT_PIC > 0 && !weights) {
                                     fprintf(
                                         stderr,
@@ -2463,9 +2546,7 @@ int main(int argc, char *argv[]) {
                                 HYBRID_EFFORT_LEVEL,
                                 baseline_indices,
                                 baseline_solmin,
-                                CERTIFIED_MODE ||
-                                    blocking_stop_states[o].
-                                        certification_required
+                                CERTIFIED_MODE
                             );
                             pool_boundary_exact[o] =
                                 baseline_exact ||
@@ -2539,6 +2620,10 @@ int main(int argc, char *argv[]) {
 
                     k_scp_time += execution_time;
 
+                    if (complete_mmcs_chart) {
+                        certification_chart_solve_time += execution_time;
+                    }
+
                     pool_execution_time[o] = execution_time;
 
                     free(baseline_indices);
@@ -2611,9 +2696,7 @@ int main(int argc, char *argv[]) {
                             previndices[i] = indices[i];
                         }
 
-                        if (!blocking_stop_states[o].certification_required) {
-                            stop_counter[o] = 0;
-                        }
+                        stop_counter[o] = 0;
 
                     } else {
                         if (*solmin == *prevsolmin) {
@@ -2641,9 +2724,8 @@ int main(int argc, char *argv[]) {
 
                     if (adaptive_stopping_supported && !certified_blocking_observe_plateau(
                         &blocking_stop_states[o],
-                        &certified_states[o],
                         REPORT_BLOCKING_DIAGNOSTIC,
-                        adaptive_escalation_enabled,
+                        adaptive_warning_enabled,
                         plateau_triggered,
                         stderr,
                         o + 1,
@@ -2671,7 +2753,6 @@ int main(int argc, char *argv[]) {
 
                     PInfo[o].stop_search = certified_stop_policy_decision(
                         certified_states ? &certified_states[o] : NULL,
-                        &blocking_stop_states[o],
                         CERTIFIED_MODE,
                         plateau_triggered,
                         k,
@@ -2680,6 +2761,21 @@ int main(int argc, char *argv[]) {
                         stderr,
                         o + 1
                     );
+
+                    if (complete_mmcs_chart) {
+                        fprintf(
+                            stderr,
+                            "CCUBES_CERTIFICATION_CHART output=%d rows=%d "
+                            "primes=%d cover=%d boundary_exact=%d "
+                            "seconds=%.6f\n",
+                            o + 1,
+                            PInfo[o].ON_minterms,
+                            PInfo[o].foundPI,
+                            *solmin,
+                            pool_boundary_exact[o] ? 1 : 0,
+                            pool_execution_time[o]
+                        );
+                    }
 
                     DBG_INFO_BLOCK {
                         if (*solmin > 0 && output_was_searching) {
@@ -2779,6 +2875,7 @@ int main(int argc, char *argv[]) {
             stop &= PInfo[o].stop_search;
         }
         if (stop) break;
+        if (complete_mmcs_chart) break;
 
     } // end of k loop
 
@@ -2788,14 +2885,11 @@ int main(int argc, char *argv[]) {
     }
 
     for (int o = 0; o < noutputs; ++o) {
-        bool certificate_required =
-            CERTIFIED_MODE || blocking_stop_states[o].certification_required;
-        if (certificate_required && !PInfo[o].stop_search) {
+        if (CERTIFIED_MODE && !PInfo[o].stop_search) {
             fprintf(
                 stderr,
-                CERTIFIED_MODE
-                    ? "Error: no global optimality certificate was established for output %d.\n"
-                    : "Error: output %d was escalated by the blocking warning but no global optimality certificate was established.\n",
+                "Error: no global optimality certificate was established "
+                "for output %d.\n",
                 o + 1
             );
             destroy_output_locks(output_locks, noutputs);
@@ -2959,6 +3053,30 @@ int main(int argc, char *argv[]) {
         total_exec_time - pi_generation_time - total_scp_time,
         total_exec_time
     );
+    if (CERTIFIED_MODE) {
+        double certification_other_time =
+            total_exec_time -
+            certification_enumeration_wall_time -
+            certification_chart_solve_time;
+        if (certification_other_time < 0.0) {
+            certification_other_time = 0.0;
+        }
+        fprintf(
+            stderr,
+            "CCUBES_CERTIFICATION_TIMING phase=summary "
+            "enumeration_wall_seconds=%.6f "
+            "enumeration_worker_seconds=%.6f "
+            "chart_solve_seconds=%.6f other_seconds=%.6f "
+            "total_seconds=%.6f outputs=%d primes=%llu\n",
+            certification_enumeration_wall_time,
+            certification_enumeration_worker_time,
+            certification_chart_solve_time,
+            certification_other_time,
+            total_exec_time,
+            noutputs,
+            (unsigned long long)certification_prime_count
+        );
+    }
 
     lock_stats_set_generation_seconds(pi_generation_time);
     lock_stats_report(stderr);

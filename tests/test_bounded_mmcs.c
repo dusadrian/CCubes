@@ -237,6 +237,73 @@ static void verify_function(
         free_generated_arrays(&pi);
     }
 
+    PIstorage complete;
+    memset(&complete, 0, sizeof(complete));
+    complete.ON_minterms = on_count;
+    complete.OFF_minterms = off_count;
+    complete.ON_set = on_set;
+    complete.OFF_set = off_set;
+    complete.pichart_words = (on_count + 63) / 64;
+    complete.cov_bits = 64;
+
+    BoundedMMCSStats complete_stats;
+    memset(&complete_stats, 0, sizeof(complete_stats));
+    assert(bounded_mmcs_generate_output_all(
+        &complete,
+        ninputs,
+        word_index,
+        bit_index,
+        shifted_mask,
+        1,
+        &complete_stats
+    ));
+
+    int complete_brute_count = 0;
+    uint64_t universe = (UINT64_C(1) << ninputs) - 1u;
+    for (uint64_t fixed = 1; fixed <= universe; ++fixed) {
+        uint64_t value = fixed;
+        while (1) {
+            if (brute_is_prime(
+                on_rows,
+                on_count,
+                off_rows,
+                off_count,
+                fixed,
+                value
+            )) {
+                complete_brute_count++;
+                uint64_t packed_fixed = 0;
+                uint64_t packed_value = 0;
+                for (int input = 0; input < ninputs; ++input) {
+                    uint64_t bit = UINT64_C(1) << input;
+                    if ((fixed & bit) == 0) continue;
+                    packed_fixed |= shifted_mask[input];
+                    if (value & bit) {
+                        packed_value |= UINT64_C(1) << bit_index[input];
+                    }
+                }
+
+                bool found = false;
+                for (int cube = 0; cube < complete.foundPI; ++cube) {
+                    if (
+                        complete.implicants_pos[cube] == packed_fixed &&
+                        complete.implicants_val[cube] == packed_value
+                    ) {
+                        found = true;
+                        break;
+                    }
+                }
+                assert(found);
+            }
+            if (value == 0) break;
+            value = (value - 1u) & fixed;
+        }
+    }
+
+    assert(complete.foundPI == complete_brute_count);
+    assert(complete_stats.unique_cubes == (uint64_t)complete_brute_count);
+    free_generated_arrays(&complete);
+
     free(on_set);
     free(off_set);
     free(on_rows);
@@ -261,6 +328,69 @@ static void verify_random_functions(void) {
         verify_function(ninputs, is_on);
         free(is_on);
     }
+}
+
+static void verify_duplicate_on_rows(void) {
+    PIstorage pi;
+    memset(&pi, 0, sizeof(pi));
+
+    int on_set[4] = {
+        1, 1,
+        1, 1
+    };
+    int off_set[2] = {2, 2};
+    int word_index[2] = {0, 0};
+    int bit_index[2] = {0, 2};
+    uint64_t shifted_mask[2] = {
+        UINT64_C(3),
+        UINT64_C(3) << 2
+    };
+
+    pi.ON_minterms = 2;
+    pi.OFF_minterms = 1;
+    pi.ON_set = on_set;
+    pi.OFF_set = off_set;
+    pi.pichart_words = 1;
+    pi.cov_bits = 64;
+
+    BoundedMMCSStats stats;
+    memset(&stats, 0, sizeof(stats));
+    assert(bounded_mmcs_generate_output_all(
+        &pi,
+        2,
+        word_index,
+        bit_index,
+        shifted_mask,
+        1,
+        &stats
+    ));
+    assert(pi.foundPI == 2);
+    assert(pi.pichart_pos[0] == UINT64_C(3));
+    assert(pi.pichart_pos[1] == UINT64_C(3));
+    free_generated_arrays(&pi);
+}
+
+static void verify_exhaustive_small_functions(void) {
+    unsigned char is_on[16];
+    uint64_t functions = 0;
+
+    for (int ninputs = 1; ninputs <= 4; ++ninputs) {
+        int rows = 1 << ninputs;
+        uint32_t function_count = UINT32_C(1) << rows;
+        for (
+            uint32_t function = 1;
+            function + 1u < function_count;
+            ++function
+        ) {
+            for (int row = 0; row < rows; ++row) {
+                is_on[row] = (unsigned char)((function >> row) & 1u);
+            }
+            verify_function(ninputs, is_on);
+            functions++;
+        }
+    }
+
+    assert(functions == UINT64_C(65804));
 }
 
 static void verify_cross_output_sharing(void) {
@@ -365,12 +495,128 @@ static void verify_transactional_node_limit(void) {
     assert(pi.implicants_pos[0] == UINT64_C(0x3f));
     assert(pi.implicants_val[0] == 0);
     free_generated_arrays(&pi);
+    pi.foundPI = 0;
+    pi.estimPI = 0;
+
+    memset(&limited_stats, 0, sizeof(limited_stats));
+    assert(bounded_mmcs_generate_output_all_limited(
+        &pi,
+        3,
+        word_index,
+        bit_index,
+        shifted_mask,
+        1,
+        1,
+        &limited_stats
+    ) == BOUNDED_MMCS_LIMIT_REACHED);
+    assert(limited_stats.search_nodes == 1);
+    assert(pi.foundPI == 0);
+    assert(pi.implicants_pos == NULL);
+    assert(pi.pichart_pos == NULL);
+
+    memset(&complete_stats, 0, sizeof(complete_stats));
+    assert(bounded_mmcs_generate_output_all_limited(
+        &pi,
+        3,
+        word_index,
+        bit_index,
+        shifted_mask,
+        1,
+        0,
+        &complete_stats
+    ) == BOUNDED_MMCS_COMPLETE);
+    assert(pi.foundPI == 1);
+    assert(pi.implicants_pos[0] == UINT64_C(0x3f));
+    assert(pi.implicants_val[0] == 0);
+    free_generated_arrays(&pi);
+}
+
+/*
+ * For the second anchor, the OFF edge is {0} and the earlier-ON ownership
+ * edge is {1}. Their union has the minimal transversal {0,1}, but that cube
+ * is not prime against OFF: literal 1 can be deleted. The generator must use
+ * the ownership edge only to select an anchor, never as a private edge
+ * establishing primality.
+ */
+static void verify_ownership_edges_do_not_define_primality(void) {
+    int on_set[] = {
+        1, 2,
+        1, 1
+    };
+    int off_set[] = {
+        2, 1
+    };
+    uint64_t on_rows[] = {
+        UINT64_C(2),
+        UINT64_C(0)
+    };
+    uint64_t off_rows[] = {
+        UINT64_C(1)
+    };
+    int word_index[] = {0, 0};
+    int bit_index[] = {0, 2};
+    uint64_t shifted_mask[] = {
+        UINT64_C(3),
+        UINT64_C(3) << 2
+    };
+
+    PIstorage pi;
+    memset(&pi, 0, sizeof(pi));
+    pi.ON_minterms = 2;
+    pi.OFF_minterms = 1;
+    pi.ON_set = on_set;
+    pi.OFF_set = off_set;
+    pi.pichart_words = 1;
+    pi.cov_bits = 64;
+
+    BoundedMMCSStats stats;
+    memset(&stats, 0, sizeof(stats));
+    assert(bounded_mmcs_generate_output_all(
+        &pi,
+        2,
+        word_index,
+        bit_index,
+        shifted_mask,
+        1,
+        &stats
+    ));
+    assert(pi.foundPI == 2);
+
+    for (int cube = 0; cube < pi.foundPI; ++cube) {
+        uint64_t fixed = 0;
+        uint64_t value = 0;
+        for (int input = 0; input < 2; ++input) {
+            if (pi.implicants_pos[cube] & shifted_mask[input]) {
+                fixed |= UINT64_C(1) << input;
+                if (
+                    pi.implicants_val[cube] &
+                    (UINT64_C(1) << bit_index[input])
+                ) {
+                    value |= UINT64_C(1) << input;
+                }
+            }
+        }
+        assert(popcount_u64(fixed) == 1);
+        assert(brute_is_prime(
+            on_rows,
+            2,
+            off_rows,
+            1,
+            fixed,
+            value
+        ));
+    }
+
+    free_generated_arrays(&pi);
 }
 
 int main(void) {
+    verify_exhaustive_small_functions();
     verify_random_functions();
+    verify_duplicate_on_rows();
     verify_cross_output_sharing();
     verify_transactional_node_limit();
+    verify_ownership_edges_do_not_define_primality();
     puts("bounded MMCS regression: OK");
     return 0;
 }

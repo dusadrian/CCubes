@@ -193,8 +193,8 @@ clean:
 TEST_CFLAGS := -Wall -O2 -I.
 TEST_LIBS   := -lm
 
-.PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
-test: test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+.PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+test: test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
 
 test-cover-validation:
 	$(CC) $(TEST_CFLAGS) tests/test_cover_validation.c cover_validation.c -o /tmp/ccubes_test_cover_validation $(TEST_LIBS)
@@ -230,6 +230,10 @@ test-projected-cube-prime:
 test-certified-stop:
 	$(CC) $(TEST_CFLAGS) tests/test_certified_stop.c certified_stop.c -o /tmp/ccubes_test_certified_stop $(TEST_LIBS)
 	/tmp/ccubes_test_certified_stop
+
+test-certified-stop-exhaustive:
+	$(CC) $(TEST_CFLAGS) tests/test_certified_stop_exhaustive.c certified_stop.c -o /tmp/ccubes_test_certified_stop_exhaustive $(TEST_LIBS)
+	/tmp/ccubes_test_certified_stop_exhaustive
 
 test-subsumption-index:
 	$(CC) $(TEST_CFLAGS) tests/test_subsumption_index.c subsumption_index.c -o /tmp/ccubes_test_subsumption_index $(TEST_LIBS)

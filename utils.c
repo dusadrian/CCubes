@@ -16,6 +16,83 @@
 #include <float.h>
 #include <math.h>
 
+static uint64_t point_row_hash(const int *row, int ninputs) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (int input = 0; input < ninputs; ++input) {
+        hash ^= (uint64_t)(unsigned int)row[input];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+/*
+ * Certified stopping assumes a Boolean function, so its ON and OFF point sets
+ * must be disjoint.  Hash the ON rows once and probe every OFF row; duplicates
+ * within either side do not change the function and remain valid.
+ */
+static bool certified_point_sets_disjoint(
+    const PIstorage *pi,
+    int ninputs
+) {
+    size_t required = (size_t)pi->ON_minterms * 2u;
+    size_t capacity = 8u;
+    while (capacity < required) {
+        if (capacity > SIZE_MAX / 2u) return false;
+        capacity *= 2u;
+    }
+
+    int *slots = malloc(capacity * sizeof(*slots));
+    if (!slots) return false;
+    for (size_t slot = 0; slot < capacity; ++slot) slots[slot] = -1;
+
+    const size_t mask = capacity - 1u;
+    for (int row = 0; row < pi->ON_minterms; ++row) {
+        const int *point = &pi->ON_set[(size_t)row * (size_t)ninputs];
+        size_t slot = (size_t)point_row_hash(point, ninputs) & mask;
+        while (slots[slot] >= 0) {
+            const int *existing = &pi->ON_set[
+                (size_t)slots[slot] * (size_t)ninputs
+            ];
+            if (
+                memcmp(
+                    existing,
+                    point,
+                    (size_t)ninputs * sizeof(*point)
+                ) == 0
+            ) {
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+        if (slots[slot] < 0) slots[slot] = row;
+    }
+
+    bool disjoint = true;
+    for (int row = 0; row < pi->OFF_minterms && disjoint; ++row) {
+        const int *point = &pi->OFF_set[(size_t)row * (size_t)ninputs];
+        size_t slot = (size_t)point_row_hash(point, ninputs) & mask;
+        while (slots[slot] >= 0) {
+            const int *on_point = &pi->ON_set[
+                (size_t)slots[slot] * (size_t)ninputs
+            ];
+            if (
+                memcmp(
+                    on_point,
+                    point,
+                    (size_t)ninputs * sizeof(*point)
+                ) == 0
+            ) {
+                disjoint = false;
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }
+
+    free(slots);
+    return disjoint;
+}
+
 bool certified_model_supported(
     const PIstorage *PInfo,
     int ninputs,
@@ -37,6 +114,7 @@ bool certified_model_supported(
         for (size_t j = 0; j < off_cells; ++j) {
             if (PInfo[o].OFF_set[j] < 1 || PInfo[o].OFF_set[j] > 2) return false;
         }
+        if (!certified_point_sets_disjoint(&PInfo[o], ninputs)) return false;
     }
 
     return true;
@@ -205,6 +283,52 @@ double *build_cover_weights(
     /* A malformed or legacy checkpoint must not leave active columns unweighted. */
     for (int col = start; col < found_pi; ++col) {
         weights[col] = 1.0;
+        if (weight_mode == 2 && pi->shared) {
+            weights[col] += pi->shared[col];
+        }
+    }
+
+    return weights;
+}
+
+double *build_complete_cover_weights(
+    const PIstorage *pi,
+    int found_pi,
+    int ninputs,
+    int implicant_words,
+    const int *word_index,
+    const uint64_t *shifted_mask,
+    int weight_mode
+) {
+    if (
+        !pi ||
+        !pi->implicants_pos ||
+        found_pi <= 0 ||
+        ninputs <= 0 ||
+        implicant_words <= 0 ||
+        !word_index ||
+        !shifted_mask ||
+        weight_mode <= 0
+    ) {
+        return NULL;
+    }
+
+    double *weights = (double *)calloc((size_t)found_pi, sizeof(double));
+    if (!weights) return NULL;
+
+    for (int col = 0; col < found_pi; ++col) {
+        const uint64_t *position = &pi->implicants_pos[
+            (size_t)col * (size_t)implicant_words
+        ];
+        int literal_count = 0;
+        for (int input = 0; input < ninputs; ++input) {
+            if (position[word_index[input]] & shifted_mask[input]) {
+                ++literal_count;
+            }
+        }
+
+        weights[col] = scalbn(1.0, ninputs - literal_count);
+        if (!isfinite(weights[col])) weights[col] = DBL_MAX / 4.0;
         if (weight_mode == 2 && pi->shared) {
             weights[col] += pi->shared[col];
         }
@@ -2129,8 +2253,8 @@ char *prefix_basename(const char *filepath, const char *prefix) {
 void print_info(const char *INFO_PATH, const int info_level) {
     PIstorage *pi_tmp = NULL;
     int ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0;
-    int *stopc_tmp = NULL; int *coverage_tmp = NULL; int *nofvals_tmp = NULL;
-    char *src_saved=NULL; char *dst_saved=NULL; bool certified_mode = false;
+    int *stopc_tmp = NULL; int *nofvals_tmp = NULL;
+    char *src_saved=NULL; char *dst_saved=NULL;
     double elapsed_total = 0.0, elapsed_scp = 0.0; uint64_t last_task = 0ull;
 
     if (load_checkpoint(
@@ -2152,9 +2276,7 @@ void print_info(const char *INFO_PATH, const int info_level) {
             &dst_saved,
             &elapsed_total,
             &elapsed_scp,
-            &last_task,
-            &certified_mode,
-            &coverage_tmp
+            &last_task
     ) != 0) {
         fprintf(stderr, "Error: failed to load checkpoint from %s\n", INFO_PATH);
         return;
@@ -2166,13 +2288,11 @@ void print_info(const char *INFO_PATH, const int info_level) {
     printf("Inputs: %d, Outputs: %d\n", ni, no);
     // printf("Bits per word: %d, value bit width: %d, implicant words: %d\n", bpw, vbw, ipw);
     printf("Level k reached: %d\n", ck);
-    const char *stopping_policy = certified_mode
-        ? "certified"
-        : certified_model_supported(pi_tmp, ni, no)
-            ? "adaptive"
-            : heuristic_pattern_model_supported(pi_tmp, ni, no)
-                ? "heuristic plateau"
-                : "unsupported";
+    const char *stopping_policy = certified_model_supported(pi_tmp, ni, no)
+        ? "adaptive heuristic"
+        : heuristic_pattern_model_supported(pi_tmp, ni, no)
+            ? "heuristic plateau"
+            : "unsupported";
     printf("Stopping policy: %s\n", stopping_policy);
     uint64_t maxt = nchoosek(ni, ck);
 
@@ -2188,18 +2308,15 @@ void print_info(const char *INFO_PATH, const int info_level) {
     if (info_level > 0) {
         for (int o = 0; o < no; ++o) {
             bool stop_flag = pi_tmp[o].stop_search;
-            bool escalated = !certified_mode && stopc_tmp && stopc_tmp[o] > 0 && !stop_flag;
 
             printf(
-                "Output %d: ON=%d OFF=%d foundPI=%d solmin=%d stop=%s kcov=%d%s\n",
+                "Output %d: ON=%d OFF=%d foundPI=%d solmin=%d stop=%s\n",
                 o,
                 pi_tmp[o].ON_minterms,
                 pi_tmp[o].OFF_minterms,
                 pi_tmp[o].foundPI,
                 pi_tmp[o].solmin,
-                stop_flag ? "yes" : "no",
-                coverage_tmp ? coverage_tmp[o] : 0,
-                escalated ? " escalated=yes" : ""
+                stop_flag ? "yes" : "no"
             );
         }
     }
@@ -2208,7 +2325,6 @@ void print_info(const char *INFO_PATH, const int info_level) {
     if (dst_saved) free(dst_saved);
     if (nofvals_tmp) free(nofvals_tmp);
     if (stopc_tmp) free(stopc_tmp);
-    if (coverage_tmp) free(coverage_tmp);
 
     // Use cleanup to free PInfo; provide a dummy buffer holder
     ThreadBuffer **dummy = (ThreadBuffer**)calloc(1, sizeof(ThreadBuffer*));

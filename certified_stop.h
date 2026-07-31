@@ -7,12 +7,9 @@
 
 #include "utils.h"
 
-/* Per-output state for the certified stopping theorem. */
+/* Per-output state for complete-chart certification. */
 typedef struct {
-    int agreement_horizon; /* A_max */
-    int coverage_horizon;  /* k_cov, observed online */
-    int cover_lower_bound; /* pairwise-incompatibility certificate */
-    bool static_ready;     /* A_max and lower bound have been computed */
+    bool complete_prime_chart; /* every prime cube geometry is retained */
 } CertifiedStopState;
 
 /*
@@ -39,58 +36,25 @@ typedef struct {
 typedef struct {
     bool reported;
     bool warning_detected;
-    bool certification_required;
-    bool escalation_suppressed;
     bool pool_warning_avoided;
-    bool boundary_horizon_unproved;
-    int certification_horizon;
-    uint64_t estimated_remaining_tasks;
-    bool task_estimate_capped;
 } BlockingStopState;
 
-/*
- * Default adaptive stopping is an engineering safeguard, not an implicit
- * request for exhaustive search.  It may continue only when the remaining
- * certified horizon contains at most this many position-subset tasks.  The
- * explicit -c mode is intentionally not subject to this limit.
- */
-#define CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT UINT64_C(1000000)
-
-/* Initialize an empty state; coverage can be recorded before static setup. */
+/* Initialize an empty complete-chart state. */
 void certified_stop_state_reset(CertifiedStopState *state);
 
-/* Lazily compute the static certificate data while preserving k_cov. */
-bool certified_stop_state_prepare(
-    CertifiedStopState *state,
-    const PIstorage *pi,
-    int ninputs
+/* Record transactional completion of complete-prime enumeration. */
+void certified_stop_observe_complete_prime_chart(
+    CertifiedStopState *state
 );
-
-/* Reset and compute the complete certificate state for one output. */
-bool certified_stop_state_init(
-    CertifiedStopState *state,
-    const PIstorage *pi,
-    int ninputs
-);
-
-/* Record the first completed level whose retained pool covers every ON row. */
-void certified_stop_observe_coverage(
-    CertifiedStopState *state,
-    int level,
-    bool on_set_covered
-);
-
-/* k^dagger = max(A_max, k_cov). */
-int certified_stop_horizon(const CertifiedStopState *state);
 
 /*
- * A stop is certified either when a feasible cover meets the global lower
- * bound, or when the certified generation horizon is complete and the
- * boundary problem has been solved exactly.
+ * A nontrivial stop is certified only after complete transactional prime
+ * enumeration and an exact solve of that complete chart. The caller must have
+ * established that ON and OFF are nonempty, disjoint, fully specified binary
+ * point sets; certified_model_supported() enforces that contract for the CLI.
  */
 bool certified_stop_should_stop(
     const CertifiedStopState *state,
-    int level,
     int cover_size,
     bool boundary_exact
 );
@@ -117,21 +81,8 @@ void certified_blocking_diagnostic_print(
 /* Initialize, then observe at most the first terminating plateau. */
 void certified_blocking_state_init(BlockingStopState *state);
 
-/*
- * Estimate sum(C(ninputs, k), k = level + 1 .. horizon), capped at limit + 1.
- * The return value says whether the complete remaining horizon fits the limit.
- */
-bool certified_stop_adaptive_work_within_limit(
-    int ninputs,
-    int level,
-    int horizon,
-    uint64_t limit,
-    uint64_t *estimated_tasks
-);
-
 bool certified_blocking_observe_plateau(
     BlockingStopState *state,
-    CertifiedStopState *certificate,
     bool report_diagnostic,
     bool adaptive_mode,
     bool plateau_triggered,
@@ -146,10 +97,9 @@ bool certified_blocking_observe_plateau(
     bool inspect_equal_pool
 );
 
-/* Combine plateau, full-certified, and one-way adaptive stopping semantics. */
+/* Combine heuristic plateau and complete-chart certified stopping semantics. */
 bool certified_stop_policy_decision(
     const CertifiedStopState *certificate,
-    BlockingStopState *blocking,
     bool certified_mode,
     bool plateau_triggered,
     int level,

@@ -206,6 +206,21 @@ double *build_cover_weights(
 );
 
 /*
+ * Complete-prime enumeration is not grouped into contiguous complexity
+ * levels.  Derive each secondary weight from the stored cube geometry instead
+ * of nofpi[] level boundaries.
+ */
+double *build_complete_cover_weights(
+    const PIstorage *pi,
+    int found_pi,
+    int ninputs,
+    int implicant_words,
+    const int *word_index,
+    const uint64_t *shifted_mask,
+    int weight_mode
+);
+
+/*
  * Pooling is a Boolean user choice.  Candidate discovery grows only
  * logarithmically with PI-chart width and is capped tightly because pooling
  * is a secondary multi-output objective, not part of cover feasibility.

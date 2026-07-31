@@ -60,6 +60,35 @@ BoundedMMCSResult bounded_mmcs_generate_output_level_limited(
 );
 
 /*
+ * Enumerate the complete prime set for one fully specified binary output in
+ * one minimal-transversal traversal per canonical ON anchor. Unlike repeated
+ * level generation, this does not restart the search for every support size.
+ *
+ * The bounded form is transactional: a node-limited result appends nothing,
+ * so only BOUNDED_MMCS_COMPLETE may be used as a complete-chart certificate.
+ */
+bool bounded_mmcs_generate_output_all(
+    PIstorage *pi,
+    int ninputs,
+    const int *word_index,
+    const int *bit_index,
+    const uint64_t *shifted_mask,
+    int implicant_words,
+    BoundedMMCSStats *stats
+);
+
+BoundedMMCSResult bounded_mmcs_generate_output_all_limited(
+    PIstorage *pi,
+    int ninputs,
+    const int *word_index,
+    const int *bit_index,
+    const uint64_t *shifted_mask,
+    int implicant_words,
+    uint64_t node_limit,
+    BoundedMMCSStats *stats
+);
+
+/*
  * Geometry is generated independently per output.  Recompute the number of
  * other outputs containing each newly generated cube before level
  * canonicalization performs coverage-equivalence pruning.

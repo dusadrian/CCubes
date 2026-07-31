@@ -13,8 +13,8 @@
 #include <string.h>
 
 #define CK_MAGIC "CCCHKv1"  // 7 chars + \0
-/* v7: the dense int PI chart is gone; coverage lives only in pichart_pos */
-#define CK_VERSION 7u
+/* v8: retired certified-horizon state is no longer serialized */
+#define CK_VERSION 8u
 
 static int write_bytes(FILE *f, const void *buf, size_t len) {
     return fwrite(buf, 1, len, f) == len ? 0 : -1;
@@ -93,9 +93,7 @@ int save_checkpoint(
     const char *dst_path,
     double elapsed_total,
     double elapsed_scp,
-    uint64_t last_task,
-    bool certified_mode,
-    const int *coverage_horizon
+    uint64_t last_task
 ) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
@@ -126,13 +124,9 @@ int save_checkpoint(
     // last_task at current_k
     if (write_u64(f, last_task) < 0) goto FAIL;
 
-    // Stopping-policy state (version 6).
-    if (write_int(f, certified_mode ? 1 : 0) < 0) goto FAIL;
-
     // stop_counter per output
     for (int o = 0; o < noutputs; ++o) {
         if (write_int(f, stop_counter ? stop_counter[o] : 0) < 0) goto FAIL;
-        if (write_int(f, coverage_horizon ? coverage_horizon[o] : 0) < 0) goto FAIL;
     }
 
     // For each output, write the necessary fields
@@ -202,9 +196,7 @@ int load_checkpoint(
     char **dst_path_out,
     double *elapsed_total_out,
     double *elapsed_scp_out,
-    uint64_t *last_task_out,
-    bool *certified_mode_out,
-    int **coverage_horizon_out
+    uint64_t *last_task_out
 ) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -247,35 +239,29 @@ int load_checkpoint(
     }
     double loaded_elapsed_total = 0.0, loaded_elapsed_scp = 0.0;
     uint64_t loaded_last_task = 0ull;
-    int loaded_certified_mode = 0;
     if (read_double(f, &loaded_elapsed_total) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
     if (read_double(f, &loaded_elapsed_scp) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
     if (read_u64(f, &loaded_last_task) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
-    if (read_int(f, &loaded_certified_mode) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
 
     int *stopc = (int*)calloc((size_t)no, sizeof(int));
-    int *coverage = (int*)calloc((size_t)no, sizeof(int));
-    if (!stopc || !coverage) {
+    if (!stopc) {
         free(stopc);
-        free(coverage);
         free(loaded_src);
         free(loaded_dst);
         goto FAIL;
     }
     for (int o = 0; o < (int)no; ++o) {
-        if (read_int(f, &stopc[o]) < 0 || read_int(f, &coverage[o]) < 0) {
+        if (read_int(f, &stopc[o]) < 0) {
             free(stopc);
-            free(coverage);
             free(loaded_src);
             free(loaded_dst);
             goto FAIL;
         }
     }
     *stop_counter_out = stopc;
-    *coverage_horizon_out = coverage;
 
     PIstorage *pi = (PIstorage*)calloc((size_t)no, sizeof(PIstorage));
-    if (!pi) { free(coverage); free(loaded_src); free(loaded_dst); goto FAIL; }
+    if (!pi) { free(loaded_src); free(loaded_dst); goto FAIL; }
 
     // initialize pointers to NULL for safe cleanup()
     for (int o = 0; o < (int)no; ++o) {
@@ -388,7 +374,6 @@ int load_checkpoint(
     if (!nofvals) {
         free(pi);
         free(*stop_counter_out);
-        free(*coverage_horizon_out);
         free(loaded_src);
         free(loaded_dst);
         return -1;
@@ -429,7 +414,6 @@ int load_checkpoint(
     if (elapsed_total_out) *elapsed_total_out = loaded_elapsed_total;
     if (elapsed_scp_out) *elapsed_scp_out = loaded_elapsed_scp;
     if (last_task_out) *last_task_out = loaded_last_task;
-    if (certified_mode_out) *certified_mode_out = loaded_certified_mode != 0;
 
     *PInfo = pi;
     return 0;
@@ -455,7 +439,6 @@ READ_FAIL:
     }
     free(pi);
     free(*stop_counter_out);
-    free(*coverage_horizon_out);
 FAIL:
     fclose(f);
     return -1;

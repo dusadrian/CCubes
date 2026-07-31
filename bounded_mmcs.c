@@ -18,6 +18,7 @@ typedef struct {
     int critical_edge_count;
     int edge_words;
     int target_size;
+    bool exact_size;
     const uint64_t *edges;
 
     unsigned char *selected;
@@ -147,6 +148,11 @@ static bool add_vertex(
         if (state->hit_count[edge] == 0) {
             state->uncovered_count--;
             edge_now_covered(state, edge);
+            /*
+             * Only OFF edges establish primality. Canonical earlier-ON edges
+             * constrain ownership, but they must never give a selected
+             * literal the private edge needed to call the cube prime.
+             */
             if (edge < state->critical_edge_count) {
                 state->critical_count[vertex]++;
             }
@@ -165,8 +171,9 @@ static bool add_vertex(
     }
 
     /*
-     * MMCS minimality pruning: once a selected vertex has no private edge,
-     * adding more vertices cannot make it private again.
+     * MMCS primality pruning: once a selected vertex has no private OFF edge,
+     * adding more vertices cannot make it private again. In particular, a
+     * private canonical ownership edge is intentionally insufficient here.
      */
     for (int i = 0; valid && i < state->selected_count; ++i) {
         if (state->critical_count[state->selected_vertices[i]] == 0) {
@@ -258,7 +265,7 @@ static void mmcs_search(
     state->stats->search_nodes++;
 
     if (state->uncovered_count == 0) {
-        if (state->selected_count == state->target_size) {
+        if (!state->exact_size || state->selected_count == state->target_size) {
             state->stats->completed_transversals++;
             if (!state->emit(
                 state->selected_vertices,
@@ -679,10 +686,11 @@ static bool ensure_pi_capacity(
     return true;
 }
 
-BoundedMMCSResult bounded_mmcs_generate_output_level_limited(
+static BoundedMMCSResult bounded_mmcs_generate_output_target_limited(
     PIstorage *pi,
     int ninputs,
     int level,
+    bool exact_size,
     const int *word_index,
     const int *bit_index,
     const uint64_t *shifted_mask,
@@ -780,6 +788,32 @@ BoundedMMCSResult bounded_mmcs_generate_output_level_limited(
         const int *anchor = &pi->ON_set[
             (size_t)on * (size_t)ninputs
         ];
+
+        /*
+         * Duplicate ON rows describe the same point and do not create a new
+         * canonical owner.  Every cube covering this anchor was already
+         * generated for its first occurrence; its coverage bits include all
+         * duplicate rows.  Skipping here is therefore both complete and
+         * necessary—the corresponding ownership edge would be empty.
+         */
+        bool duplicate_anchor = false;
+        for (int earlier = 0; earlier < on; ++earlier) {
+            const int *earlier_row = &pi->ON_set[
+                (size_t)earlier * (size_t)ninputs
+            ];
+            if (
+                memcmp(
+                    anchor,
+                    earlier_row,
+                    (size_t)ninputs * sizeof(*anchor)
+                ) == 0
+            ) {
+                duplicate_anchor = true;
+                break;
+            }
+        }
+        if (duplicate_anchor) continue;
+
         memset(
             edges,
             0,
@@ -890,9 +924,11 @@ BoundedMMCSResult bounded_mmcs_generate_output_level_limited(
         MMCSState state = {
             .ninputs = ninputs,
             .edge_count = edge_count,
+            /* Minimality is measured against OFF edges, not ownership edges. */
             .critical_edge_count = pi->OFF_minterms,
             .edge_words = edge_words,
             .target_size = level,
+            .exact_size = exact_size,
             .edges = edges,
             .selected = selected,
             .forbidden = forbidden,
@@ -970,6 +1006,31 @@ BoundedMMCSResult bounded_mmcs_generate_output_level_limited(
     return BOUNDED_MMCS_COMPLETE;
 }
 
+BoundedMMCSResult bounded_mmcs_generate_output_level_limited(
+    PIstorage *pi,
+    int ninputs,
+    int level,
+    const int *word_index,
+    const int *bit_index,
+    const uint64_t *shifted_mask,
+    int implicant_words,
+    uint64_t node_limit,
+    BoundedMMCSStats *stats
+) {
+    return bounded_mmcs_generate_output_target_limited(
+        pi,
+        ninputs,
+        level,
+        true,
+        word_index,
+        bit_index,
+        shifted_mask,
+        implicant_words,
+        node_limit,
+        stats
+    );
+}
+
 bool bounded_mmcs_generate_output_level(
     PIstorage *pi,
     int ninputs,
@@ -984,6 +1045,51 @@ bool bounded_mmcs_generate_output_level(
         pi,
         ninputs,
         level,
+        word_index,
+        bit_index,
+        shifted_mask,
+        implicant_words,
+        0,
+        stats
+    ) == BOUNDED_MMCS_COMPLETE;
+}
+
+BoundedMMCSResult bounded_mmcs_generate_output_all_limited(
+    PIstorage *pi,
+    int ninputs,
+    const int *word_index,
+    const int *bit_index,
+    const uint64_t *shifted_mask,
+    int implicant_words,
+    uint64_t node_limit,
+    BoundedMMCSStats *stats
+) {
+    return bounded_mmcs_generate_output_target_limited(
+        pi,
+        ninputs,
+        ninputs,
+        false,
+        word_index,
+        bit_index,
+        shifted_mask,
+        implicant_words,
+        node_limit,
+        stats
+    );
+}
+
+bool bounded_mmcs_generate_output_all(
+    PIstorage *pi,
+    int ninputs,
+    const int *word_index,
+    const int *bit_index,
+    const uint64_t *shifted_mask,
+    int implicant_words,
+    BoundedMMCSStats *stats
+) {
+    return bounded_mmcs_generate_output_all_limited(
+        pi,
+        ninputs,
         word_index,
         bit_index,
         shifted_mask,

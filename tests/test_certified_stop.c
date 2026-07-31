@@ -11,6 +11,18 @@ static FILE *test_stream(void) {
     return stream;
 }
 
+static bool stream_contains(FILE *stream, const char *needle) {
+    assert(stream != NULL);
+    assert(needle != NULL);
+    fflush(stream);
+    rewind(stream);
+
+    char buffer[4096];
+    size_t length = fread(buffer, 1, sizeof(buffer) - 1u, stream);
+    buffer[length] = '\0';
+    return strstr(buffer, needle) != NULL;
+}
+
 static void test_pool_avoids_tied_cover_warning(void) {
     int on_set[12] = {
         0, 0, 0,
@@ -19,7 +31,6 @@ static void test_pool_avoids_tied_cover_warning(void) {
         1, 1, 1
     };
     int off_set[3] = {0, 1, 1};
-    /* bit-packed, one word per column; bit r = row r */
     uint64_t pichart_pos[4] = {
         0x3u, /* c0: rows 0,1 */
         0xCu, /* c1: rows 2,3 */
@@ -51,14 +62,11 @@ static void test_pool_avoids_tied_cover_warning(void) {
     ));
     assert(before.delayed_private_pairs == 1);
 
-    CertifiedStopState certificate;
     BlockingStopState blocking;
-    certified_stop_state_reset(&certificate);
     certified_blocking_state_init(&blocking);
     FILE *stream = test_stream();
     assert(certified_blocking_observe_plateau(
         &blocking,
-        &certificate,
         false,
         true,
         true,
@@ -76,8 +84,6 @@ static void test_pool_avoids_tied_cover_warning(void) {
 
     assert(blocking.warning_detected);
     assert(blocking.pool_warning_avoided);
-    assert(!blocking.certification_required);
-    assert(!blocking.escalation_suppressed);
     assert(selected[0] == 2 && selected[1] == 3);
 }
 
@@ -91,8 +97,8 @@ static void make_delayed_pair(
     memset(pi, 0, sizeof(*pi));
     memset(on_set, 0, (size_t)(2 * ninputs) * sizeof(*on_set));
     memset(off_set, 0, (size_t)ninputs * sizeof(*off_set));
-    on_set[ninputs] = 1; /* The two ON rows disagree only at input 0. */
-    off_set[1] = 1;      /* Excludes the OFF row from their supercube. */
+    on_set[ninputs] = 1;   /* The ON rows disagree only at input 0. */
+    off_set[1] = 1;        /* Their agreement supercube excludes this OFF. */
     pichart_pos[0] = 0x1u; /* c0: row 0 */
     pichart_pos[1] = 0x2u; /* c1: row 1 */
     pi->ON_minterms = 2;
@@ -106,66 +112,7 @@ static void make_delayed_pair(
     pi->solmin = 2;
 }
 
-static void test_unaffordable_adaptive_warning_stops(void) {
-    int on_set[60];
-    int off_set[30];
-    uint64_t pichart_pos[2];
-    int selected[2] = {0, 1};
-    PIstorage pi;
-    make_delayed_pair(&pi, 30, on_set, off_set, pichart_pos);
-
-    uint64_t estimate = 0;
-    assert(!certified_stop_adaptive_work_within_limit(
-        30,
-        4,
-        29,
-        CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT,
-        &estimate
-    ));
-    assert(estimate == CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT + 1u);
-
-    CertifiedStopState certificate;
-    BlockingStopState blocking;
-    certified_stop_state_reset(&certificate);
-    certified_stop_observe_coverage(&certificate, 2, true);
-    certified_blocking_state_init(&blocking);
-    FILE *stream = test_stream();
-    assert(certified_blocking_observe_plateau(
-        &blocking,
-        &certificate,
-        false,
-        true,
-        true,
-        stream,
-        1,
-        &pi,
-        30,
-        4,
-        selected,
-        2,
-        true,
-        false
-    ));
-    fclose(stream);
-
-    assert(blocking.warning_detected);
-    assert(blocking.escalation_suppressed);
-    assert(!blocking.certification_required);
-    assert(blocking.certification_horizon == 29);
-    assert(certified_stop_policy_decision(
-        &certificate, &blocking, false, true, 4, 2, true, NULL, 1
-    ));
-
-    /* Explicit certified mode ignores the adaptive work guard. */
-    assert(!certified_stop_policy_decision(
-        &certificate, &blocking, true, true, 4, 2, true, NULL, 1
-    ));
-    assert(certified_stop_policy_decision(
-        &certificate, &blocking, true, true, 29, 2, true, NULL, 1
-    ));
-}
-
-static void test_affordable_warning_still_certifies(void) {
+static void test_adaptive_warning_stops_without_legacy_escalation(void) {
     int on_set[10];
     int off_set[5];
     uint64_t pichart_pos[2];
@@ -173,21 +120,11 @@ static void test_affordable_warning_still_certifies(void) {
     PIstorage pi;
     make_delayed_pair(&pi, 5, on_set, off_set, pichart_pos);
 
-    uint64_t estimate = 0;
-    assert(certified_stop_adaptive_work_within_limit(
-        5, 3, 4, CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT, &estimate
-    ));
-    assert(estimate == 5);
-
-    CertifiedStopState certificate;
     BlockingStopState blocking;
-    certified_stop_state_reset(&certificate);
-    certified_stop_observe_coverage(&certificate, 2, true);
     certified_blocking_state_init(&blocking);
     FILE *stream = test_stream();
     assert(certified_blocking_observe_plateau(
         &blocking,
-        &certificate,
         false,
         true,
         true,
@@ -201,44 +138,79 @@ static void test_affordable_warning_still_certifies(void) {
         true,
         false
     ));
+    assert(blocking.warning_detected);
+    assert(stream_contains(
+        stream,
+        "action=warn-stop reason=complete-certificate-required"
+    ));
     fclose(stream);
 
-    assert(blocking.certification_required);
-    assert(!blocking.escalation_suppressed);
-    assert(blocking.certification_horizon == 4);
-    assert(!certified_stop_policy_decision(
-        &certificate, &blocking, false, true, 3, 2, true, NULL, 1
-    ));
     assert(certified_stop_policy_decision(
-        &certificate, &blocking, false, true, 4, 2, true, NULL, 1
-    ));
-
-    BlockingStopState unproved = blocking;
-    unproved.certification_required = true;
-    unproved.escalation_suppressed = false;
-    unproved.boundary_horizon_unproved = false;
-    FILE *fallback_stream = test_stream();
-    assert(certified_stop_policy_decision(
-        &certificate,
-        &unproved,
+        NULL,
         false,
         true,
-        4,
+        3,
         2,
-        false,
-        fallback_stream,
+        true,
+        NULL,
         1
     ));
-    fclose(fallback_stream);
-    assert(!unproved.certification_required);
-    assert(unproved.escalation_suppressed);
-    assert(unproved.boundary_horizon_unproved);
+}
+
+static void test_complete_prime_chart_requires_exact_boundary(void) {
+    CertifiedStopState certificate;
+    certified_stop_state_reset(&certificate);
+
+    assert(!certified_stop_should_stop(&certificate, 2, true));
+    certified_stop_observe_complete_prime_chart(&certificate);
+    assert(!certified_stop_should_stop(&certificate, 2, false));
+    assert(certified_stop_should_stop(&certificate, 2, true));
+
+    FILE *stream = test_stream();
+    assert(!certified_stop_policy_decision(
+        &(CertifiedStopState){0},
+        true,
+        false,
+        1,
+        2,
+        true,
+        stream,
+        1
+    ));
+    assert(certified_stop_policy_decision(
+        &certificate,
+        true,
+        false,
+        1,
+        2,
+        true,
+        stream,
+        1
+    ));
+    fclose(stream);
+}
+
+static void test_one_cube_cardinality_floor_is_global(void) {
+    FILE *stream = test_stream();
+    assert(certified_stop_policy_decision(
+        &(CertifiedStopState){0},
+        true,
+        false,
+        1,
+        1,
+        false,
+        stream,
+        1
+    ));
+    assert(stream_contains(stream, "method=cardinality-floor"));
+    fclose(stream);
 }
 
 int main(void) {
     test_pool_avoids_tied_cover_warning();
-    test_unaffordable_adaptive_warning_stops();
-    test_affordable_warning_still_certifies();
-    puts("certified stopping regression: OK");
+    test_adaptive_warning_stops_without_legacy_escalation();
+    test_complete_prime_chart_requires_exact_boundary();
+    test_one_cube_cardinality_floor_is_global();
+    puts("complete-chart certification regression: OK");
     return 0;
 }

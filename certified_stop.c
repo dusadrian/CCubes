@@ -51,124 +51,25 @@ static bool on_pair_compatible(
     return true;
 }
 
-static int compatible_pair_agreement_horizon(
-    const PIstorage *pi,
-    int ninputs
-) {
-    int horizon = 0;
-
-    for (int p = 0; p < pi->ON_minterms; ++p) {
-        for (int q = p + 1; q < pi->ON_minterms; ++q) {
-            int agreements = 0;
-            bool compatible = on_pair_compatible(
-                pi,
-                ninputs,
-                p,
-                q,
-                &agreements
-            );
-            if (compatible && agreements > horizon) horizon = agreements;
-        }
-    }
-
-    return horizon;
-}
-
-/*
- * A pairwise-incompatible ON-row set lower-bounds every implicant cover.  A
- * greedy maximal set is sufficient; maximum cardinality is not required.
- */
-static bool greedy_incompatibility_lower_bound(
-    const PIstorage *pi,
-    int ninputs,
-    int *lower_bound
-) {
-    if (!lower_bound || pi->ON_minterms <= 0) return false;
-
-    int *selected = calloc((size_t)pi->ON_minterms, sizeof(int));
-    if (!selected) return false;
-
-    int selected_count = 0;
-    for (int p = 0; p < pi->ON_minterms; ++p) {
-        bool incompatible_with_all = true;
-        for (int j = 0; j < selected_count; ++j) {
-            if (on_pair_compatible(pi, ninputs, p, selected[j], NULL)) {
-                incompatible_with_all = false;
-                break;
-            }
-        }
-        if (incompatible_with_all) selected[selected_count++] = p;
-    }
-
-    free(selected);
-    *lower_bound = selected_count;
-    return true;
-}
-
 void certified_stop_state_reset(CertifiedStopState *state) {
     if (state) *state = (CertifiedStopState){0};
 }
 
-bool certified_stop_state_prepare(
-    CertifiedStopState *state,
-    const PIstorage *pi,
-    int ninputs
+void certified_stop_observe_complete_prime_chart(
+    CertifiedStopState *state
 ) {
-    if (!state || !pi || ninputs <= 0) return false;
-
-    state->agreement_horizon = compatible_pair_agreement_horizon(pi, ninputs);
-    if (!greedy_incompatibility_lower_bound(
-        pi,
-        ninputs,
-        &state->cover_lower_bound
-    )) {
-        return false;
-    }
-    state->static_ready = true;
-    return true;
-}
-
-bool certified_stop_state_init(
-    CertifiedStopState *state,
-    const PIstorage *pi,
-    int ninputs
-) {
-    certified_stop_state_reset(state);
-    return certified_stop_state_prepare(state, pi, ninputs);
-}
-
-void certified_stop_observe_coverage(
-    CertifiedStopState *state,
-    int level,
-    bool on_set_covered
-) {
-    if (state && on_set_covered && state->coverage_horizon == 0) {
-        state->coverage_horizon = level;
-    }
-}
-
-int certified_stop_horizon(const CertifiedStopState *state) {
-    if (!state) return 0;
-    return state->agreement_horizon > state->coverage_horizon
-        ? state->agreement_horizon
-        : state->coverage_horizon;
+    if (state) state->complete_prime_chart = true;
 }
 
 bool certified_stop_should_stop(
     const CertifiedStopState *state,
-    int level,
     int cover_size,
     bool boundary_exact
 ) {
-    if (!state || !state->static_ready || cover_size <= 0) return false;
-
-    if (cover_size == state->cover_lower_bound) return true;
-
-    return (
-        boundary_exact &&
-        state->coverage_horizon > 0 &&
-        level >= certified_stop_horizon(state)
-    );
+    return state &&
+        state->complete_prime_chart &&
+        cover_size > 0 &&
+        boundary_exact;
 }
 
 static bool pair_joint_in_retained_chart(
@@ -358,77 +259,6 @@ void certified_blocking_state_init(BlockingStopState *state) {
     if (state) *state = (BlockingStopState){0};
 }
 
-static uint64_t capped_binomial(int n, int k, uint64_t cap) {
-    if (n < 0 || k < 0 || k > n) return 0;
-    if (k == 0 || k == n) return 1;
-    if (k > n - k) k = n - k;
-
-    uint64_t value = 1;
-    for (int i = 1; i <= k; ++i) {
-        const uint64_t numerator = (uint64_t)(n - k + i);
-#if defined(__SIZEOF_INT128__)
-        __uint128_t next = (__uint128_t)value * numerator / (uint64_t)i;
-        if (next > cap) return cap;
-        value = (uint64_t)next;
-#else
-        /* Exact divisibility lets us reduce before multiplying. */
-        uint64_t divisor = (uint64_t)i;
-        uint64_t a = value;
-        uint64_t b = numerator;
-        uint64_t x = a;
-        uint64_t y = divisor;
-        while (y != 0) {
-            uint64_t remainder = x % y;
-            x = y;
-            y = remainder;
-        }
-        a /= x;
-        divisor /= x;
-        x = b;
-        y = divisor;
-        while (y != 0) {
-            uint64_t remainder = x % y;
-            x = y;
-            y = remainder;
-        }
-        b /= x;
-        divisor /= x;
-        if (divisor != 1 || (a != 0 && b > cap / a)) return cap;
-        value = a * b;
-        if (value > cap) return cap;
-#endif
-    }
-    return value;
-}
-
-bool certified_stop_adaptive_work_within_limit(
-    int ninputs,
-    int level,
-    int horizon,
-    uint64_t limit,
-    uint64_t *estimated_tasks
-) {
-    if (!estimated_tasks || ninputs < 0 || level < 0 || horizon < 0) {
-        return false;
-    }
-
-    const uint64_t cap = limit == UINT64_MAX ? UINT64_MAX : limit + 1u;
-    uint64_t total = 0;
-    int final_level = horizon < ninputs ? horizon : ninputs;
-    for (int k = level + 1; k <= final_level; ++k) {
-        uint64_t remaining_cap = cap - total;
-        uint64_t tasks = capped_binomial(ninputs, k, remaining_cap);
-        if (tasks >= remaining_cap) {
-            total = cap;
-            break;
-        }
-        total += tasks;
-    }
-
-    *estimated_tasks = total;
-    return total <= limit;
-}
-
 static bool same_cover_set(const int *left, const int *right, int terms) {
     if (!left || !right || terms <= 0) return false;
     for (int i = 0; i < terms; ++i) {
@@ -535,7 +365,6 @@ static bool prefer_warning_free_pool_cover(
 
 bool certified_blocking_observe_plateau(
     BlockingStopState *state,
-    CertifiedStopState *certificate,
     bool report_diagnostic,
     bool adaptive_mode,
     bool plateau_triggered,
@@ -631,39 +460,16 @@ bool certified_blocking_observe_plateau(
     }
     if (adaptive_mode) {
         const bool unresolved_warning = diagnostic.delayed_private_pairs > 0;
-        if (unresolved_warning) {
-            if (!certified_stop_state_prepare(certificate, pi, ninputs)) {
-                return false;
-            }
-            state->certification_horizon = certified_stop_horizon(certificate);
-            state->certification_required = certified_stop_adaptive_work_within_limit(
-                ninputs,
-                level,
-                state->certification_horizon,
-                CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT,
-                &state->estimated_remaining_tasks
-            );
-            state->task_estimate_capped =
-                !state->certification_required &&
-                state->estimated_remaining_tasks >
-                    CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT;
-            state->escalation_suppressed = !state->certification_required;
-        }
         if (report_diagnostic || unresolved_warning) {
             fprintf(
                 output,
-                "CCUBES_ADAPTIVE output=%d level=%d action=%s horizon=%d "
-                "remaining_position_tasks=%" PRIu64 " estimate_capped=%d "
-                "limit=%" PRIu64 "\n",
+                "CCUBES_ADAPTIVE output=%d level=%d action=%s%s\n",
                 output_index,
                 level,
-                state->certification_required
-                    ? "certify"
-                    : unresolved_warning ? "warn-stop" : "plateau",
-                state->certification_horizon,
-                state->estimated_remaining_tasks,
-                state->task_estimate_capped ? 1 : 0,
-                (uint64_t)CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT
+                unresolved_warning ? "warn-stop" : "plateau",
+                unresolved_warning
+                    ? " reason=complete-certificate-required"
+                    : ""
             );
         }
     }
@@ -673,7 +479,6 @@ bool certified_blocking_observe_plateau(
 
 bool certified_stop_policy_decision(
     const CertifiedStopState *certificate,
-    BlockingStopState *blocking,
     bool certified_mode,
     bool plateau_triggered,
     int level,
@@ -682,54 +487,45 @@ bool certified_stop_policy_decision(
     FILE *stream,
     int output_index
 ) {
-    const bool escalated = blocking && blocking->certification_required;
+    FILE *output = stream ? stream : stderr;
 
     /* Every supported output has a nonempty ON set, so one term is optimal. */
-    if (cover_size == 1) return true;
+    if (cover_size == 1) {
+        if (certified_mode) {
+            fprintf(
+                output,
+                "CCUBES_CERTIFICATE output=%d scope=global "
+                "method=cardinality-floor status=certified level=%d "
+                "cover=%d\n",
+                output_index,
+                level,
+                cover_size
+            );
+        }
+        return true;
+    }
 
     if (certified_mode) {
-        return certified_stop_should_stop(
+        bool certified = certified_stop_should_stop(
             certificate,
-            level,
             cover_size,
             boundary_exact
         );
-    }
-
-    if (escalated) {
-        if (certified_stop_should_stop(
-            certificate,
+        fprintf(
+            output,
+            "CCUBES_CERTIFICATE output=%d scope=global "
+            "method=complete-prime-chart status=%s level=%d "
+            "cover=%d boundary_exact=%d\n",
+            output_index,
+            certified ? "certified" : certificate &&
+                certificate->complete_prime_chart
+                    ? "boundary-unproved"
+                    : "enumeration-incomplete",
             level,
             cover_size,
-            boundary_exact
-        )) {
-            return true;
-        }
-
-        /*
-         * Adaptive mode never searches beyond the horizon whose work it
-         * budgeted.  If the hybrid boundary has not closed its gap there,
-         * preserve the best cover and stop with an explicit warning.  -c is
-         * handled above and intentionally remains unbounded by this guard.
-         */
-        if (blocking->certification_horizon > 0 &&
-            level >= blocking->certification_horizon) {
-            blocking->certification_required = false;
-            blocking->escalation_suppressed = true;
-            blocking->boundary_horizon_unproved = true;
-            fprintf(
-                stream ? stream : stderr,
-                "CCUBES_ADAPTIVE output=%d level=%d action=warn-stop "
-                "horizon=%d remaining_position_tasks=0 estimate_capped=0 "
-                "limit=%" PRIu64 " reason=boundary-not-proved\n",
-                output_index,
-                level,
-                blocking->certification_horizon,
-                (uint64_t)CCUBES_ADAPTIVE_CERTIFICATION_TASK_LIMIT
-            );
-            return true;
-        }
-        return false;
+            boundary_exact ? 1 : 0
+        );
+        return certified;
     }
 
     return plateau_triggered;

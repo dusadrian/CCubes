@@ -162,10 +162,94 @@ static void verify_pooling_keeps_the_useful_geometry(void) {
     assert(stats.sharing_savings == 1);
 }
 
+static void verify_certified_model_rejects_on_off_conflicts(void) {
+    int on_set[6] = {
+        1, 1,
+        1, 1, /* a duplicate ON row is harmless */
+        2, 2
+    };
+    int off_set[4] = {
+        1, 2,
+        2, 1
+    };
+    PIstorage pi;
+    memset(&pi, 0, sizeof(pi));
+    pi.ON_minterms = 3;
+    pi.OFF_minterms = 2;
+    pi.ON_set = on_set;
+    pi.OFF_set = off_set;
+
+    assert(certified_model_supported(&pi, 2, 1));
+
+    off_set[2] = 1;
+    off_set[3] = 1;
+    assert(!certified_model_supported(&pi, 2, 1));
+
+    off_set[2] = 2;
+    off_set[3] = 1;
+    on_set[0] = 0;
+    assert(!certified_model_supported(&pi, 2, 1));
+}
+
+static void verify_complete_chart_weights_follow_cube_geometry(void) {
+    PIstorage pi;
+    memset(&pi, 0, sizeof(pi));
+
+    /*
+     * Four two-bit input lanes:
+     *   cube 0 fixes inputs 0 and 2 -> weight 2^(4-2) = 4
+     *   cube 1 fixes input 1       -> weight 2^(4-1) = 8
+     */
+    uint64_t positions[2] = {
+        (UINT64_C(3) << 0) | (UINT64_C(3) << 4),
+        (UINT64_C(3) << 2)
+    };
+    int shared[2] = {2, 3};
+    int word_index[4] = {0, 0, 0, 0};
+    uint64_t shifted_mask[4] = {
+        UINT64_C(3) << 0,
+        UINT64_C(3) << 2,
+        UINT64_C(3) << 4,
+        UINT64_C(3) << 6
+    };
+    pi.implicants_pos = positions;
+    pi.shared = shared;
+
+    double *weights = build_complete_cover_weights(
+        &pi,
+        2,
+        4,
+        1,
+        word_index,
+        shifted_mask,
+        1
+    );
+    assert(weights);
+    assert(weights[0] == 4.0);
+    assert(weights[1] == 8.0);
+    free(weights);
+
+    weights = build_complete_cover_weights(
+        &pi,
+        2,
+        4,
+        1,
+        word_index,
+        shifted_mask,
+        2
+    );
+    assert(weights);
+    assert(weights[0] == 6.0);
+    assert(weights[1] == 11.0);
+    free(weights);
+}
+
 int main(void) {
     verify_geometry_aware_deferred_pruning();
     verify_d_controls_only_canonical_order();
     verify_pooling_keeps_the_useful_geometry();
+    verify_certified_model_rejects_on_off_conflicts();
+    verify_complete_chart_weights_follow_cube_geometry();
     puts("PI level finalization regression: OK");
     return 0;
 }
