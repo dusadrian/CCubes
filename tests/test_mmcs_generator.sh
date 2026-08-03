@@ -20,10 +20,12 @@ grep -q 'CCUBES_PI_GENERATOR level=6 selected=mmcs' \
 grep -q 'deterministic PI order: no' \
     "${tmp_prefix}_forced.log"
 
-"$bin" -t1 -d -e0 -dbg1 --pi-generator=projection \
+CCUBES_TEST_PI_GENERATOR=projection \
+"$bin" -t1 -d -e0 -dbg1 \
     "$small_fixture" "${tmp_prefix}_projection.pla" \
     >"${tmp_prefix}_projection.log" 2>&1
-"$bin" -t1 -d -e0 --pi-generator=mmcs \
+CCUBES_TEST_PI_GENERATOR=mmcs \
+"$bin" -t1 -d -e0 \
     "$small_fixture" "${tmp_prefix}_mmcs.pla" \
     >"${tmp_prefix}_mmcs.log" 2>&1
 
@@ -31,16 +33,16 @@ grep -q 'deterministic PI order: yes' \
     "${tmp_prefix}_projection.log"
 cmp "${tmp_prefix}_projection.pla" "${tmp_prefix}_mmcs.pla"
 
-if "$bin" -t1 --pi-generator=complete-mmcs \
+if CCUBES_TEST_PI_GENERATOR=complete-mmcs "$bin" -t1 \
     "$complete_fixture" "${tmp_prefix}_complete_without_c.pla" \
     >"${tmp_prefix}_complete_without_c.log" 2>&1; then
     echo "complete-mmcs unexpectedly ran without -c" >&2
     exit 1
 fi
-grep -q 'complete-mmcs is a global certification mode and requires -c' \
+grep -q 'complete MMCS is a global certification mode and requires -c' \
     "${tmp_prefix}_complete_without_c.log"
 
-if "$bin" -t1 -c --pi-generator=projection \
+if CCUBES_TEST_PI_GENERATOR=projection "$bin" -t1 -c \
     "$complete_fixture" "${tmp_prefix}_legacy_certificate.pla" \
     >"${tmp_prefix}_legacy_certificate.log" 2>&1; then
     echo "-c unexpectedly accepted the retired horizon generator" >&2
@@ -75,7 +77,8 @@ grep -q '^111 1$' "${tmp_prefix}_complete.pla"
 "$bin" -t4 -d -e0 -dbg1 \
     "$dense_fixture" "${tmp_prefix}_auto_dense.pla" \
     >"${tmp_prefix}_auto_dense.log" 2>&1
-"$bin" -t4 -d -e0 --pi-generator=projection \
+CCUBES_TEST_PI_GENERATOR=projection \
+"$bin" -t4 -d -e0 \
     "$dense_fixture" "${tmp_prefix}_projection_dense.pla" \
     >"${tmp_prefix}_projection_dense.log" 2>&1
 

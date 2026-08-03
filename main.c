@@ -387,9 +387,6 @@ void help() {
     printf("                         enumeration plus an exact complete-chart solve\n");
     printf("                         (fully specified binary point rows only)\n");
     printf("  -p                   : enable automatic equal-cardinality cover pooling\n");
-    printf("  --pi-generator=<name>: PI generator: auto (default), projection, mmcs,\n");
-    printf("                         or complete-mmcs (the generator selected by -c)\n");
-    printf("                         (non-auto modes are expert reproducibility overrides)\n");
     printf("  -l<sec>[=<file>]     : time limit to save a checkpoint in the <file>\n");
     printf("  -r=<file>            : resume from checkpoint file\n");
     printf("  -i<level>=<file>     : inspect checkpoint (print progress and metadata)\n");
@@ -434,7 +431,6 @@ int main(int argc, char *argv[]) {
      */
     bool DETERMINISTIC_PI_ORDER = env_flag_enabled("CCUBES_DETERMINISTIC");
     PIGeneratorMode PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
-    bool COMPLETE_MMCS_DEFAULTED = false;
     bool CERTIFIED_MODE = false;
     bool REPORT_BLOCKING_DIAGNOSTIC = false;
     char *SRC_FILE = NULL;
@@ -544,26 +540,6 @@ int main(int argc, char *argv[]) {
             );
             help();
             return 1;
-        } else if (strncmp(argv[i], "--pi-generator=", 15) == 0) {
-            const char *generator = argv[i] + 15;
-            if (strcmp(generator, "auto") == 0) {
-                PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
-            } else if (strcmp(generator, "projection") == 0) {
-                PI_GENERATOR_MODE = PI_GENERATOR_PROJECTION;
-            } else if (strcmp(generator, "mmcs") == 0) {
-                PI_GENERATOR_MODE = PI_GENERATOR_MMCS;
-            } else if (strcmp(generator, "complete-mmcs") == 0) {
-                PI_GENERATOR_MODE = PI_GENERATOR_COMPLETE_MMCS;
-            } else {
-                fprintf(
-                    stderr,
-                    "Invalid PI generator: %s (must be auto, projection, "
-                    "mmcs, or complete-mmcs)\n",
-                    generator
-                );
-                help();
-                return 1;
-            }
         } else if (strncmp(argv[i], "-l", 2) == 0) {
             char *opt = argv[i] + 2;  // string after "-l"
             char *eq  = strchr(opt, '=');
@@ -622,6 +598,23 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Internal differential-test control; intentionally not a command option. */
+    const char *test_pi_generator = getenv("CCUBES_TEST_PI_GENERATOR");
+    if (test_pi_generator && *test_pi_generator) {
+        if (strcmp(test_pi_generator, "auto") == 0) {
+            PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
+        } else if (strcmp(test_pi_generator, "projection") == 0) {
+            PI_GENERATOR_MODE = PI_GENERATOR_PROJECTION;
+        } else if (strcmp(test_pi_generator, "mmcs") == 0) {
+            PI_GENERATOR_MODE = PI_GENERATOR_MMCS;
+        } else if (strcmp(test_pi_generator, "complete-mmcs") == 0) {
+            PI_GENERATOR_MODE = PI_GENERATOR_COMPLETE_MMCS;
+        } else {
+            fprintf(stderr, "Error: invalid internal PI generator override.\n");
+            return 1;
+        }
+    }
+
     /*
      * Certified mode has one production proof: complete transactional prime
      * enumeration followed by an exact solve of the complete chart.  The
@@ -631,7 +624,6 @@ int main(int argc, char *argv[]) {
     if (CERTIFIED_MODE) {
         if (PI_GENERATOR_MODE == PI_GENERATOR_AUTO) {
             PI_GENERATOR_MODE = PI_GENERATOR_COMPLETE_MMCS;
-            COMPLETE_MMCS_DEFAULTED = true;
         } else if (PI_GENERATOR_MODE != PI_GENERATOR_COMPLETE_MMCS) {
             fprintf(
                 stderr,
@@ -703,8 +695,7 @@ int main(int argc, char *argv[]) {
     if (PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS && !CERTIFIED_MODE) {
         fprintf(
             stderr,
-            "Error: --pi-generator=complete-mmcs is a global certification "
-            "mode and requires -c.\n"
+            "Error: complete MMCS is a global certification mode and requires -c.\n"
         );
         return 1;
     }
@@ -978,9 +969,7 @@ int main(int argc, char *argv[]) {
     } else if (PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS) {
         fprintf(
             stderr,
-            COMPLETE_MMCS_DEFAULTED
-                ? "Notice: -c uses complete-prime MMCS certification.\n"
-                : "Notice: using complete-prime MMCS certification.\n"
+            "Notice: -c uses complete-prime MMCS certification.\n"
         );
     } else if (PI_GENERATOR_MODE == PI_GENERATOR_PROJECTION) {
         fprintf(stderr, "Notice: forcing projection PI generation.\n");

@@ -10,28 +10,9 @@ The default `-s0 -e0` profile is deliberately the fastest hybrid heuristic. Befo
 
 For fully specified binary point rows, `-e1`, `-e2`, and the Gurobi boundary profile use the same heuristic plateau policy unless `-c` is requested. A one-term cover stops immediately because no nonempty function can use fewer terms. Before any hybrid effort profile accepts its first unchanged boundary value, CCubes performs one bounded plateau probe. It pairs private witnesses from different incumbent terms, maintains exact OFF-row blocker counts while expanding their agreement cubes, and prefers safe literal deletions that admit the most additional ON rows. Opposite deterministic tie orders provide candidate diversity. The probe adds only non-dominated prime candidates. The `-e0` and `-e1` budget examines at most 128 pairs and appends at most 32 candidates; `-e2` raises those caps to 1024 and 128. Candidates are retained only when re-solving the chart reduces cover cardinality; otherwise CCubes rolls them back. Probe exhaustion is not a certificate.
 
-If the probe does not improve the cover, CCubes applies the existing adaptive diagnostic. Because this warning is cover-dependent, CCubes first checks the retained equal-cardinality solution pool and substitutes a warning-free tied cover when one exists. An unresolved warning emits `action=warn-stop` and preserves the best heuristic cover; it no longer triggers the discarded support-horizon march. Run with `-c` when a global certificate is required. A negative pair warning is not a proof of global optimality because a delayed group of three or more rows can escape the pair screen.
-
-For applications that require a certificate from the outset, `-c` enumerates the
-complete prime set directly as minimal transversals, without restarting once per
-support level, and then solves the complete PI chart. Completion is transactional: a
-partial enumeration cannot certify a result. A successful run prints
-`CCUBES_CERTIFICATE ... scope=global method=complete-prime-chart
-status=certified`; if the bundled boundary solver does not prove the chart optimum, the
-run fails rather than returning an uncertified cover. This expert mode can still
-require exponential time and memory and currently does not support checkpoint/resume
-or time-limit checkpoints. Gurobi supplies an exact chart boundary directly; the
-bundled hybrid solver certifies it when its lower and upper bounds meet.
-Canonical earlier-ON difference edges assign each prime to the first ON row it covers,
-but do not define primality: the MMCS private-edge test counts only OFF edges. Thus a
-literal needed solely to avoid an earlier ON row cannot make a non-prime cube eligible.
-Certified runs separately report per-output enumeration time and chart-solve time using
-`CCUBES_CERTIFICATION_ENUMERATION`, `CCUBES_CERTIFICATION_CHART`, and
-`CCUBES_CERTIFICATION_TIMING` records.
+If the probe does not improve the cover, CCubes applies the existing adaptive diagnostic. Because this warning is cover-dependent, CCubes first checks the retained equal-cardinality solution pool and substitutes a warning-free tied cover when one exists. An unresolved warning preserves the best heuristic cover; it no longer triggers the discarded support-horizon march. Run with `-c` when a global certificate is required.
 
 The small `examples/certified_F2.pla` instance demonstrates the plateau probe under every hybrid effort profile. Its ordinary boundary cover has two terms at levels one and two. At the level-two plateau, the probe constructs the delayed prime and obtains the one-term cover without enumerating level three, including under the default `-e0` profile.
-
-The optional `-g` switch prints the machine-readable `CCUBES_BLOCKING` observation without changing the selected stopping policy. Adaptive profiles also print the resulting `CCUBES_ADAPTIVE` action, and pool inspection is reported as `CCUBES_ADAPTIVE_POOL`. Under `-e0`, the observation remains diagnostic only. Unresolved adaptive warnings are always printed, even without `-g`, so `action=warn-stop` cannot be silent. The `model_union_bound` field is an ex-ante all-ON-pair bound under an auxiliary independent, uniform, with-replacement OFF-row model; it is not conditioned on the observed cover and is not a finite-sample certificate. It is reported as `NA` when more than one million ON pairs would make this explanatory statistic disproportionately expensive.
 
 Input-dash PLA pattern rows are accepted through a separate, explicitly announced heuristic path, provided every output has nonempty ON and OFF sets. That path uses the first plateau and does not claim the point-row blocking diagnostic or a global certificate; `-c` is rejected.
 
@@ -53,7 +34,7 @@ Parallel search supports both OpenMP and pthreads. The build automatically uses 
 
 PI coverage patterns from completed complexity levels are kept in a per-output hash index. Worker threads can therefore reject duplicate coverage in constant expected time without scanning the global PI chart under a lock. New PIs use only a short synchronized append, and coverage buckets are rebuilt once after the parallel level completes. This keeps the expensive generation phase parallel even when the PI chart contains tens of thousands of columns.
 
-For fully specified binary point rows in heuristic mode, CCubes automatically chooses between projection and an experimental bounded MMCS-style generator at each level. Small support spaces remain on projection. Once a level exceeds 8,192 projection tasks, CCubes gives MMCS a transactional trial of at most 8,192 search nodes per output, using at most four concurrent trial workers. A completed trial is retained; if any output reaches the budget, every trial append is rolled back to the common level boundary and projection completes the entire level. Thus partial MMCS work can never contaminate a boundary evaluation. Checkpoint/resume, time-limit checkpoints, and input-dash pattern rows remain on projection. The `--pi-generator=projection` and `--pi-generator=mmcs` options are heuristic expert overrides for reproducibility. Certified mode always uses complete MMCS; it rejects either bounded-level override.
+For fully specified binary point rows in heuristic mode, CCubes automatically chooses between projection and an experimental bounded MMCS-style generator at each level. Small support spaces remain on projection. Once a level exceeds 8,192 projection tasks, CCubes gives MMCS a transactional trial of at most 8,192 search nodes per output, using at most four concurrent trial workers. A completed trial is retained; if any output reaches the budget, every trial append is rolled back to the common level boundary and projection completes the entire level. Thus partial MMCS work can never contaminate a boundary evaluation. Checkpoint/resume, time-limit checkpoints, and input-dash pattern rows remain on projection. Certified mode always uses complete MMCS.
 
 The MMCS-style backend forms the OFF-row difference hypergraph for each ON row and enumerates exact-cardinality minimal transversals using an independently implemented uncovered-edge and critical-edge search. Every cube is assigned to the earliest ON row it covers, preventing repeated enumeration from later ON rows; complete ON coverage and cross-output sharing are rebuilt before the ordinary level-boundary evaluation. The included `examples/mmcs_forced_100x1.pla` fixture demonstrates the intended sparse-transversal regime: its sole PI has six literals, so the projection backend must pass through all 75,287,520 five-input supports before level six, whereas the bounded search reaches the forced level-six transversal directly. Difficult dense transversal families can still require exponential work, which is why automatic selection retains the projection fallback.
 
@@ -95,8 +76,6 @@ Options:
   -c                  : certify a global minimum by complete-prime enumeration
                           plus an exact complete-chart solve (point rows only)
   -p                  : enable automatic equal-cardinality cover pooling
-  --pi-generator=<name> : auto (default), projection, mmcs, or complete-mmcs
-                          complete-mmcs is selected automatically by -c
   -l<sec>[=<file>]    : time limit to save a checkpoint in the <file>
   -r=<file>           : resume from checkpoint file
   -i<level>=<file>    : inspect checkpoint (print progress and metadata)
