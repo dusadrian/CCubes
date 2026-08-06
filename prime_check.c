@@ -7,9 +7,10 @@
  * makes it intersect at least one OFF pattern. A zero in an OFF row is an
  * input dash and therefore matches either binary literal.
  *
- * DC-bearing outputs already own wildcard-compatible OFF-row masks for PI
- * validation. Reuse them here to test each deletion with word intersections.
- * Fully specified outputs retain the scalar loop and its cheap early exits.
+ * Outputs with a compact compatibility-mask representation reuse it here to
+ * test each deletion with word intersections. This includes wildcard rows and
+ * dense fully specified OFF sets. High-cardinality exact data may retain the
+ * scalar loop when masks would enlarge the working set.
  */
 static bool projected_cube_is_prime_with_masks(
     const PIstorage *pi,

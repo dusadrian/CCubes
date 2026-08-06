@@ -101,10 +101,6 @@ bool certified_model_supported(
     if (!PInfo || ninputs <= 0 || noutputs <= 0) return false;
 
     for (int o = 0; o < noutputs; ++o) {
-        if (PInfo[o].ON_minterms <= 0 || PInfo[o].OFF_minterms <= 0) {
-            return false;
-        }
-
         size_t on_cells = (size_t)PInfo[o].ON_minterms * (size_t)ninputs;
         size_t off_cells = (size_t)PInfo[o].OFF_minterms * (size_t)ninputs;
 
@@ -128,10 +124,6 @@ bool heuristic_pattern_model_supported(
     if (!PInfo || ninputs <= 0 || noutputs <= 0) return false;
 
     for (int o = 0; o < noutputs; ++o) {
-        if (PInfo[o].ON_minterms <= 0 || PInfo[o].OFF_minterms <= 0) {
-            return false;
-        }
-
         size_t on_cells = (size_t)PInfo[o].ON_minterms * (size_t)ninputs;
         size_t off_cells = (size_t)PInfo[o].OFF_minterms * (size_t)ninputs;
 
@@ -1560,9 +1552,7 @@ static void clear_shared_projection_rows(
         PInfo[output].projection_rows = NULL;
         PInfo[output].projection_row_count = 0;
         free(PInfo[output].ON_projection_ids);
-        free(PInfo[output].OFF_projection_ids);
         PInfo[output].ON_projection_ids = NULL;
-        PInfo[output].OFF_projection_ids = NULL;
     }
 }
 
@@ -1576,9 +1566,13 @@ bool prepare_shared_projection_rows(
 
     size_t memberships = 0u;
     for (int output = 0; output < noutputs; ++output) {
-        size_t rows =
-            (size_t)PInfo[output].ON_minterms +
-            (size_t)PInfo[output].OFF_minterms;
+        size_t rows = (size_t)PInfo[output].ON_minterms;
+        /*
+         * OFF rows are deliberately absent from this eager layout. Masked
+         * outputs validate them by bitset intersection; scalar outputs must
+         * project them lazily so their mixed-radix discovery bound can stop
+         * the scan without first paying to project the whole OFF set.
+         */
         if (rows > SIZE_MAX - memberships) return false;
         memberships += rows;
     }
@@ -1613,16 +1607,9 @@ bool prepare_shared_projection_rows(
                 (size_t)PInfo[output].ON_minterms * sizeof(int)
             );
         }
-        if (PInfo[output].OFF_minterms > 0) {
-            PInfo[output].OFF_projection_ids = (int *)malloc(
-                (size_t)PInfo[output].OFF_minterms * sizeof(int)
-            );
-        }
         if (
             (PInfo[output].ON_minterms > 0 &&
-                !PInfo[output].ON_projection_ids) ||
-            (PInfo[output].OFF_minterms > 0 &&
-                !PInfo[output].OFF_projection_ids)
+                !PInfo[output].ON_projection_ids)
         ) {
             free(slots);
             free(rows);
@@ -1634,56 +1621,48 @@ bool prepare_shared_projection_rows(
 
     int row_count = 0;
     for (int output = 0; output < noutputs; ++output) {
-        for (int partition = 0; partition < 2; ++partition) {
-            int count = partition == 0
-                ? PInfo[output].ON_minterms
-                : PInfo[output].OFF_minterms;
-            const int *source = partition == 0
-                ? PInfo[output].ON_set
-                : PInfo[output].OFF_set;
-            int *ids = partition == 0
-                ? PInfo[output].ON_projection_ids
-                : PInfo[output].OFF_projection_ids;
+        int count = PInfo[output].ON_minterms;
+        const int *source = PInfo[output].ON_set;
+        int *ids = PInfo[output].ON_projection_ids;
 
-            for (int source_row = 0; source_row < count; ++source_row) {
-                const int *row = &source[
-                    (size_t)source_row * (size_t)ninputs
-                ];
-                size_t mask = table_size - 1u;
-                size_t slot =
-                    (size_t)(projection_row_hash(row, ninputs) & mask);
+        for (int source_row = 0; source_row < count; ++source_row) {
+            const int *row = &source[
+                (size_t)source_row * (size_t)ninputs
+            ];
+            size_t mask = table_size - 1u;
+            size_t slot =
+                (size_t)(projection_row_hash(row, ninputs) & mask);
 
-                while (slots[slot] >= 0) {
-                    int candidate = slots[slot];
-                    if (
-                        memcmp(
-                            &rows[(size_t)candidate * (size_t)ninputs],
-                            row,
-                            (size_t)ninputs * sizeof(int)
-                        ) == 0
-                    ) {
-                        break;
-                    }
-                    slot = (slot + 1u) & mask;
-                }
-
-                if (slots[slot] < 0) {
-                    if ((size_t)row_count >= memberships) {
-                        free(slots);
-                        free(rows);
-                        PInfo[0].projection_rows = NULL;
-                        clear_shared_projection_rows(PInfo, noutputs);
-                        return false;
-                    }
-                    memcpy(
-                        &rows[(size_t)row_count * (size_t)ninputs],
+            while (slots[slot] >= 0) {
+                int candidate = slots[slot];
+                if (
+                    memcmp(
+                        &rows[(size_t)candidate * (size_t)ninputs],
                         row,
                         (size_t)ninputs * sizeof(int)
-                    );
-                    slots[slot] = row_count++;
+                    ) == 0
+                ) {
+                    break;
                 }
-                ids[source_row] = slots[slot];
+                slot = (slot + 1u) & mask;
             }
+
+            if (slots[slot] < 0) {
+                if ((size_t)row_count >= memberships) {
+                    free(slots);
+                    free(rows);
+                    PInfo[0].projection_rows = NULL;
+                    clear_shared_projection_rows(PInfo, noutputs);
+                    return false;
+                }
+                memcpy(
+                    &rows[(size_t)row_count * (size_t)ninputs],
+                    row,
+                    (size_t)ninputs * sizeof(int)
+                );
+                slots[slot] = row_count++;
+            }
+            ids[source_row] = slots[slot];
         }
     }
 
@@ -1695,7 +1674,7 @@ bool prepare_shared_projection_rows(
     return true;
 }
 
-static void clear_off_wildcard_masks(
+static void clear_off_compat_masks(
     PIstorage *PInfo,
     int noutputs
 ) {
@@ -1707,10 +1686,11 @@ static void clear_off_wildcard_masks(
         PInfo[output].off_compat_masks = NULL;
         PInfo[output].off_mask_words = 0;
         PInfo[output].off_mask_count = 0;
+        PInfo[output].off_has_dc = false;
     }
 }
 
-bool prepare_off_wildcard_masks(
+bool prepare_off_compat_masks(
     PIstorage *PInfo,
     int ninputs,
     int noutputs,
@@ -1724,7 +1704,7 @@ bool prepare_off_wildcard_masks(
     ) {
         return false;
     }
-    clear_off_wildcard_masks(PInfo, noutputs);
+    clear_off_compat_masks(PInfo, noutputs);
 
     size_t mask_count = 0u;
     for (int input = 0; input < ninputs; ++input) {
@@ -1739,29 +1719,48 @@ bool prepare_off_wildcard_masks(
 
     for (int output = 0; output < noutputs; ++output) {
         PIstorage *pi = &PInfo[output];
-        bool has_dc = false;
-        size_t cells =
-            (size_t)pi->OFF_minterms * (size_t)ninputs;
-        for (size_t cell = 0; cell < cells; ++cell) {
-            if (pi->OFF_set[cell] == 0) {
-                has_dc = true;
-                break;
-            }
-        }
-        if (!has_dc) continue;
+        if (pi->OFF_minterms <= 0) continue;
 
         int words = (pi->OFF_minterms + 63) / 64;
         if (
             words <= 0 ||
             mask_count > SIZE_MAX / (size_t)words
         ) {
-            clear_off_wildcard_masks(PInfo, noutputs);
+            clear_off_compat_masks(PInfo, noutputs);
             return false;
         }
         size_t mask_words = mask_count * (size_t)words;
         if (mask_words > SIZE_MAX / sizeof(uint64_t)) {
-            clear_off_wildcard_masks(PInfo, noutputs);
+            clear_off_compat_masks(PInfo, noutputs);
             return false;
+        }
+
+        /*
+         * Wildcard rows retain the established mask path. For fully
+         * specified rows, use the new path only when its persistent bitsets
+         * are no larger than the scalar OFF matrix they accelerate. This is
+         * comfortably true for binary data (about one sixteenth as large),
+         * while avoiding an accidental memory expansion on very high-cardinal
+         * multi-valued inputs.
+         */
+        bool has_dc = false;
+        size_t off_cells =
+            (size_t)pi->OFF_minterms * (size_t)ninputs;
+        for (size_t cell = 0; cell < off_cells; ++cell) {
+            if (pi->OFF_set[cell] == 0) {
+                has_dc = true;
+                break;
+            }
+        }
+        pi->off_has_dc = has_dc;
+        if (!has_dc) {
+            if (
+                off_cells > SIZE_MAX / sizeof(int) ||
+                mask_words * sizeof(uint64_t) >
+                    off_cells * sizeof(int)
+            ) {
+                continue;
+            }
         }
 
         pi->off_mask_offsets = (int *)malloc(
@@ -1772,7 +1771,7 @@ bool prepare_off_wildcard_masks(
             sizeof(uint64_t)
         );
         if (!pi->off_mask_offsets || !pi->off_compat_masks) {
-            clear_off_wildcard_masks(PInfo, noutputs);
+            clear_off_compat_masks(PInfo, noutputs);
             return false;
         }
 
@@ -1799,7 +1798,7 @@ bool prepare_off_wildcard_masks(
                     value_begin < 1 ||
                     value_end >= nofvalues[input]
                 ) {
-                    clear_off_wildcard_masks(PInfo, noutputs);
+                    clear_off_compat_masks(PInfo, noutputs);
                     return false;
                 }
                 for (int value = value_begin; value <= value_end; ++value) {
@@ -1961,7 +1960,6 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
     for (int o = 0; o < noutputs; o++) {
         if (o == 0) free(PInfo[o].projection_rows);
         free(PInfo[o].ON_projection_ids);
-        free(PInfo[o].OFF_projection_ids);
         free(PInfo[o].off_mask_offsets);
         free(PInfo[o].off_compat_masks);
         free(PInfo[o].ON_set);
@@ -2009,6 +2007,7 @@ void cleanup(PIstorage *PInfo, ThreadBuffer **buffer) {
             free(buffer[t][o].projection_has_dc);
             free(buffer[t][o].task_row_codes);
             free(buffer[t][o].task_seen_stamps);
+            free(buffer[t][o].task_config_bits);
         }
         free(buffer[t]);
     }
@@ -2230,6 +2229,79 @@ static uint32_t begin_task_seen_epoch(ThreadBuffer *workspace) {
     return workspace->task_seen_epoch;
 }
 
+static bool ensure_task_config_word_capacity(
+    ThreadBuffer *workspace,
+    size_t needed_words
+) {
+    if (!workspace || needed_words == 0u) return false;
+    if (
+        workspace->task_config_word_capacity >= needed_words &&
+        workspace->task_config_bits
+    ) {
+        return true;
+    }
+
+    size_t capacity = workspace->task_config_word_capacity > 0u
+        ? workspace->task_config_word_capacity
+        : needed_words;
+    while (capacity < needed_words) {
+        if (capacity > SIZE_MAX / 2u) {
+            capacity = needed_words;
+            break;
+        }
+        capacity *= 2u;
+    }
+    if (capacity > SIZE_MAX / sizeof(uint64_t)) return false;
+
+    uint64_t *bits = (uint64_t *)calloc(capacity, sizeof(uint64_t));
+    if (!bits) return false;
+    free(workspace->task_config_bits);
+    workspace->task_config_bits = bits;
+    workspace->task_config_word_capacity = capacity;
+    return true;
+}
+
+static bool compact_projected_configuration(
+    const int *row,
+    const int *support,
+    int support_size,
+    const int *nofvalues,
+    int *configuration_out
+) {
+    int configuration = 0;
+    int base = 1;
+    for (int c = 0; c < support_size; ++c) {
+        int input = support[c];
+        int value = row[input];
+        int levels = nofvalues[input] - 1;
+        if (value <= 0 || value > levels) return false;
+        configuration += (value - 1) * base;
+        base *= levels;
+    }
+    *configuration_out = configuration;
+    return true;
+}
+
+static int compare_int_ascending(const void *left, const void *right) {
+    int a = *(const int *)left;
+    int b = *(const int *)right;
+    return (a > b) - (a < b);
+}
+
+static bool sorted_int_contains(const int *values, int count, int value) {
+    int low = 0;
+    int high = count;
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        if (values[middle] < value) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low < count && values[low] == value;
+}
+
 char *prefix_basename(const char *filepath, const char *prefix) {
     const char *basename = strrchr(filepath, '/');
     if (basename) {
@@ -2248,6 +2320,25 @@ char *prefix_basename(const char *filepath, const char *prefix) {
     strcat(new_name, basename);
 
     return new_name;
+}
+
+static int checkpoint_uncovered_rows(const PIstorage *pi) {
+    if (!pi || pi->ON_minterms <= 0) return 0;
+    if (pi->foundPI <= 0 || !pi->pichart_pos) return pi->ON_minterms;
+
+    PIChartView chart = pi_chart_view(pi);
+    int uncovered = 0;
+    for (int row = 0; row < pi->ON_minterms; ++row) {
+        bool covered = false;
+        for (int column = 0; column < pi->foundPI; ++column) {
+            if (chart_covers(&chart, column, row)) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) uncovered++;
+    }
+    return uncovered;
 }
 
 void print_info(const char *INFO_PATH, const int info_level) {
@@ -2308,15 +2399,19 @@ void print_info(const char *INFO_PATH, const int info_level) {
     if (info_level > 0) {
         for (int o = 0; o < no; ++o) {
             bool stop_flag = pi_tmp[o].stop_search;
+            int uncovered = checkpoint_uncovered_rows(&pi_tmp[o]);
 
             printf(
-                "Output %d: ON=%d OFF=%d foundPI=%d solmin=%d stop=%s\n",
+                "Output %d: ON=%d OFF=%d foundPI=%d solmin=%d stop=%s "
+                "cover_feasible=%s uncovered=%d\n",
                 o,
                 pi_tmp[o].ON_minterms,
                 pi_tmp[o].OFF_minterms,
                 pi_tmp[o].foundPI,
                 pi_tmp[o].solmin,
-                stop_flag ? "yes" : "no"
+                stop_flag ? "yes" : "no",
+                uncovered == 0 ? "yes" : "no",
+                uncovered
             );
         }
     }
@@ -2454,10 +2549,15 @@ int process_task(
     }
 
     int space_size = 1;
+    int configuration_count = 1;
     for (int i = 0; i < k; i++) {
         space_size *= nofvalues[tempk[i]];
+        int levels = nofvalues[tempk[i]] - 1;
+        if (levels < 1) levels = 1;
+        configuration_count *= levels;
     }
     if (space_size < 1) space_size = 1;
+    if (configuration_count < 1) configuration_count = 1;
 
     int mbase_sum = 0;
     for (int i = 0; i < k; i++) {
@@ -2510,15 +2610,37 @@ int process_task(
         int *cov_word_index = PInfo[o].cov_word_index;
         uint64_t *shifted_cov_mask = PInfo[o].shifted_cov_mask;
         bool use_off_masks = PInfo[o].off_compat_masks != NULL;
+        bool scalar_exact = !use_off_masks && !PInfo[o].off_has_dc;
 
         ThreadBuffer *ts = &buffer[tid][o];
         ThreadBuffer *workspace = &buffer[tid][0];
+        size_t configuration_words =
+            ((size_t)configuration_count + 63u) / 64u;
+        size_t sparse_capacity = (size_t)OFF_minterms <
+                (size_t)configuration_count
+            ? (size_t)OFF_minterms
+            : (size_t)configuration_count;
+        size_t dense_bytes = configuration_words <= SIZE_MAX / 2u
+            ? configuration_words * 2u * sizeof(uint64_t)
+            : SIZE_MAX;
+        size_t sparse_bytes = sparse_capacity <= SIZE_MAX / sizeof(int)
+            ? sparse_capacity * sizeof(int)
+            : SIZE_MAX;
+        bool scalar_dense = scalar_exact &&
+            (configuration_count <= 64 || dense_bytes <= sparse_bytes);
+
         size_t row_codes_needed = (size_t)ON_minterms;
-        if (!use_off_masks) {
+        if (scalar_exact && !scalar_dense) {
             if (
-                (size_t)OFF_minterms >
+                sparse_capacity >
                 SIZE_MAX - row_codes_needed
             ) {
+                fprintf(stderr, "Error: sparse OFF-set size overflow\n");
+                return 1;
+            }
+            row_codes_needed += sparse_capacity;
+        } else if (!use_off_masks && !scalar_exact) {
+            if ((size_t)OFF_minterms > SIZE_MAX - row_codes_needed) {
                 fprintf(stderr, "Error: decimal position size overflow\n");
                 return 1;
             }
@@ -2529,16 +2651,52 @@ int process_task(
             return 1;
         }
         int *decpos = workspace->task_row_codes;
-        int *decneg = use_off_masks
-            ? NULL
-            : workspace->task_row_codes + ON_minterms;
+        int *sparse_off_configurations = scalar_exact && !scalar_dense
+            ? workspace->task_row_codes + ON_minterms
+            : NULL;
+        int *decneg = !use_off_masks && !scalar_exact
+            ? workspace->task_row_codes + ON_minterms
+            : NULL;
 
-        bool use_seen_stamps = ensure_task_seen_capacity(
-            workspace,
-            (size_t)space_size
-        );
+        bool use_seen_stamps = false;
+        if (!scalar_exact) {
+            use_seen_stamps = ensure_task_seen_capacity(
+                workspace,
+                (size_t)space_size
+            );
+        }
 
-        int max_candidates = space_size < ON_minterms ? space_size : ON_minterms;
+        uint64_t *dense_off_configurations = NULL;
+        uint64_t *dense_on_configurations = NULL;
+        if (scalar_dense) {
+            if (
+                configuration_words > SIZE_MAX / 2u ||
+                !ensure_task_config_word_capacity(
+                    workspace,
+                    configuration_words * 2u
+                )
+            ) {
+                fprintf(stderr, "Error: dense OFF-set allocation failed\n");
+                return 1;
+            }
+            dense_off_configurations = workspace->task_config_bits;
+            dense_on_configurations =
+                workspace->task_config_bits + configuration_words;
+            memset(
+                dense_off_configurations,
+                0,
+                configuration_words * 2u * sizeof(uint64_t)
+            );
+        }
+#ifdef CCUBES_TESTING
+        ts->scalar_config_scratch_bytes = scalar_exact
+            ? (scalar_dense ? dense_bytes : sparse_bytes)
+            : 0u;
+#endif
+
+        int max_candidates = configuration_count < ON_minterms
+            ? configuration_count
+            : ON_minterms;
         if (!ensure_thread_buffer_capacity(
             ts,
             max_candidates,
@@ -2580,49 +2738,106 @@ int process_task(
             decpos[r] = valid ? acc : 0;
         }
 
-        // calculate decimal numbers, using mbase, fills in decpos and decneg
-
-        int unique_off_rows[OFF_minterms];
-        bool dc_off_rows[OFF_minterms];
+        int sparse_off_count = 0;
+        int *unique_off_rows = NULL;
+        unsigned char *dc_off_rows = NULL;
         int off_count = 0;
+        int exact_off_count = 0;
 
-        if (!use_off_masks) {
-            // initialize don't-care flags to false
-            for (int r = 0; r < OFF_minterms; r++) {
-                dc_off_rows[r] = false;
+        if (scalar_exact) {
+            for (int r = 0; r < OFF_minterms; ++r) {
+#ifdef CCUBES_TESTING
+                ts->scalar_off_rows_projected++;
+#endif
+                int configuration = 0;
+                if (!compact_projected_configuration(
+                    &PInfo[o].OFF_set[(size_t)r * (size_t)ninputs],
+                    tempk,
+                    k,
+                    nofvalues,
+                    &configuration
+                )) {
+                    fprintf(stderr, "Error: exact OFF row contains a dash\n");
+                    return 1;
+                }
+
+                if (scalar_dense) {
+                    size_t word = (size_t)configuration / 64u;
+                    uint64_t bit = UINT64_C(1) << (configuration % 64);
+                    if ((dense_off_configurations[word] & bit) == 0u) {
+                        dense_off_configurations[word] |= bit;
+                        exact_off_count++;
+                        if (exact_off_count >= configuration_count) break;
+                    }
+                } else {
+                    assert((size_t)sparse_off_count < sparse_capacity);
+                    sparse_off_configurations[sparse_off_count++] =
+                        configuration;
+                }
             }
 
-            // OFF-set O(1) dedup using the same mbase and space_size as ON-set
+            if (!scalar_dense && sparse_off_count > 1) {
+                qsort(
+                    sparse_off_configurations,
+                    (size_t)sparse_off_count,
+                    sizeof(int),
+                    compare_int_ascending
+                );
+                int unique = 1;
+                for (int index = 1; index < sparse_off_count; ++index) {
+                    if (
+                        sparse_off_configurations[index] !=
+                        sparse_off_configurations[unique - 1]
+                    ) {
+                        sparse_off_configurations[unique++] =
+                            sparse_off_configurations[index];
+                    }
+                }
+                sparse_off_count = unique;
+            }
+
+            if (exact_off_count >= configuration_count) {
+                continue;
+            }
+        } else if (!use_off_masks) {
+            unique_off_rows = (int *)malloc(
+                (size_t)OFF_minterms * sizeof(int)
+            );
+            dc_off_rows = (unsigned char *)calloc(
+                (size_t)OFF_minterms,
+                sizeof(unsigned char)
+            );
+            if (!unique_off_rows || !dc_off_rows) {
+                free(unique_off_rows);
+                free(dc_off_rows);
+                fprintf(stderr, "Error: wildcard OFF workspace allocation failed\n");
+                return 1;
+            }
+
             uint32_t off_seen_epoch = use_seen_stamps
                 ? begin_task_seen_epoch(workspace)
                 : 0;
 
             for (int r = 0; r < OFF_minterms; r++) {
-                if (off_count >= space_size) break;
+                if (exact_off_count >= configuration_count) break;
 
                 int acc = 0;
                 bool has_dc = false;
 
-                if (
-                    use_shared_projection &&
-                    PInfo[o].OFF_projection_ids
-                ) {
-                    int row_id = PInfo[o].OFF_projection_ids[r];
-                    acc = projection_codes[row_id];
-                    has_dc = projection_has_dc[row_id] != 0;
-                } else {
-                    for (int c = 0; c < k; c++) {
-                        int value =
-                            PInfo[o].OFF_set[
-                                r * ninputs + tempk[c]
-                            ];
-                        if (value == 0) has_dc = true;
-                        acc += value * mbase[c];
-                    }
+#ifdef CCUBES_TESTING
+                ts->scalar_off_rows_projected++;
+#endif
+                for (int c = 0; c < k; c++) {
+                    int value =
+                        PInfo[o].OFF_set[
+                            r * ninputs + tempk[c]
+                        ];
+                    if (value == 0) has_dc = true;
+                    acc += value * mbase[c];
                 }
 
                 decneg[r] = acc;
-                dc_off_rows[r] = has_dc;
+                dc_off_rows[r] = has_dc ? 1u : 0u;
 
                 size_t off_index = (size_t)acc;
                 assert(off_index < (size_t)space_size);
@@ -2642,6 +2857,7 @@ int process_task(
                     workspace->task_seen_stamps[off_index] =
                         off_seen_epoch;
                     unique_off_rows[off_count++] = r;
+                    if (!has_dc) exact_off_count++;
                 } else {
                     bool unique = true;
                     for (int prev = 0; prev < off_count; prev++) {
@@ -2653,12 +2869,14 @@ int process_task(
 
                     if (unique) {
                         unique_off_rows[off_count++] = r;
+                        if (!has_dc) exact_off_count++;
                     }
                 }
             }
 
-            // If the OFF-set spans the space, no ON row can be valid.
-            if (off_count >= space_size) {
+            if (exact_off_count >= configuration_count) {
+                free(unique_off_rows);
+                free(dc_off_rows);
                 continue;
             }
         }
@@ -2672,13 +2890,33 @@ int process_task(
             : 0;
 
         for (int r = 0; r < ON_minterms; r++) {
-            if (found >= space_size) break; // Early stop: all potential PIs already found
+            if (found >= configuration_count) break;
             if (decpos[r] == 0) continue;   // invalid row (has DC in selected inputs)
+
+            int on_configuration = -1;
+            if (scalar_exact) {
+                if (!compact_projected_configuration(
+                    &PInfo[o].ON_set[(size_t)r * (size_t)ninputs],
+                    tempk,
+                    k,
+                    nofvalues,
+                    &on_configuration
+                )) {
+                    continue;
+                }
+            }
 
             size_t on_index = (size_t)(decpos[r] - mbase_sum);
             assert(on_index < (size_t)space_size);
 
-            if (
+            if (scalar_dense) {
+                size_t word = (size_t)on_configuration / 64u;
+                uint64_t bit = UINT64_C(1) << (on_configuration % 64);
+                if ((dense_on_configurations[word] & bit) != 0u) {
+                    continue;
+                }
+                dense_on_configurations[word] |= bit;
+            } else if (
                 use_seen_stamps &&
                 on_index < (size_t)space_size
             ) {
@@ -2697,8 +2935,11 @@ int process_task(
                     pos_seen_epoch;
             }
             if (
-                !use_seen_stamps ||
-                on_index >= (size_t)space_size
+                !scalar_dense &&
+                (
+                    !use_seen_stamps ||
+                    on_index >= (size_t)space_size
+                )
             ) {
                 // O(n) fallback: check previously selected rows for duplicate decpos
                 bool duplicate = false;
@@ -2729,6 +2970,20 @@ int process_task(
                     tempk,
                     k
                 );
+            } else if (scalar_exact) {
+                if (scalar_dense) {
+                    size_t word = (size_t)on_configuration / 64u;
+                    uint64_t bit =
+                        UINT64_C(1) << (on_configuration % 64);
+                    valid_row =
+                        (dense_off_configurations[word] & bit) == 0u;
+                } else {
+                    valid_row = !sorted_int_contains(
+                        sparse_off_configurations,
+                        sparse_off_count,
+                        on_configuration
+                    );
+                }
             } else {
                 for (int roff = 0; roff < off_count; roff++) {
                     bool different = false;
@@ -2763,10 +3018,13 @@ int process_task(
             possible_rows[found++] = r;
             max_found++;
 
-            if (found >= space_size) {
+            if (found >= configuration_count) {
                 break; // also guard after increment
             }
         }
+
+        free(unique_off_rows);
+        free(dc_off_rows);
 
         PICoverageIndex *generation_index = coverage_indices
             ? &coverage_indices[o]

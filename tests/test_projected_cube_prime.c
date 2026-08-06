@@ -30,7 +30,7 @@ static void prepare_masks(
     for (int input = 0; input < ninputs; ++input) {
         nofvalues[input] = 3;
     }
-    assert(prepare_off_wildcard_masks(
+    assert(prepare_off_compat_masks(
         pi,
         ninputs,
         1,
@@ -77,6 +77,71 @@ int main(void) {
         pi_a.OFF_minterms = 1;
         pi_a.OFF_set = off_a_only;
         assert(projected_cube_is_prime(&pi_a, ninputs, support, 2, value_bits, word_index, bit_index) == false);
+    }
+
+    /* A fully specified OFF set large enough to select the adaptive mask path. */
+    {
+        int ninputs = 2;
+        int support[] = {0, 1};
+        int word_index[2], bit_index[2];
+        build_layout(ninputs, word_index, bit_index);
+        uint64_t value_bits[1] = {0};
+        int off_rows[65 * 2];
+        for (int row = 0; row < 64; ++row) {
+            off_rows[row * 2] = 2;
+            off_rows[row * 2 + 1] = 1;
+        }
+        off_rows[64 * 2] = 1;
+        off_rows[64 * 2 + 1] = 2;
+
+        PIstorage pi;
+        memset(&pi, 0, sizeof(pi));
+        pi.OFF_minterms = 65;
+        pi.OFF_set = off_rows;
+        assert(projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            2,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        prepare_masks(&pi, ninputs);
+        assert(pi.off_mask_words == 2);
+        assert(projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            2,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        free_masks(&pi);
+
+        pi.OFF_minterms = 64;
+        assert(!projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            2,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        prepare_masks(&pi, ninputs);
+        assert(pi.off_mask_words == 1);
+        assert(!projected_cube_is_prime(
+            &pi,
+            ninputs,
+            support,
+            2,
+            value_bits,
+            word_index,
+            bit_index
+        ));
+        free_masks(&pi);
     }
 
     /*

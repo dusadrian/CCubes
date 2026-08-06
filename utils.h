@@ -90,22 +90,23 @@ typedef struct {
     int      *ON_set;
     int      *OFF_set;
     /*
-     * Exact input rows are shared across output-specific ON/OFF partitions.
-     * projection_rows is owned only by PInfo[0]; every output owns its two
-     * row-id maps into that common table.
+     * Exact ON rows are shared across output partitions. projection_rows is
+     * owned only by PInfo[0]; every output owns its ON row-id map. OFF rows
+     * remain lazy or use compatibility masks.
      */
     int       projection_row_count;
     int      *projection_rows;
     int      *ON_projection_ids;
-    int      *OFF_projection_ids;
     /*
-     * DC-bearing OFF sets use compatibility masks indexed by
-     * (input, non-DC value). A bit is set when the OFF row has that value or
-     * a wildcard at the input. Fully specified outputs leave these fields
-     * empty and retain the decoded-index validation path.
+     * OFF compatibility masks are indexed by (input, non-DC value). A bit is
+     * set when the OFF row has that value or a wildcard at the input. Besides
+     * handling wildcard rows, these masks let dense fully specified OFF sets
+     * validate projected ON assignments without re-projecting every OFF row
+     * for every support.
      */
     int       off_mask_words;
     int       off_mask_count;
+    bool      off_has_dc;
     int      *off_mask_offsets;
     uint64_t *off_compat_masks;
     int      *covered;
@@ -155,9 +156,13 @@ typedef struct ThreadBuffer {
     uint32_t *task_seen_stamps;
     size_t    task_seen_capacity;
     uint32_t  task_seen_epoch;
+    uint64_t *task_config_bits;
+    size_t    task_config_word_capacity;
     int       found;
 #ifdef CCUBES_TESTING
     uint64_t  validation_attempts;
+    uint64_t  scalar_off_rows_projected;
+    size_t    scalar_config_scratch_bytes;
 #endif
 } ThreadBuffer;
 
@@ -176,7 +181,8 @@ typedef struct {
     atomic_uint_fast64_t subsumption_rejections;
 } PICoverageIndex;
 
-/* Binary total-row model required by adaptive and certified stopping. */
+/* Binary total-row model required by adaptive and certified stopping.
+   Outputs with an empty ON or OFF set are trivial constants. */
 bool certified_model_supported(
     const PIstorage *PInfo,
     int ninputs,
@@ -252,7 +258,7 @@ bool prepare_shared_projection_rows(
     int noutputs
 );
 
-bool prepare_off_wildcard_masks(
+bool prepare_off_compat_masks(
     PIstorage *PInfo,
     int ninputs,
     int noutputs,

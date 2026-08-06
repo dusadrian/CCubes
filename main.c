@@ -906,13 +906,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (!prepare_off_wildcard_masks(
+    if (!prepare_off_compat_masks(
         PInfo,
         ninputs,
         noutputs,
         nofvalues
     )) {
-        fprintf(stderr, "Error: wildcard OFF-mask allocation failed.\n");
+        fprintf(stderr, "Error: OFF compatibility-mask allocation failed.\n");
         free(chk_stop_counter);
         cleanup(PInfo, NULL);
         return 1;
