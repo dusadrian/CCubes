@@ -345,12 +345,17 @@ int load_checkpoint(
                     !po->covsum
                 )
             ) ||
-            !po->last_index ||
-            !po->k_last_index ||
-            !po->previndices ||
-            !po->indices ||
-            !po->cov_word_index ||
-            !po->shifted_cov_mask
+            (
+                onm &&
+                (
+                    !po->last_index ||
+                    !po->k_last_index ||
+                    !po->previndices ||
+                    !po->indices ||
+                    !po->cov_word_index ||
+                    !po->shifted_cov_mask
+                )
+            )
         ) goto READ_FAIL;
 
         if (read_bytes(f, po->covered, fp * sizeof(int)) < 0) goto READ_FAIL;
