@@ -18,7 +18,12 @@
     #endif
 #endif
 
-#define CCUBES_THREAD_LIMIT 64
+/*
+ * This is a corruption guard, not a performance policy. Callers with large
+ * per-worker state (notably weighted pricing) must apply their own
+ * memory-aware limit before entering the shared parallel layer.
+ */
+#define CCUBES_THREAD_LIMIT 1024
 
 static int ccubes_configured_threads = 0;
 
@@ -161,12 +166,13 @@ int ccubes_parallel_for(
         return 0;
     }
 
-    uint64_t chunk = count / (uint64_t)nthreads;
-    uint64_t rem = count % (uint64_t)nthreads;
+    const uint64_t chunk = count / (uint64_t)nthreads;
+    const uint64_t rem = count % (uint64_t)nthreads;
     uint64_t next = start;
-    int started = 0;
-    int ok = 1;
 
+    /* Resolve every logical task before creating OS threads.  If pthread
+     * creation later stops partway through, the caller thread can execute the
+     * untouched suffix exactly once while the created prefix runs normally. */
     for (int i = 0; i < nthreads; i++) {
         tasks[i].worker = worker;
         tasks[i].data = data;
@@ -184,12 +190,18 @@ int ccubes_parallel_for(
             tasks[i].stride = 1;
             next += width;
         }
+    }
 
+    int started = 0;
+    for (int i = 0; i < nthreads; ++i) {
         if (pthread_create(&threads[i], NULL, ccubes_thread_main, &tasks[i]) != 0) {
-            ok = 0;
             break;
         }
         started++;
+    }
+
+    for (int i = started; i < nthreads; ++i) {
+        ccubes_thread_main(&tasks[i]);
     }
 
     for (int i = 0; i < started; i++) {
@@ -198,7 +210,7 @@ int ccubes_parallel_for(
 
     free(threads);
     free(tasks);
-    return ok;
+    return 1;
 #else
     (void)strided;
     worker(start, end, 1, 0, 1, data);
