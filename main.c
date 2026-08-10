@@ -20,6 +20,8 @@
 #include "pool_selection.h"
 #include "plateau_probe.h"
 #include "bounded_mmcs.h"
+#include "cover_validation.h"
+#include "projection_rwls.h"
 
 #define CCUBES_AUTO_MMCS_MIN_PROJECTION_TASKS UINT64_C(8192)
 #define CCUBES_AUTO_MMCS_MIN_NODE_BUDGET UINT64_C(8192)
@@ -37,6 +39,133 @@ typedef enum {
     PI_GENERATOR_MMCS,
     PI_GENERATOR_COMPLETE_MMCS
 } PIGeneratorMode;
+
+static const char *projection_rwls_status_name(
+    ProjectionRWLSStatus status
+) {
+    switch (status) {
+        case PROJECTION_RWLS_OK: return "ok";
+        case PROJECTION_RWLS_INVALID: return "invalid";
+        case PROJECTION_RWLS_OUT_OF_MEMORY: return "out-of-memory";
+        case PROJECTION_RWLS_MEMORY_LIMIT: return "memory-limit";
+    }
+    return "unknown";
+}
+
+/*
+ * Experimental fixed-chart finisher. Keep it separate from prime generation:
+ * it may select only columns already present at this projection boundary.
+ * Four logical families make the searched work independent of -t; physical
+ * workers change elapsed time, not the deterministic family prefix.
+ */
+static bool try_projection_rwls(
+    const PIChartView *chart,
+    int level,
+    int output,
+    int threads,
+    bool certified_mode,
+    bool boundary_exact,
+    int *solution,
+    int *cardinality
+) {
+    const bool enabled = env_flag_enabled(
+        "CCUBES_TEST_PROJECTION_RWLS"
+    );
+    if (!enabled) return false;
+
+    if (!projection_rwls_should_run(
+        true,
+        certified_mode,
+        boundary_exact,
+        true,
+        cardinality ? *cardinality : -1
+    )) {
+        const char *reason = certified_mode
+            ? "certified-mode"
+            : (
+                boundary_exact
+                    ? "boundary-exact"
+                    : "cardinality-floor"
+            );
+        fprintf(
+            stderr,
+            "CCUBES_PROJECTION_RWLS level=%d output=%d "
+            "status=skipped reason=%s\n",
+            level,
+            output + 1,
+            reason
+        );
+        return false;
+    }
+
+    const int incumbent_cardinality = *cardinality;
+    ProjectionRWLSOptions options;
+    projection_rwls_options_default(&options);
+    options.requested_threads = threads;
+    options.logical_family_count = 4;
+    options.seed =
+        ((uint64_t)(unsigned int)level << 32) ^
+        (uint64_t)(unsigned int)(output + 1);
+
+    int *candidate = NULL;
+    int candidate_cardinality = -1;
+    ProjectionRWLSStats stats;
+    const ProjectionRWLSStatus status = projection_rwls_improve(
+        chart,
+        incumbent_cardinality,
+        solution,
+        &options,
+        &candidate,
+        &candidate_cardinality,
+        &stats
+    );
+    const bool candidate_valid =
+        status == PROJECTION_RWLS_OK &&
+        cover_is_feasible(
+            chart,
+            candidate,
+            candidate_cardinality
+        );
+    const bool improved =
+        candidate_valid &&
+        candidate_cardinality < incumbent_cardinality;
+
+    if (improved) {
+        memcpy(
+            solution,
+            candidate,
+            (size_t)candidate_cardinality * sizeof(int)
+        );
+        *cardinality = candidate_cardinality;
+    }
+
+    fprintf(
+        stderr,
+        "CCUBES_PROJECTION_RWLS level=%d output=%d status=%s "
+        "cover=%d->%d targets=%d/%d families=%d threads=%d "
+        "iterations=%llu memory=%llu seconds=%.6f\n",
+        level,
+        output + 1,
+        status == PROJECTION_RWLS_OK
+            ? (
+                !candidate_valid
+                    ? "invalid-result"
+                    : (improved ? "improved" : "unchanged")
+            )
+            : projection_rwls_status_name(status),
+        incumbent_cardinality,
+        improved ? candidate_cardinality : incumbent_cardinality,
+        stats.targets_improved,
+        stats.targets_attempted,
+        stats.logical_family_states,
+        stats.threads_used,
+        (unsigned long long)stats.iterations,
+        (unsigned long long)stats.allocated_bytes,
+        (double)stats.elapsed_nanoseconds / 1e9
+    );
+    free(candidate);
+    return improved;
+}
 
 /*
  * Keep the ordinary sharing-aware incumbent in a boundary pool.  Pool
@@ -140,13 +269,11 @@ typedef struct {
     int *max_shared;
     int increase;
     int *multiplier;
-    double time_limit_sec;
-    double base_elapsed;
+    double checkpoint_deadline_sec;
     struct timespec start_time;
     atomic_bool *time_up;
-    double *time_up_elapsed;
-    atomic_uint_fast64_t *last_task_reached;
-    ccubes_mutex *state_lock;
+    uint64_t *worker_next_tasks;
+    atomic_bool *failed;
 } PIWorkerContext;
 
 typedef struct {
@@ -178,34 +305,26 @@ static void pi_search_range_worker(
     (void)worker_count;
     PIWorkerContext *ctx = (PIWorkerContext *)data;
 
+    ctx->worker_next_tasks[worker_id] = start;
+
     for (uint64_t task = start; task < end; task += stride) {
         if (atomic_load_explicit(ctx->time_up, memory_order_acquire)) {
             break;
         }
 
-        if (ctx->time_limit_sec > 0.0 && (task & 0x3FFull) == 0) {
+        if (ctx->checkpoint_deadline_sec > 0.0 && (task & 0x3FFull) == 0) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             double elapsed =
                 (now.tv_sec - ctx->start_time.tv_sec) +
                 (now.tv_nsec - ctx->start_time.tv_nsec) / 1e9;
 
-            if (elapsed >= ctx->time_limit_sec) {
-                bool expected = false;
-                if (
-                    atomic_compare_exchange_strong_explicit(
-                        ctx->time_up,
-                        &expected,
-                        true,
-                        memory_order_acq_rel,
-                        memory_order_acquire
-                    )
-                ) {
-                    ccubes_mutex_lock(ctx->state_lock);
-                    *ctx->time_up_elapsed = ctx->base_elapsed + elapsed;
-                    atomic_store_explicit(ctx->last_task_reached, task, memory_order_release);
-                    ccubes_mutex_unlock(ctx->state_lock);
-                }
+            if (elapsed >= ctx->checkpoint_deadline_sec) {
+                atomic_store_explicit(
+                    ctx->time_up,
+                    true,
+                    memory_order_release
+                );
                 break;
             }
         }
@@ -238,8 +357,11 @@ static void pi_search_range_worker(
                 ctx->k
             );
             atomic_store_explicit(ctx->time_up, true, memory_order_release);
+            atomic_store_explicit(ctx->failed, true, memory_order_release);
             break;
         }
+
+        ctx->worker_next_tasks[worker_id] = task + stride;
     }
 }
 
@@ -388,6 +510,8 @@ void help() {
     printf("                         (fully specified binary point rows only)\n");
     printf("  -p                   : enable automatic equal-cardinality cover pooling\n");
     printf("  -l<sec>[=<file>]     : time limit to save a checkpoint in the <file>\n");
+    printf("  --checkpoint-every=<sec>\n");
+    printf("                       : save periodically and continue running\n");
     printf("  -r=<file>            : resume from checkpoint file\n");
     printf("  -i<level>=<file>     : inspect checkpoint (print progress and metadata)\n");
     printf("                           0 (default) progress report\n");
@@ -441,13 +565,14 @@ int main(int argc, char *argv[]) {
 
     // checkpoint/time limit
     double TIME_LIMIT_SEC = 0.0;
+    double CHECKPOINT_INTERVAL_SEC = 0.0;
     char *CHK_SAVE_PATH = NULL;
     char *RESUME_PATH = NULL;
     char *INFO_PATH = NULL; // -i: inspect checkpoint file
     int RESUME_K = -1;
     // resume progress for current k
-    uint64_t RESUME_LAST_TASK = 0ull;
-    bool HAS_RESUME_LAST_TASK = false;
+    uint64_t RESUME_TASK = 0ull;
+    bool HAS_RESUME_TASK = false;
 
     int info_level = 0;
 
@@ -477,6 +602,31 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             debug_init(file, debug_level);
+        } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
+            if (
+                i + 1 >= argc ||
+                !parse_nonnegative_double(
+                    argv[++i],
+                    &CHECKPOINT_INTERVAL_SEC
+                )
+            ) {
+                fprintf(
+                    stderr,
+                    "Error: --checkpoint-every requires nonnegative seconds.\n"
+                );
+                return 1;
+            }
+        } else if (strncmp(argv[i], "--checkpoint-every=", 19) == 0) {
+            const char *opt = argv[i] + 19;
+            if (!parse_nonnegative_double(opt, &CHECKPOINT_INTERVAL_SEC)) {
+                fprintf(
+                    stderr,
+                    "Invalid checkpoint interval: %s "
+                    "(must be nonnegative seconds)\n",
+                    opt
+                );
+                return 1;
+            }
         } else if (strcmp(argv[i], "-d") == 0) {
             DETERMINISTIC_PI_ORDER = true;
         } else if (strcmp(argv[i], "-c") == 0) {
@@ -683,11 +833,12 @@ int main(int argc, char *argv[]) {
             PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
             PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS
         ) &&
-        TIME_LIMIT_SEC > 0.0
+        (TIME_LIMIT_SEC > 0.0 || CHECKPOINT_INTERVAL_SEC > 0.0)
     ) {
         fprintf(
             stderr,
-            "Error: the experimental MMCS generator does not yet support time-limit checkpoints.\n"
+            "Error: the experimental MMCS generator does not yet support "
+            "time-limit or periodic checkpoints.\n"
         );
         return 1;
     }
@@ -729,7 +880,7 @@ int main(int argc, char *argv[]) {
         char *chk_src_path = NULL;
         char *chk_dst_path = NULL;
         double chk_elapsed_total = 0.0, chk_elapsed_scp = 0.0;
-        uint64_t chk_last_task = 0ull;
+        uint64_t chk_resume_task = 0ull;
 
         if (
             load_checkpoint(
@@ -751,7 +902,7 @@ int main(int argc, char *argv[]) {
                 &chk_dst_path,
                 &chk_elapsed_total,
                 &chk_elapsed_scp,
-                &chk_last_task
+                &chk_resume_task
             ) != 0
         ) {
             fprintf(stderr, "Error: failed to load checkpoint from %s\n", RESUME_PATH);
@@ -784,9 +935,9 @@ int main(int argc, char *argv[]) {
 
         // Resume the interrupted generation level recorded in the checkpoint.
         search_level = RESUME_K;
-        // carry forward last_task information for this k
-        RESUME_LAST_TASK = chk_last_task;
-        HAS_RESUME_LAST_TASK = true;
+        // Carry forward the earliest task that must be run at this level.
+        RESUME_TASK = chk_resume_task;
+        HAS_RESUME_TASK = true;
 
         // Loaded widths are kept for later use
 	    // value_bit_width and implicant_words are set after computing max_value in non-resume mode
@@ -1264,6 +1415,7 @@ int main(int argc, char *argv[]) {
     }
 
     double scp_time = 0.0, k_scp_time = 0.0, pi_generation_time = 0.0;
+    double next_periodic_checkpoint_sec = CHECKPOINT_INTERVAL_SEC;
     double certification_enumeration_wall_time = 0.0;
     double certification_enumeration_worker_time = 0.0;
     double certification_chart_solve_time = 0.0;
@@ -1312,6 +1464,7 @@ int main(int argc, char *argv[]) {
             adaptive_stopping_supported &&
             !RESUME_PATH &&
             TIME_LIMIT_SEC <= 0.0 &&
+            CHECKPOINT_INTERVAL_SEC <= 0.0 &&
             (
                 projection_tasks == 0 ||
                 projection_tasks > CCUBES_AUTO_MMCS_MIN_PROJECTION_TASKS
@@ -1372,32 +1525,34 @@ int main(int argc, char *argv[]) {
         uint64_t maxtasks = attempt_mmcs
             ? (uint64_t)noutputs
             : projection_tasks;
+        double checkpoint_deadline_sec = TIME_LIMIT_SEC;
+        if (
+            CHECKPOINT_INTERVAL_SEC > 0.0 &&
+            (
+                checkpoint_deadline_sec <= 0.0 ||
+                next_periodic_checkpoint_sec < checkpoint_deadline_sec
+            )
+        ) {
+            checkpoint_deadline_sec = next_periodic_checkpoint_sec;
+        }
         PICoverageIndex *coverage_indices = NULL;
         atomic_bool time_up;
         atomic_init(&time_up, false);
-        double time_up_elapsed = 0.0;
-        atomic_uint_fast64_t last_task_reached;
-        atomic_init(&last_task_reached, 0ull);
-        uint64_t resume_last_task_local = 0ull;
-        uint64_t start_task = 0ull;
-        ccubes_mutex state_lock;
-        if (!ccubes_mutex_init(&state_lock)) {
-            fprintf(stderr, "Error: state lock initialization failed\n");
-            destroy_output_locks(output_locks, noutputs);
-            cleanup(PInfo, buffer);
-            return 1;
+        atomic_bool generation_failed;
+        atomic_init(&generation_failed, false);
+        uint64_t worker_next_tasks[THREADS];
+        for (int t = 0; t < THREADS; ++t) {
+            worker_next_tasks[t] = UINT64_MAX;
         }
+        uint64_t start_task = 0ull;
 
-        if (RESUME_PATH && HAS_RESUME_LAST_TASK && RESUME_K == k) {
-            resume_last_task_local = RESUME_LAST_TASK;
-            atomic_store_explicit(&last_task_reached, resume_last_task_local, memory_order_release);
-            start_task = resume_last_task_local + 1ull;
+        if (HAS_RESUME_TASK && RESUME_K == k) {
+            start_task = RESUME_TASK;
             if (start_task > maxtasks) start_task = maxtasks; // safety
         }
 
         if (!attempt_mmcs && maxtasks == 0) {
             // overflow, too many tasks
-            ccubes_mutex_destroy(&state_lock);
             destroy_output_locks(output_locks, noutputs);
             cleanup(PInfo, buffer);
             // exit(EXIT_FAILURE);
@@ -1413,7 +1568,6 @@ int main(int argc, char *argv[]) {
                 implicant_words
             )) {
                 fprintf(stderr, "Error: failed to build PI coverage indices\n");
-                ccubes_mutex_destroy(&state_lock);
                 destroy_output_locks(output_locks, noutputs);
                 cleanup(PInfo, buffer);
                 return 1;
@@ -1482,7 +1636,6 @@ int main(int argc, char *argv[]) {
                 &mmcs_ctx
             ) || atomic_load_explicit(&mmcs_failed, memory_order_acquire)) {
                 fprintf(stderr, "Error: bounded MMCS PI search failed\n");
-                ccubes_mutex_destroy(&state_lock);
                 destroy_output_locks(output_locks, noutputs);
                 cleanup(PInfo, buffer);
                 return 1;
@@ -1509,7 +1662,6 @@ int main(int argc, char *argv[]) {
                         stderr,
                         "Error: projection task count overflow after MMCS trial fallback\n"
                     );
-                    ccubes_mutex_destroy(&state_lock);
                     destroy_output_locks(output_locks, noutputs);
                     cleanup(PInfo, buffer);
                     return 1;
@@ -1522,7 +1674,6 @@ int main(int argc, char *argv[]) {
                     implicant_words
                 )) {
                     fprintf(stderr, "Error: failed to build PI coverage indices\n");
-                    ccubes_mutex_destroy(&state_lock);
                     destroy_output_locks(output_locks, noutputs);
                     cleanup(PInfo, buffer);
                     return 1;
@@ -1537,7 +1688,6 @@ int main(int argc, char *argv[]) {
                     &max_shared
                 )) {
                     fprintf(stderr, "Error: failed to mark MMCS PI sharing\n");
-                    ccubes_mutex_destroy(&state_lock);
                     destroy_output_locks(output_locks, noutputs);
                     cleanup(PInfo, buffer);
                     return 1;
@@ -1562,13 +1712,11 @@ int main(int argc, char *argv[]) {
                 .max_shared = &max_shared,
                 .increase = increase,
                 .multiplier = &multiplier,
-                .time_limit_sec = TIME_LIMIT_SEC,
-                .base_elapsed = BASE_ELAPSED,
+                .checkpoint_deadline_sec = checkpoint_deadline_sec,
                 .start_time = start,
                 .time_up = &time_up,
-                .time_up_elapsed = &time_up_elapsed,
-                .last_task_reached = &last_task_reached,
-                .state_lock = &state_lock
+                .worker_next_tasks = worker_next_tasks,
+                .failed = &generation_failed
             };
             if (!ccubes_parallel_for(
                 start_task,
@@ -1580,21 +1728,27 @@ int main(int argc, char *argv[]) {
             )) {
                 fprintf(stderr, "Error: failed to start workers for PI search\n");
                 destroy_pi_coverage_indices(coverage_indices, noutputs);
-                ccubes_mutex_destroy(&state_lock);
                 destroy_output_locks(output_locks, noutputs);
                 cleanup(PInfo, buffer);
                 return 1;
             }
         }
 
-        HAS_RESUME_LAST_TASK = false; // reset for the next k-level
+        if (atomic_load_explicit(&generation_failed, memory_order_acquire)) {
+            destroy_pi_coverage_indices(coverage_indices, noutputs);
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            return 1;
+        }
 
-        // Time-limit checkpoint (post-loop or early-cancel)
+        // Periodic or time-limit checkpoint after all workers are quiescent.
         bool level_time_up = atomic_load_explicit(&time_up, memory_order_acquire);
-        uint64_t last_task_reached_value = atomic_load_explicit(
-            &last_task_reached,
-            memory_order_acquire
-        );
+        uint64_t resume_task_value = maxtasks;
+        for (int t = 0; t < THREADS; ++t) {
+            if (worker_next_tasks[t] < resume_task_value) {
+                resume_task_value = worker_next_tasks[t];
+            }
+        }
         DBG_INFO_BLOCK {
             uint64_t mmcs_trial_nodes = 0;
             for (int o = 0; o < noutputs; ++o) {
@@ -1653,7 +1807,6 @@ int main(int argc, char *argv[]) {
                 );
             }
         }
-        ccubes_mutex_destroy(&state_lock);
         destroy_pi_coverage_indices(coverage_indices, noutputs);
 
         for (int o = 0; o < noutputs; ++o) {
@@ -1720,7 +1873,15 @@ int main(int argc, char *argv[]) {
             );
         }
 
-        if (TIME_LIMIT_SEC > 0 && level_time_up) {
+        if (level_time_up) {
+            struct timespec checkpoint_start;
+            clock_gettime(CLOCK_MONOTONIC, &checkpoint_start);
+            double run_elapsed =
+                (checkpoint_start.tv_sec - start.tv_sec) +
+                (checkpoint_start.tv_nsec - start.tv_nsec) / 1e9;
+            double checkpoint_elapsed_total = BASE_ELAPSED + run_elapsed;
+            bool time_limit_reached =
+                TIME_LIMIT_SEC > 0.0 && run_elapsed >= TIME_LIMIT_SEC;
             if (!CHK_SAVE_PATH) {
                 if (RESUME_PATH) {
                     CHK_SAVE_PATH = RESUME_PATH; // overwrite the same checkpoint when resuming
@@ -1755,30 +1916,72 @@ int main(int argc, char *argv[]) {
                     POOL_MAX,
                     SRC_FILE,
                     dst_to_save,
-                    time_up_elapsed,
+                    checkpoint_elapsed_total,
                     BASE_SCP + scp_time,
-                    last_task_reached_value
+                    resume_task_value
                 ) == 0
             ) {
-                double pct = (double)last_task_reached_value * 100.0 / (double)maxtasks;
+                double pct = maxtasks > 0
+                    ? (double)resume_task_value * 100.0 / (double)maxtasks
+                    : 100.0;
 
-                fprintf(
-                    stderr,
-                    "Time limit reached. Checkpoint saved at %.2f%% of level k=%d.\n",
-                    pct, k
-                );
+                if (time_limit_reached) {
+                    fprintf(
+                        stderr,
+                        "Time limit reached. Checkpoint saved at %.2f%% "
+                        "of level k=%d.\n",
+                        pct,
+                        k
+                    );
+                } else {
+                    fprintf(
+                        stderr,
+                        "Periodic checkpoint saved at %.2f%% of level "
+                        "k=%d; continuing.\n",
+                        pct,
+                        k
+                    );
+                }
             } else {
                 fprintf(
                     stderr,
-                    "Time limit reached. Failed to save checkpoint to %s.\n",
+                    "%s checkpoint failed: unable to save %s.\n",
+                    time_limit_reached ? "Time-limit" : "Periodic",
                     CHK_SAVE_PATH
                 );
+                if (tmp_dst_alloc) free(tmp_dst_alloc);
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                return 1;
             }
             if (tmp_dst_alloc) free(tmp_dst_alloc);
+
+            if (!time_limit_reached) {
+                struct timespec checkpoint_end;
+                clock_gettime(CLOCK_MONOTONIC, &checkpoint_end);
+                double elapsed_after_save =
+                    (checkpoint_end.tv_sec - start.tv_sec) +
+                    (checkpoint_end.tv_nsec - start.tv_nsec) / 1e9;
+                do {
+                    next_periodic_checkpoint_sec +=
+                        CHECKPOINT_INTERVAL_SEC;
+                } while (
+                    next_periodic_checkpoint_sec <= elapsed_after_save
+                );
+
+                RESUME_K = k;
+                RESUME_TASK = resume_task_value;
+                HAS_RESUME_TASK = true;
+                --k;
+                continue;
+            }
+
             destroy_output_locks(output_locks, noutputs);
             cleanup(PInfo, buffer);
             return 0;
         }
+
+        HAS_RESUME_TASK = false;
 
         // solve the PI charts per output
         if (POOL_MAX == 1) {
@@ -1886,13 +2089,31 @@ int main(int argc, char *argv[]) {
                         );
                     }
 
-                    const bool probe_due =
+                    bool probe_due =
                         *solmin > 0 &&
                         adaptive_stopping_supported &&
                         *prevsolmin > 1 &&
                         *prevsolmin <= ON_minterms &&
                         *solmin >= *prevsolmin &&
                         stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
+                    if (probe_due && SCP_TYPE == 0) {
+                        (void)try_projection_rwls(
+                            &chart,
+                            k,
+                            o,
+                            THREADS,
+                            CERTIFIED_MODE,
+                            boundary_exact,
+                            indices,
+                            solmin
+                        );
+                        probe_due =
+                            *solmin > 0 &&
+                            *prevsolmin > 1 &&
+                            *prevsolmin <= ON_minterms &&
+                            *solmin >= *prevsolmin &&
+                            stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
+                    }
                     if (probe_due) {
                         const int pre_probe_found = *foundPI;
                         const uint64_t pair_limit =
@@ -2310,6 +2531,25 @@ int main(int argc, char *argv[]) {
                         destroy_output_locks(output_locks, noutputs);
                         cleanup(PInfo, buffer);
                         return 1;
+                    }
+
+                    const bool rwls_due =
+                        adaptive_stopping_supported &&
+                        PInfo[o].prevsolmin > 1 &&
+                        PInfo[o].prevsolmin <= ON_minterms &&
+                        *solmin >= PInfo[o].prevsolmin &&
+                        stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
+                    if (rwls_due && SCP_TYPE == 0) {
+                        (void)try_projection_rwls(
+                            &chart,
+                            k,
+                            o,
+                            THREADS,
+                            CERTIFIED_MODE,
+                            pool_boundary_exact[o],
+                            indices,
+                            solmin
+                        );
                     }
 
                     int baseline_solmin = *solmin;

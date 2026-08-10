@@ -193,8 +193,8 @@ clean:
 TEST_CFLAGS := -Wall -O2 -I.
 TEST_LIBS   := -lm
 
-.PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
-test: test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-bounded-mmcs test-mmcs-generator test-effort-policy
+.PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-projection-rwls test-projection-rwls-integration test-bounded-mmcs test-mmcs-generator test-effort-policy test-periodic-checkpoint
+test: test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-projection-rwls test-projection-rwls-integration test-bounded-mmcs test-mmcs-generator test-effort-policy test-periodic-checkpoint
 
 test-cover-validation:
 	$(CC) $(TEST_CFLAGS) tests/test_cover_validation.c cover_validation.c -o /tmp/ccubes_test_cover_validation $(TEST_LIBS)
@@ -243,12 +243,22 @@ test-plateau-probe:
 	$(CC) $(TEST_CFLAGS) tests/test_plateau_probe.c plateau_probe.c -o /tmp/ccubes_test_plateau_probe $(TEST_LIBS)
 	/tmp/ccubes_test_plateau_probe
 
+test-projection-rwls:
+	$(CC) $(TEST_CFLAGS) tests/test_projection_rwls.c projection_rwls.c ccubes_threads.c cover_validation.c -o /tmp/ccubes_test_projection_rwls $(TEST_LIBS)
+	/tmp/ccubes_test_projection_rwls
+
+test-projection-rwls-integration: $(BIN)
+	sh tests/test_projection_rwls_integration.sh ./$(BIN) examples/certified_F2.pla examples/boom_15x1x300.pla
+
 test-bounded-mmcs:
 	$(CC) $(TEST_CFLAGS) tests/test_bounded_mmcs.c bounded_mmcs.c -o /tmp/ccubes_test_bounded_mmcs $(TEST_LIBS)
 	/tmp/ccubes_test_bounded_mmcs
 
 test-mmcs-generator: $(BIN)
 	sh tests/test_mmcs_generator.sh ./$(BIN) examples/mmcs_forced_100x1.pla examples/certified_F2.pla examples/rnd_20x10x40.pla
+
+test-periodic-checkpoint: $(BIN)
+	sh tests/test_periodic_checkpoint.sh ./$(BIN) examples/rnd_20x10x40.pla
 
 test-effort-policy: $(BIN)
 	sh tests/test_effort_policy.sh ./$(BIN) examples/certified_F2.pla
