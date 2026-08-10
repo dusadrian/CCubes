@@ -24,7 +24,7 @@ int save_checkpoint(
     const char *dst_path,
     double elapsed_total,
     double elapsed_scp,
-    uint64_t last_task
+    uint64_t resume_task
 );
 
 // Load the search state from a binary checkpoint file.
@@ -50,7 +50,7 @@ int load_checkpoint(
     char **dst_path_out,
     double *elapsed_total_out,
     double *elapsed_scp_out,
-    uint64_t *last_task_out
+    uint64_t *resume_task_out
 );
 
 #endif // CHECKPOINT_H

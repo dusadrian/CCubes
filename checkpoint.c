@@ -12,9 +12,14 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #define CK_MAGIC "CCCHKv1"  // 7 chars + \0
-/* v8: retired certified-horizon state is no longer serialized */
-#define CK_VERSION 8u
+/* v9: the task field is the earliest safe task to resume, not a sampled task */
+#define CK_VERSION 9u
+#define CK_OLDEST_SUPPORTED_VERSION 8u
 
 static int write_bytes(FILE *f, const void *buf, size_t len) {
     return fwrite(buf, 1, len, f) == len ? 0 : -1;
@@ -93,10 +98,22 @@ int save_checkpoint(
     const char *dst_path,
     double elapsed_total,
     double elapsed_scp,
-    uint64_t last_task
+    uint64_t resume_task
 ) {
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
+    if (!path || !*path) return -1;
+
+    size_t path_len = strlen(path);
+    if (path_len > SIZE_MAX - 5u) return -1;
+    char *tmp_path = (char *)malloc(path_len + 5u);
+    if (!tmp_path) return -1;
+    memcpy(tmp_path, path, path_len);
+    memcpy(tmp_path + path_len, ".tmp", 5u);
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        free(tmp_path);
+        return -1;
+    }
 
     // header
     char magic[8] = CK_MAGIC;
@@ -121,8 +138,8 @@ int save_checkpoint(
     if (write_double(f, elapsed_total) < 0) goto FAIL;
     if (write_double(f, elapsed_scp) < 0) goto FAIL;
 
-    // last_task at current_k
-    if (write_u64(f, last_task) < 0) goto FAIL;
+    // Earliest task that must be rerun at current_k.
+    if (write_u64(f, resume_task) < 0) goto FAIL;
 
     // stop_counter per output
     for (int o = 0; o < noutputs; ++o) {
@@ -170,10 +187,29 @@ int save_checkpoint(
         if (write_bytes(f, pi->shifted_cov_mask, onm * sizeof(uint64_t)) < 0) goto FAIL;
     }
 
-    fclose(f);
+    int flush_failed = fflush(f) != 0;
+    int close_failed = fclose(f) != 0;
+    f = NULL;
+    if (flush_failed || close_failed) goto FAIL;
+
+#ifdef _WIN32
+    if (!MoveFileExA(
+        tmp_path,
+        path,
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    )) {
+        goto FAIL;
+    }
+#else
+    if (rename(tmp_path, path) != 0) goto FAIL;
+#endif
+
+    free(tmp_path);
     return 0;
 FAIL:
-    fclose(f);
+    if (f) fclose(f);
+    remove(tmp_path);
+    free(tmp_path);
     return -1;
 }
 
@@ -196,7 +232,7 @@ int load_checkpoint(
     char **dst_path_out,
     double *elapsed_total_out,
     double *elapsed_scp_out,
-    uint64_t *last_task_out
+    uint64_t *resume_task_out
 ) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -207,7 +243,7 @@ int load_checkpoint(
 
     uint32_t ver=0, ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0;
     if (read_u32(f, &ver) < 0) goto FAIL;
-    if (ver != CK_VERSION) goto FAIL;
+    if (ver < CK_OLDEST_SUPPORTED_VERSION || ver > CK_VERSION) goto FAIL;
 
     if (read_u32(f, &ni) < 0) goto FAIL;
     if (read_u32(f, &no) < 0) goto FAIL;
@@ -238,10 +274,10 @@ int load_checkpoint(
         if (read_str(f, &loaded_dst) < 0) { free(loaded_src); goto FAIL; }
     }
     double loaded_elapsed_total = 0.0, loaded_elapsed_scp = 0.0;
-    uint64_t loaded_last_task = 0ull;
+    uint64_t loaded_resume_task = 0ull;
     if (read_double(f, &loaded_elapsed_total) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
     if (read_double(f, &loaded_elapsed_scp) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
-    if (read_u64(f, &loaded_last_task) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
+    if (read_u64(f, &loaded_resume_task) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
 
     int *stopc = (int*)calloc((size_t)no, sizeof(int));
     if (!stopc) {
@@ -418,7 +454,7 @@ int load_checkpoint(
 
     if (elapsed_total_out) *elapsed_total_out = loaded_elapsed_total;
     if (elapsed_scp_out) *elapsed_scp_out = loaded_elapsed_scp;
-    if (last_task_out) *last_task_out = loaded_last_task;
+    if (resume_task_out) *resume_task_out = loaded_resume_task;
 
     *PInfo = pi;
     return 0;

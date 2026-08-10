@@ -2346,7 +2346,8 @@ void print_info(const char *INFO_PATH, const int info_level) {
     int ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0;
     int *stopc_tmp = NULL; int *nofvals_tmp = NULL;
     char *src_saved=NULL; char *dst_saved=NULL;
-    double elapsed_total = 0.0, elapsed_scp = 0.0; uint64_t last_task = 0ull;
+    double elapsed_total = 0.0, elapsed_scp = 0.0;
+    uint64_t resume_task = 0ull;
 
     if (load_checkpoint(
             INFO_PATH,
@@ -2367,7 +2368,7 @@ void print_info(const char *INFO_PATH, const int info_level) {
             &dst_saved,
             &elapsed_total,
             &elapsed_scp,
-            &last_task
+            &resume_task
     ) != 0) {
         fprintf(stderr, "Error: failed to load checkpoint from %s\n", INFO_PATH);
         return;
@@ -2388,9 +2389,14 @@ void print_info(const char *INFO_PATH, const int info_level) {
     uint64_t maxt = nchoosek(ni, ck);
 
     if (ck > 0 && maxt > 0) {
-        double pct = (double)(last_task + 1) * 100.0 / (double)maxt;
+        double pct = (double)resume_task * 100.0 / (double)maxt;
         if (pct > 100.0) pct = 100.0;
-        printf("Progress at k: task=%llu / %llu (%.2f%%)\n", (unsigned long long)last_task, (unsigned long long)maxt, pct);
+        printf(
+            "Progress at k: resume_task=%llu / %llu (%.2f%%)\n",
+            (unsigned long long)resume_task,
+            (unsigned long long)maxt,
+            pct
+        );
     }
 
     printf("Total time spent: %.3fs (%.3fs SCP)\n", elapsed_total, elapsed_scp);

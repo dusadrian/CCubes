@@ -44,7 +44,15 @@ Projection validation builds wildcard-aware OFF-row bit masks only for outputs w
 
 There is a minimal help system integrated into CCubes. Users can enable diagnostic logging with `-dbg<level>`; this provides insights into the minimization process and can be useful for troubleshooting. The debug levels are preliminary, and more detailed logging functionality will be added in the future.
 
-For very large heuristic runs, CCubes can save its state into a binary checkpoint file and exit when a specified `-l` time limit is reached. The process can be resumed later without re-specifying the input and output files. If the binary checkpoint file is not specified, it defaults to `chk_<basename(source)>.bin`. Even when `-r`esuming, another time limit can save a later intermediate checkpoint, overwriting the binary checkpoint unless a different path is given. Complete-prime certified mode does not support checkpoints. Checkpoint version 8 removes the retired certified-horizon state; older formats are intentionally not accepted.
+For very large heuristic runs, CCubes can save its state into a binary checkpoint file and exit when a specified `-l` time limit is reached. The process can be resumed later without re-specifying the input and output files. If the binary checkpoint file is not specified, it defaults to `chk_<basename(source)>.bin`. Even when `-r`esuming, another time limit can save a later intermediate checkpoint, overwriting the binary checkpoint unless a different path is given.
+
+`--checkpoint-every=<sec>` adds periodic checkpoints without ending the process. At each interval, the projection workers stop at a safe shared frontier, CCubes atomically replaces the checkpoint file, and generation continues at the same complexity level. When it is combined with `-l`, periodic checkpoints continue until the overall per-invocation time limit is reached; that final checkpoint still ends the process. For example, a seven-hour resumed run with hourly checkpoints is:
+
+```sh
+./ccubes -t16 -l25200=output096.chk --checkpoint-every=3600 -r=output096.chk
+```
+
+Checkpoint polling occurs during interruptible projection generation. A long covering solve cannot be serialized halfway through; an overdue checkpoint is written when generation next reaches a safe point. Complete-prime certified mode and the experimental MMCS generator do not support checkpoints. Checkpoint version 9 stores the earliest safe resume task and accepts existing version 8 files. Each save is first written beside the target as `<file>.tmp` and then replaces the target, so a failed partial write does not truncate the previous checkpoint.
 
 The binary checkpoint file can be inspected using the `-i` option with various progress information in the metadata.
 
@@ -77,6 +85,8 @@ Options:
                           plus an exact complete-chart solve (point rows only)
   -p                  : enable automatic equal-cardinality cover pooling
   -l<sec>[=<file>]    : time limit to save a checkpoint in the <file>
+  --checkpoint-every=<sec>
+                      : save periodically and continue running
   -r=<file>           : resume from checkpoint file
   -i<level>=<file>    : inspect checkpoint (print progress and metadata)
                           0 (default) progress report
