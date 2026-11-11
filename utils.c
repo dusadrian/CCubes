@@ -12,7 +12,6 @@
 #include "prime_check.h"
 #include "lock_stats.h"
 #include <assert.h>
-#include <errno.h>
 #include <float.h>
 #include <math.h>
 
@@ -144,53 +143,6 @@ void destroy_output_locks(ccubes_mutex *locks, int noutputs) {
         ccubes_mutex_destroy(&locks[o]);
     }
     free(locks);
-}
-
-bool env_flag_enabled(const char *name) {
-    const char *value = getenv(name);
-    if (!value || !*value) return false;
-
-    return (
-        strcmp(value, "0") != 0 &&
-        strcmp(value, "false") != 0 &&
-        strcmp(value, "FALSE") != 0 &&
-        strcmp(value, "no") != 0 &&
-        strcmp(value, "NO") != 0
-    );
-}
-
-bool parse_int_strict(const char *text, int *value) {
-    if (!text || !*text || !value) return false;
-
-    char *end = NULL;
-    errno = 0;
-    long parsed = strtol(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0') return false;
-    if (parsed < INT_MIN || parsed > INT_MAX) return false;
-
-    *value = (int)parsed;
-    return true;
-}
-
-bool parse_nonnegative_double(const char *text, double *value) {
-    if (!text || !*text || !value) return false;
-
-    char *end = NULL;
-    errno = 0;
-    double parsed = strtod(text, &end);
-    if (errno != 0 || end == text || *end != '\0') return false;
-    if (!isfinite(parsed) || parsed < 0.0) return false;
-
-    *value = parsed;
-    return true;
-}
-
-bool parse_hybrid_effort_level(const char *text, int *level) {
-    int parsed = 0;
-    if (!parse_int_strict(text, &parsed)) return false;
-    if (parsed < 0 || parsed > 2) return false;
-    *level = parsed;
-    return true;
 }
 
 void print_hybrid_stats(int output_index) {

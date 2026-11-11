@@ -37,25 +37,6 @@ void destroy_output_locks(
     int noutputs
 );
 
-bool env_flag_enabled(
-    const char *name
-);
-
-bool parse_int_strict(
-    const char *text,
-    int *value
-);
-
-bool parse_nonnegative_double(
-    const char *text,
-    double *value
-);
-
-bool parse_hybrid_effort_level(
-    const char *text,
-    int *level
-);
-
 void print_hybrid_stats(
     int output_index
 );

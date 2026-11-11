@@ -13,6 +13,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "main.h"
+#include "cli.h"
 #include "certified_stop.h"
 #include "checkpoint.h"
 #include "lock_stats.h"
@@ -21,7 +22,9 @@
 #include "plateau_probe.h"
 #include "bounded_mmcs.h"
 #include "cover_validation.h"
+#ifdef CCUBES_TESTING
 #include "projection_rwls.h"
+#endif
 
 #define CCUBES_AUTO_MMCS_MIN_PROJECTION_TASKS UINT64_C(8192)
 #define CCUBES_AUTO_MMCS_MIN_NODE_BUDGET UINT64_C(8192)
@@ -33,13 +36,7 @@
 #define CCUBES_AUTO_MMCS_MAX_NODE_LIMIT UINT64_C(100000000)
 #define CCUBES_AUTO_MMCS_MAX_TRIAL_THREADS 4
 
-typedef enum {
-    PI_GENERATOR_AUTO = 0,
-    PI_GENERATOR_PROJECTION,
-    PI_GENERATOR_MMCS,
-    PI_GENERATOR_COMPLETE_MMCS
-} PIGeneratorMode;
-
+#ifdef CCUBES_TESTING
 static const char *projection_rwls_status_name(
     ProjectionRWLSStatus status
 ) {
@@ -55,7 +52,7 @@ static const char *projection_rwls_status_name(
 /*
  * Experimental fixed-chart finisher. Keep it separate from prime generation:
  * it may select only columns already present at this projection boundary.
- * Four logical families make the searched work independent of -t; physical
+ * Four logical families make the searched work independent of --threads; physical
  * workers change elapsed time, not the deterministic family prefix.
  */
 static bool try_projection_rwls(
@@ -68,11 +65,6 @@ static bool try_projection_rwls(
     int *solution,
     int *cardinality
 ) {
-    const bool enabled = env_flag_enabled(
-        "CCUBES_TEST_PROJECTION_RWLS"
-    );
-    if (!enabled) return false;
-
     if (!projection_rwls_should_run(
         true,
         certified_mode,
@@ -166,6 +158,8 @@ static bool try_projection_rwls(
     free(candidate);
     return improved;
 }
+
+#endif /* CCUBES_TESTING */
 
 /*
  * Keep the ordinary sharing-aware incumbent in a boundary pool.  Pool
@@ -486,49 +480,24 @@ static bool mmcs_branching_plausible(int b, int k, uint64_t budget) {
     return true;
 }
 
-void help() {
-    printf("Usage: ccubes [options] source.pla [dest.pla]\n");
-    printf("Options:\n");
-    printf("  -b<number>           : bits per word, either 8, 16, 32, 64 (default) or 128\n");
-    printf("  -t<number>           : number of CPU worker threads to use\n");
-    printf("  -w<number>           : weights applied to the prime implicants:\n");
-    printf("                           0 no weight\n");
-    printf("                           1 (default) weight based on complexity levels k\n");
-    printf("                           2 additional weight if shared between outputs\n");
-    printf("  -s<number>           : how to solve the covering problem:\n");
-    printf("                           0 (default) bundled hybrid solver\n");
-    printf("                             (presolve + Lagrangian bounds + bounded exact search)\n");
-    printf("                           1 Gurobi exact\n");
-    printf("  -e<number>           : hybrid solver effort level:\n");
-    printf("                           0 (default) small probe, then stop at first plateau\n");
-    printf("                           1 stronger bounds plus adaptive plateau handling\n");
-    printf("                           2 strong bounds plus a larger plateau probe\n");
-    printf("  -d                   : deterministic PI ordering on multi-thread search\n");
-    printf("  -g                   : print the adaptive blocking diagnostic at the first plateau\n");
-    printf("  -c                   : certify a global minimum cover by complete-prime\n");
-    printf("                         enumeration plus an exact complete-chart solve\n");
-    printf("                         (fully specified binary point rows only)\n");
-    printf("  -p                   : enable automatic equal-cardinality cover pooling\n");
-    printf("  -l<sec>[=<file>]     : time limit to save a checkpoint in the <file>\n");
-    printf("  --checkpoint-every=<sec>\n");
-    printf("                       : save periodically and continue running\n");
-    printf("  -r=<file>            : resume from checkpoint file\n");
-    printf("  -i<level>=<file>     : inspect checkpoint (print progress and metadata)\n");
-    printf("                           0 (default) progress report\n");
-    printf("                           1 complete metadata about each output\n");
-    printf("  -dbg<level>[=<file>] : incremental debug information\n");
-    printf("                           0 (default) errors + warnings\n");
-    printf("                           1 errors + warnings + info\n");
-    printf("                           2 everything (trace)\n");
-    printf("  -h, --help           : show this help message\n");
-}
-
 int main(int argc, char *argv[]) {
 
     if (argc < 2) {
-        help();
+        cli_help(stdout);
         return 1;
     }
+
+    CliOptions options;
+    int parse_result = cli_parse(argc, argv, &options, stderr);
+    if (parse_result > 0) {
+        cli_help(stdout);
+        return 0;
+    }
+    if (parse_result < 0) return 1;
+    if (options.legacy_options) {
+        fprintf(stderr, "Warning: short options are deprecated; use the long options in --help.\n");
+    }
+    if (options.debug) debug_init(options.debug_file, options.debug_level);
 
     bool gurobi_ok = false;
 
@@ -540,230 +509,44 @@ int main(int argc, char *argv[]) {
     // defaults
     int search_level = 1;
     const int STOP_AFTER_EQUALITY = 1;
-    int BITS_PER_WORD = 64;
-    int THREADS = 0; // max by default
-    bool THREADS_FORCED = false; // set to true if -t is provided
-    int WEIGHT_PIC = 1;
-    int SCP_TYPE = 0;
-    int HYBRID_EFFORT_LEVEL = 0;
-    int POOL_MAX = 1; // collect up to this many solutions
+    int BITS_PER_WORD = options.bits_per_word;
+    int THREADS = options.threads; // 0 selects available cores
+    bool THREADS_FORCED = THREADS > 0;
+    int WEIGHT_PIC = options.weights;
+    int SCP_TYPE = options.solver;
+    int HYBRID_EFFORT_LEVEL = options.effort;
+    int POOL_MAX = options.pool ? CCUBES_POOL_STORAGE_CAPACITY : 1;
     /*
      * Current-level coverage deduplication is always deferred until the level
      * is complete, keeping the worker-side index immutable and lock-free.
      * This flag controls only whether records are canonically sorted before
      * the common pruning/finalization pass.
      */
-    bool DETERMINISTIC_PI_ORDER = env_flag_enabled("CCUBES_DETERMINISTIC");
+    bool DETERMINISTIC_PI_ORDER = options.deterministic;
     PIGeneratorMode PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
-    bool CERTIFIED_MODE = false;
-    bool REPORT_BLOCKING_DIAGNOSTIC = false;
-    char *SRC_FILE = NULL;
-    char *DST_FILE = NULL;
+#ifdef CCUBES_TESTING
+    PI_GENERATOR_MODE = options.test_pi_generator;
+#endif
+    bool CERTIFIED_MODE = options.certify;
+    bool REPORT_BLOCKING_DIAGNOSTIC = options.blocking_diagnostic;
+    char *SRC_FILE = options.source;
+    char *DST_FILE = options.destination;
     // resume timing bases
     double BASE_ELAPSED = 0.0;
     double BASE_SCP = 0.0;
 
     // checkpoint/time limit
-    double TIME_LIMIT_SEC = 0.0;
-    double CHECKPOINT_INTERVAL_SEC = 0.0;
-    char *CHK_SAVE_PATH = NULL;
-    char *RESUME_PATH = NULL;
-    char *INFO_PATH = NULL; // -i: inspect checkpoint file
+    double TIME_LIMIT_SEC = options.time_limit;
+    double CHECKPOINT_INTERVAL_SEC = options.checkpoint_every;
+    char *CHK_SAVE_PATH = options.checkpoint;
+    char *RESUME_PATH = options.resume;
+    char *INFO_PATH = options.inspect;
     int RESUME_K = -1;
     // resume progress for current k
     uint64_t RESUME_TASK = 0ull;
     bool HAS_RESUME_TASK = false;
 
-    int info_level = 0;
-
-    // parse arguments
-    for (int i = 1; i < argc; i++) {
-        if (
-            strncmp(argv[i], "-dbg", 4) == 0 ||
-            strncmp(argv[i], "-debug", 6) == 0
-        ) {
-            size_t prefix_length = strncmp(argv[i], "-dbg", 4) == 0 ? 4u : 6u;
-            char *opt = argv[i] + prefix_length;
-            char *eq = strchr(opt, '=');
-            int debug_level = 0;
-            const char *file = NULL;
-
-            if (eq) {
-                *eq = '\0';
-                debug_level = atoi(opt);
-                file = eq + 1;
-            } else {
-                debug_level = atoi(opt);
-            }
-
-            if (debug_level < 0 || debug_level > 2) {
-                fprintf(stderr, "Invalid debug level: %d (must be 0-2)\n", debug_level);
-                help();
-                return 1;
-            }
-            debug_init(file, debug_level);
-        } else if (strcmp(argv[i], "--checkpoint-every") == 0) {
-            if (
-                i + 1 >= argc ||
-                !parse_nonnegative_double(
-                    argv[++i],
-                    &CHECKPOINT_INTERVAL_SEC
-                )
-            ) {
-                fprintf(
-                    stderr,
-                    "Error: --checkpoint-every requires nonnegative seconds.\n"
-                );
-                return 1;
-            }
-        } else if (strncmp(argv[i], "--checkpoint-every=", 19) == 0) {
-            const char *opt = argv[i] + 19;
-            if (!parse_nonnegative_double(opt, &CHECKPOINT_INTERVAL_SEC)) {
-                fprintf(
-                    stderr,
-                    "Invalid checkpoint interval: %s "
-                    "(must be nonnegative seconds)\n",
-                    opt
-                );
-                return 1;
-            }
-        } else if (strcmp(argv[i], "-d") == 0) {
-            DETERMINISTIC_PI_ORDER = true;
-        } else if (strcmp(argv[i], "-c") == 0) {
-            CERTIFIED_MODE = true;
-        } else if (strcmp(argv[i], "-g") == 0) {
-            REPORT_BLOCKING_DIAGNOSTIC = true;
-        } else if (strncmp(argv[i], "-b", 2) == 0) {
-            BITS_PER_WORD = atoi(argv[i] + 2);
-            if (
-                BITS_PER_WORD != 8 && BITS_PER_WORD != 16 &&
-                BITS_PER_WORD != 32 && BITS_PER_WORD != 64 &&
-                BITS_PER_WORD != 128
-            ) {
-                fprintf(stderr, "Invalid bits per word: %d (must be 8, 16, 32, 64, or 128)\n", BITS_PER_WORD);
-                help();
-                return 1;
-            }
-        } else if (strncmp(argv[i], "-w", 2) == 0) {
-            WEIGHT_PIC = atoi(argv[i] + 2);
-            if (WEIGHT_PIC < 0 || WEIGHT_PIC > 2) {
-                fprintf(stderr, "Invalid weight option: %d (must be 0, 1, or 2)\n", WEIGHT_PIC);
-                help();
-                return 1;
-            }
-        } else if (strncmp(argv[i], "-s", 2) == 0) {
-            SCP_TYPE = atoi(argv[i] + 2);
-            if (SCP_TYPE != 0 && SCP_TYPE != 1) {
-                fprintf(stderr, "Invalid SCP solver: %d (must be 0 or 1)\n", SCP_TYPE);
-                help();
-                return 1;
-            }
-        } else if (strcmp(argv[i], "-e") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Error: -e requires an effort level (0, 1, or 2)\n");
-                return 1;
-            }
-            if (!parse_hybrid_effort_level(argv[++i], &HYBRID_EFFORT_LEVEL)) {
-                fprintf(stderr, "Invalid hybrid effort level: %s (must be 0, 1, or 2)\n", argv[i]);
-                help();
-                return 1;
-            }
-        } else if (strncmp(argv[i], "-e", 2) == 0) {
-            if (!parse_hybrid_effort_level(argv[i] + 2, &HYBRID_EFFORT_LEVEL)) {
-                fprintf(stderr, "Invalid hybrid effort level: %s (must be 0, 1, or 2)\n", argv[i] + 2);
-                help();
-                return 1;
-            }
-        } else if (strncmp(argv[i], "-t", 2) == 0) {
-            if (!parse_int_strict(argv[i] + 2, &THREADS) || THREADS < 0) {
-                fprintf(stderr, "Invalid thread count: %s (must be a nonnegative integer)\n", argv[i] + 2);
-                help();
-                return 1;
-            }
-            THREADS_FORCED = true;
-        } else if (strcmp(argv[i], "-p") == 0) {
-            POOL_MAX = CCUBES_POOL_STORAGE_CAPACITY;
-        } else if (strncmp(argv[i], "-p", 2) == 0) {
-            fprintf(
-                stderr,
-                "Error: -p is a Boolean switch and does not accept a number.\n"
-            );
-            help();
-            return 1;
-        } else if (strncmp(argv[i], "-l", 2) == 0) {
-            char *opt = argv[i] + 2;  // string after "-l"
-            char *eq  = strchr(opt, '=');
-            if (eq) {
-                *eq = '\0';
-                CHK_SAVE_PATH  = eq + 1;
-            }
-            if (!parse_nonnegative_double(opt, &TIME_LIMIT_SEC)) {
-                fprintf(stderr, "Invalid time limit: %s (must be nonnegative seconds)\n", opt);
-                help();
-                return 1;
-            }
-        } else if (strncmp(argv[i], "-r", 2) == 0) {
-            // Support -r=<file> (preferred) and legacy -r<file>
-            if (argv[i][2] == '=') {
-                RESUME_PATH = argv[i] + 3;
-            } else if (argv[i][2] != '\0') {
-                RESUME_PATH = argv[i] + 2;
-            } else if (i + 1 < argc) {
-                RESUME_PATH = argv[++i];
-            } else {
-                fprintf(stderr, "Error: -r requires a file path (use -r=<file>)\n");
-                return 1;
-            }
-        } else if (strncmp(argv[i], "-i", 2) == 0) {
-            char *opt = argv[i] + 2;  // string after "-i"
-            char *eq  = strchr(opt, '=');
-            if (eq) {
-                *eq = '\0';
-                info_level = atoi(opt);
-                INFO_PATH  = eq + 1;
-            } else {
-                fprintf(stderr, "Error: -i requires a file path (use -i<level>=<file>)\n");
-                return 1;
-            }
-            if (info_level < 0 || info_level > 1) {
-                fprintf(stderr, "Invalid info level: %d (must be 0 or 1)\n", info_level);
-                help();
-                return 1;
-            }
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            help();
-            return 0;
-        } else if (argv[i][0] == '-') {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            help();
-            return 1;
-        } else if (!SRC_FILE) {
-            SRC_FILE = argv[i];
-        } else if (!DST_FILE) {
-            DST_FILE = argv[i];
-        } else {
-            fprintf(stderr, "Unknown argument: %s\n", argv[i]);
-            help();
-            return 1;
-        }
-    }
-
-    /* Internal differential-test control; intentionally not a command option. */
-    const char *test_pi_generator = getenv("CCUBES_TEST_PI_GENERATOR");
-    if (test_pi_generator && *test_pi_generator) {
-        if (strcmp(test_pi_generator, "auto") == 0) {
-            PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
-        } else if (strcmp(test_pi_generator, "projection") == 0) {
-            PI_GENERATOR_MODE = PI_GENERATOR_PROJECTION;
-        } else if (strcmp(test_pi_generator, "mmcs") == 0) {
-            PI_GENERATOR_MODE = PI_GENERATOR_MMCS;
-        } else if (strcmp(test_pi_generator, "complete-mmcs") == 0) {
-            PI_GENERATOR_MODE = PI_GENERATOR_COMPLETE_MMCS;
-        } else {
-            fprintf(stderr, "Error: invalid internal PI generator override.\n");
-            return 1;
-        }
-    }
+    int info_level = options.inspect_level;
 
     /*
      * Certified mode has one production proof: complete transactional prime
@@ -777,7 +560,7 @@ int main(int argc, char *argv[]) {
         } else if (PI_GENERATOR_MODE != PI_GENERATOR_COMPLETE_MMCS) {
             fprintf(
                 stderr,
-                "Error: -c uses complete-prime certification and cannot be "
+                "Error: --certify uses complete-prime certification and cannot be "
                 "combined with projection or bounded-level MMCS.\n"
             );
             return 1;
@@ -810,7 +593,7 @@ int main(int argc, char *argv[]) {
 
     if (!SRC_FILE && !RESUME_PATH) {
         fprintf(stderr, "Error: source .pla file is required.\n");
-        help();
+        cli_help(stderr);
         return 1;
     }
 
@@ -846,7 +629,7 @@ int main(int argc, char *argv[]) {
     if (PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS && !CERTIFIED_MODE) {
         fprintf(
             stderr,
-            "Error: complete MMCS is a global certification mode and requires -c.\n"
+            "Error: complete MMCS is a global certification mode and requires --certify.\n"
         );
         return 1;
     }
@@ -1018,7 +801,7 @@ int main(int argc, char *argv[]) {
     if (!adaptive_stopping_supported && CERTIFIED_MODE) {
         fprintf(
             stderr,
-            "Error: -c certified stopping requires nonconflicting, fully "
+            "Error: --certify certified stopping requires nonconflicting, fully "
             "specified binary point rows with nonempty ON and OFF sets.\n"
         );
         free(chk_stop_counter);
@@ -1120,7 +903,7 @@ int main(int argc, char *argv[]) {
     } else if (PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS) {
         fprintf(
             stderr,
-            "Notice: -c uses complete-prime MMCS certification.\n"
+            "Notice: --certify uses complete-prime MMCS certification.\n"
         );
     } else if (PI_GENERATOR_MODE == PI_GENERATOR_PROJECTION) {
         fprintf(stderr, "Notice: forcing projection PI generation.\n");
@@ -1135,7 +918,7 @@ int main(int argc, char *argv[]) {
         if (REPORT_BLOCKING_DIAGNOSTIC) {
             fprintf(
                 stderr,
-                "Notice: -g is ignored because the blocking diagnostic requires point rows.\n"
+                "Notice: --blocking-diagnostic is ignored because the blocking diagnostic requires point rows.\n"
             );
             REPORT_BLOCKING_DIAGNOSTIC = false;
         }
@@ -1191,8 +974,8 @@ int main(int argc, char *argv[]) {
     THREADS = ccubes_effective_thread_count(THREADS);
     ccubes_set_thread_count(THREADS);
 
-    /* opt-in (CCUBES_LOCK_STATS=1) profiling of the PI-insertion locks */
-    if (!lock_stats_init(THREADS, noutputs)) {
+    /* Explicit opt-in profiling of the PI-insertion locks. */
+    if (!lock_stats_init(options.lock_stats, THREADS, noutputs)) {
         fprintf(stderr, "Error: lock statistics allocation failed\n");
         return 1;
     }
@@ -1320,7 +1103,7 @@ int main(int argc, char *argv[]) {
                 fprintf(
                     stderr,
                     "Notice: output %d resumed at a stored heuristic plateau; "
-                    "use a fresh -c run for global certification.\n",
+                    "use a fresh --certify run for global certification.\n",
                     o + 1
                 );
             }
@@ -2096,7 +1879,8 @@ int main(int argc, char *argv[]) {
                         *prevsolmin <= ON_minterms &&
                         *solmin >= *prevsolmin &&
                         stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
-                    if (probe_due && SCP_TYPE == 0) {
+#ifdef CCUBES_TESTING
+                    if (options.test_projection_rwls && probe_due && SCP_TYPE == 0) {
                         (void)try_projection_rwls(
                             &chart,
                             k,
@@ -2114,6 +1898,7 @@ int main(int argc, char *argv[]) {
                             *solmin >= *prevsolmin &&
                             stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
                     }
+#endif
                     if (probe_due) {
                         const int pre_probe_found = *foundPI;
                         const uint64_t pair_limit =
@@ -2533,13 +2318,14 @@ int main(int argc, char *argv[]) {
                         return 1;
                     }
 
+#ifdef CCUBES_TESTING
                     const bool rwls_due =
                         adaptive_stopping_supported &&
                         PInfo[o].prevsolmin > 1 &&
                         PInfo[o].prevsolmin <= ON_minterms &&
                         *solmin >= PInfo[o].prevsolmin &&
                         stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
-                    if (rwls_due && SCP_TYPE == 0) {
+                    if (options.test_projection_rwls && rwls_due && SCP_TYPE == 0) {
                         (void)try_projection_rwls(
                             &chart,
                             k,
@@ -2551,6 +2337,8 @@ int main(int argc, char *argv[]) {
                             solmin
                         );
                     }
+
+#endif
 
                     int baseline_solmin = *solmin;
                     memcpy(

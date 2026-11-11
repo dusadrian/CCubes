@@ -31,9 +31,8 @@ uint64_t lock_stats_now_ns(void) {
     return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
 }
 
-bool lock_stats_init(int threads, int noutputs) {
-    const char *flag = getenv("CCUBES_LOCK_STATS");
-    if (!flag || flag[0] == '\0' || flag[0] == '0') return true;
+bool lock_stats_init(bool enabled, int threads, int noutputs) {
+    if (!enabled) return true;
     if (threads <= 0 || noutputs <= 0) return true;
 
     /*

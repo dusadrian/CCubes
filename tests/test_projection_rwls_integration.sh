@@ -4,13 +4,13 @@ set -eu
 ccubes=${1:-./ccubes}
 exact_fixture=${2:-examples/certified_F2.pla}
 improvement_fixture=${3:-examples/boom_15x1x300.pla}
+test_bin=${4:-./.build/ccubes-testing}
 work=$(mktemp -d "${TMPDIR:-/tmp}/ccubes_projection_rwls.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
-"$ccubes" -t1 -d -e0 "$exact_fixture" "$work/exact-base.pla" \
+"$ccubes" --threads=1 --deterministic --effort=0 "$exact_fixture" "$work/exact-base.pla" \
     >"$work/exact-base.log" 2>&1
-CCUBES_TEST_PROJECTION_RWLS=1 \
-"$ccubes" -t1 -d -e0 "$exact_fixture" "$work/exact-rwls.pla" \
+"$test_bin" --test-projection-rwls --threads=1 --deterministic --effort=0 "$exact_fixture" "$work/exact-rwls.pla" \
     >"$work/exact-rwls.log" 2>&1
 
 grep -q \
@@ -18,11 +18,10 @@ grep -q \
     "$work/exact-rwls.log"
 cmp "$work/exact-base.pla" "$work/exact-rwls.pla"
 
-"$ccubes" -t4 -d -e0 \
+"$ccubes" --threads=4 --deterministic --effort=0 \
     "$improvement_fixture" "$work/improvement-base.pla" \
     >"$work/improvement-base.log" 2>&1
-CCUBES_TEST_PROJECTION_RWLS=1 \
-"$ccubes" -t4 -d -e0 \
+"$test_bin" --test-projection-rwls --threads=4 --deterministic --effort=0 \
     "$improvement_fixture" "$work/improvement-rwls.pla" \
     >"$work/improvement-rwls.log" 2>&1
 

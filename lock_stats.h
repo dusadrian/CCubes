@@ -16,7 +16,7 @@
 /*
  * Opt-in contention profiling for the per-output PI-insertion locks.
  *
- * Enabled with CCUBES_LOCK_STATS=1. Counters are per (thread, output) in
+ * Enabled with --lock-stats. Counters are per (thread, output) in
  * separately allocated rows so the profiling itself neither contends nor
  * false-shares; totals are combined only in the final report.
  *
@@ -25,11 +25,11 @@
  * speedup is no matter how many cores are added.
  */
 
-/* True when CCUBES_LOCK_STATS is set; read directly in the hot path. */
+/* True when profiling is enabled; read directly in the hot path. */
 extern bool lock_stats_active;
 
-/* Reads the env switch and allocates the counters. Safe to call once. */
-bool lock_stats_init(int threads, int noutputs);
+/* Allocates counters when explicitly enabled. Safe to call once. */
+bool lock_stats_init(bool enabled, int threads, int noutputs);
 
 uint64_t lock_stats_now_ns(void);
 

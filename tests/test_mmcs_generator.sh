@@ -6,10 +6,11 @@ forced_fixture=${2:-examples/mmcs_forced_100x1.pla}
 small_fixture=${3:-examples/certified_F2.pla}
 dense_fixture=${4:-examples/rnd_20x10x40.pla}
 complete_fixture=${5:-examples/certified_two_term.pla}
+test_bin=${6:-./.build/ccubes-testing}
 tmp_prefix=/tmp/ccubes_mmcs_generator_$$
 trap 'rm -f "${tmp_prefix}"_*' EXIT HUP INT TERM
 
-"$bin" -t1 -e0 -dbg1 \
+"$bin" --threads=1 --effort=0 --debug=1 \
     "$forced_fixture" "${tmp_prefix}_forced.pla" \
     >"${tmp_prefix}_forced.log" 2>&1
 
@@ -20,12 +21,10 @@ grep -q 'CCUBES_PI_GENERATOR level=6 selected=mmcs' \
 grep -q 'deterministic PI order: no' \
     "${tmp_prefix}_forced.log"
 
-CCUBES_TEST_PI_GENERATOR=projection \
-"$bin" -t1 -d -e0 -dbg1 \
+"$test_bin" --test-pi-generator=projection --threads=1 --deterministic --effort=0 --debug=1 \
     "$small_fixture" "${tmp_prefix}_projection.pla" \
     >"${tmp_prefix}_projection.log" 2>&1
-CCUBES_TEST_PI_GENERATOR=mmcs \
-"$bin" -t1 -d -e0 \
+"$test_bin" --test-pi-generator=mmcs --threads=1 --deterministic --effort=0 \
     "$small_fixture" "${tmp_prefix}_mmcs.pla" \
     >"${tmp_prefix}_mmcs.log" 2>&1
 
@@ -33,29 +32,29 @@ grep -q 'deterministic PI order: yes' \
     "${tmp_prefix}_projection.log"
 cmp "${tmp_prefix}_projection.pla" "${tmp_prefix}_mmcs.pla"
 
-if CCUBES_TEST_PI_GENERATOR=complete-mmcs "$bin" -t1 \
+if "$test_bin" --test-pi-generator=complete-mmcs --threads=1 \
     "$complete_fixture" "${tmp_prefix}_complete_without_c.pla" \
     >"${tmp_prefix}_complete_without_c.log" 2>&1; then
-    echo "complete-mmcs unexpectedly ran without -c" >&2
+    echo "complete-mmcs unexpectedly ran without --certify" >&2
     exit 1
 fi
-grep -q 'complete MMCS is a global certification mode and requires -c' \
+grep -q 'complete MMCS is a global certification mode and requires --certify' \
     "${tmp_prefix}_complete_without_c.log"
 
-if CCUBES_TEST_PI_GENERATOR=projection "$bin" -t1 -c \
+if "$test_bin" --test-pi-generator=projection --threads=1 --certify \
     "$complete_fixture" "${tmp_prefix}_legacy_certificate.pla" \
     >"${tmp_prefix}_legacy_certificate.log" 2>&1; then
-    echo "-c unexpectedly accepted the retired horizon generator" >&2
+    echo "--certify unexpectedly accepted the retired horizon generator" >&2
     exit 1
 fi
 grep -q -- \
-    '-c uses complete-prime certification and cannot be combined with projection' \
+    '--certify uses complete-prime certification and cannot be combined with projection' \
     "${tmp_prefix}_legacy_certificate.log"
 
-"$bin" -t1 -d -c -s0 -e2 -w0 -dbg1 \
+"$bin" --threads=1 --deterministic --certify --solver=hybrid --effort=2 --weights=none --debug=1 \
     "$complete_fixture" "${tmp_prefix}_complete.pla" \
     >"${tmp_prefix}_complete.log" 2>&1
-grep -q 'Notice: -c uses complete-prime MMCS certification' \
+grep -q 'Notice: --certify uses complete-prime MMCS certification' \
     "${tmp_prefix}_complete.log"
 grep -q 'CCUBES_PI_GENERATOR level=1 selected=complete-mmcs' \
     "${tmp_prefix}_complete.log"
@@ -74,11 +73,10 @@ grep -q \
 grep -q '^000 1$' "${tmp_prefix}_complete.pla"
 grep -q '^111 1$' "${tmp_prefix}_complete.pla"
 
-"$bin" -t4 -d -e0 -dbg1 \
+"$bin" --threads=4 --deterministic --effort=0 --debug=1 \
     "$dense_fixture" "${tmp_prefix}_auto_dense.pla" \
     >"${tmp_prefix}_auto_dense.log" 2>&1
-CCUBES_TEST_PI_GENERATOR=projection \
-"$bin" -t4 -d -e0 \
+"$test_bin" --test-pi-generator=projection --threads=4 --deterministic --effort=0 \
     "$dense_fixture" "${tmp_prefix}_projection_dense.pla" \
     >"${tmp_prefix}_projection_dense.log" 2>&1
 

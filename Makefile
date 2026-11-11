@@ -81,10 +81,18 @@ ifeq ($(SAN),1)
 endif
 
 # Sources and target
-SRC  := $(wildcard *.c)
+# Keep production membership explicit so stray experimental .c files cannot
+# silently enter the executable. RWLS is linked only into the test build.
+SRC := binomial.c bounded_mmcs.c ccubes_threads.c certified_stop.c checkpoint.c \
+       cli.c cover_validation.c debug.c gurobi.c lagrangian.c lock_stats.c \
+       main.c plateau_probe.c pool_selection.c prime_check.c subsumption_index.c utils.c
+TEST_SRC := $(SRC) projection_rwls.c
 OBJ  := $(SRC:.c=.o)
 DEP  := $(OBJ:.o=.d)
 BIN  := ccubes
+TEST_BIN := .build/ccubes-testing
+TEST_OBJ := $(addprefix .build/testing/,$(TEST_SRC:.c=.o))
+TEST_DEP := $(TEST_OBJ:.o=.d)
 
 # Track project-header dependencies so incremental builds cannot mix object
 # files compiled against different structure layouts.
@@ -170,7 +178,7 @@ check-gurobi:
 
 # If we built with -DHAVE_GUROBI in CFLAGS, ensure we verify license at build time
 ifeq ($(filter -DHAVE_GUROBI,$(CFLAGS)),-DHAVE_GUROBI)
-  $(BIN): check-gurobi
+  $(BIN) $(TEST_BIN): check-gurobi
 endif
 
 # Build rules: indent using TABS
@@ -183,10 +191,17 @@ $(BIN): $(OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-clean:
-	rm -f $(OBJ) $(DEP) $(BIN)
+$(TEST_BIN): $(TEST_OBJ)
+	$(CC) $(TEST_OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
 
--include $(DEP)
+.build/testing/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DCCUBES_TESTING -c $< -o $@
+
+clean:
+	rm -f $(OBJ) $(DEP) $(BIN) $(TEST_OBJ) $(TEST_DEP) $(TEST_BIN)
+
+-include $(DEP) $(TEST_DEP)
 
 # Unit tests link only the module under test, so they stay fast and do not
 # need the Gurobi or OpenMP configuration above.
@@ -194,7 +209,7 @@ TEST_CFLAGS := -Wall -O2 -I.
 TEST_LIBS   := -lm
 
 .PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-projection-rwls test-projection-rwls-integration test-bounded-mmcs test-mmcs-generator test-effort-policy test-periodic-checkpoint
-test: test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-projection-rwls test-projection-rwls-integration test-bounded-mmcs test-mmcs-generator test-effort-policy test-periodic-checkpoint
+test: test-cli test-cli-integration test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-projection-rwls test-projection-rwls-integration test-bounded-mmcs test-mmcs-generator test-effort-policy test-periodic-checkpoint
 
 test-cover-validation:
 	$(CC) $(TEST_CFLAGS) tests/test_cover_validation.c cover_validation.c -o /tmp/ccubes_test_cover_validation $(TEST_LIBS)
@@ -247,18 +262,28 @@ test-projection-rwls:
 	$(CC) $(TEST_CFLAGS) tests/test_projection_rwls.c projection_rwls.c ccubes_threads.c cover_validation.c -o /tmp/ccubes_test_projection_rwls $(TEST_LIBS)
 	/tmp/ccubes_test_projection_rwls
 
-test-projection-rwls-integration: $(BIN)
-	sh tests/test_projection_rwls_integration.sh ./$(BIN) examples/certified_F2.pla examples/boom_15x1x300.pla
+test-projection-rwls-integration: $(BIN) $(TEST_BIN)
+	sh tests/test_projection_rwls_integration.sh ./$(BIN) examples/certified_F2.pla examples/boom_15x1x300.pla ./$(TEST_BIN)
 
 test-bounded-mmcs:
 	$(CC) $(TEST_CFLAGS) tests/test_bounded_mmcs.c bounded_mmcs.c -o /tmp/ccubes_test_bounded_mmcs $(TEST_LIBS)
 	/tmp/ccubes_test_bounded_mmcs
 
-test-mmcs-generator: $(BIN)
-	sh tests/test_mmcs_generator.sh ./$(BIN) examples/mmcs_forced_100x1.pla examples/certified_F2.pla examples/rnd_20x10x40.pla
+test-mmcs-generator: $(BIN) $(TEST_BIN)
+	sh tests/test_mmcs_generator.sh ./$(BIN) examples/mmcs_forced_100x1.pla examples/certified_F2.pla examples/rnd_20x10x40.pla examples/certified_two_term.pla ./$(TEST_BIN)
 
 test-periodic-checkpoint: $(BIN)
 	sh tests/test_periodic_checkpoint.sh ./$(BIN) examples/rnd_20x10x40.pla
 
 test-effort-policy: $(BIN)
 	sh tests/test_effort_policy.sh ./$(BIN) examples/certified_F2.pla
+
+.PHONY: test-cli test-cli-integration
+test-cli:
+	$(CC) $(TEST_CFLAGS) tests/test_cli.c cli.c -o /tmp/ccubes_test_cli $(TEST_LIBS)
+	/tmp/ccubes_test_cli
+	$(CC) $(TEST_CFLAGS) -DCCUBES_TESTING tests/test_cli.c cli.c -o /tmp/ccubes_test_cli_research $(TEST_LIBS)
+	/tmp/ccubes_test_cli_research
+
+test-cli-integration: $(BIN)
+	sh tests/test_cli.sh ./$(BIN)

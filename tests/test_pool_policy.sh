@@ -6,9 +6,9 @@ fixture=${2:-examples/pool_positive.pla}
 work=$(mktemp -d "${TMPDIR:-/tmp}/ccubes_pool_policy.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
-"$ccubes" -d -w2 -t1 -e0 "$fixture" "$work/w2.pla" \
+"$ccubes" --deterministic --weights=sharing --threads=1 --effort=0 "$fixture" "$work/w2.pla" \
     >"$work/w2.log" 2>&1
-"$ccubes" -d -w1 -t1 -e0 -p -dbg1 "$fixture" "$work/pool.pla" \
+"$ccubes" --deterministic --weights=complexity --threads=1 --effort=0 --pool --debug=1 "$fixture" "$work/pool.pla" \
     >"$work/pool.log" 2>&1
 
 # The first feasible boundary improves the primary cover and must not enumerate.
