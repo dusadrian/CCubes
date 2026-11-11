@@ -61,6 +61,21 @@ void certified_stop_observe_complete_prime_chart(
     if (state) state->complete_prime_chart = true;
 }
 
+/*
+ * Soundness of the horizon branch:
+ *
+ * Any valid implicant covering two distinct ON rows fixes only coordinates on
+ * which those rows agree.  Its level is therefore at most their agreement
+ * count, and their (more specific) agreement supercube is valid as well.
+ * Consequently every prime deeper than A_max covers at most one ON row.
+ *
+ * At k_cov the retained chart already contains an implicant covering each ON
+ * row.  In any later cover, replace each newly generated singleton-cover
+ * implicant with one retained implicant covering the same row.  This never
+ * increases cardinality, so singleton-only additions beyond A_max cannot
+ * improve the retained chart's exact optimum.  Hence the horizon branch also
+ * requires boundary_exact.
+ */
 bool certified_stop_should_stop(
     const CertifiedStopState *state,
     int cover_size,

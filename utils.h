@@ -37,6 +37,11 @@ void destroy_output_locks(
     int noutputs
 );
 
+bool parse_int_strict(
+    const char *text,
+    int *value
+);
+
 void print_hybrid_stats(
     int output_index
 );
@@ -140,11 +145,6 @@ typedef struct ThreadBuffer {
     uint64_t *task_config_bits;
     size_t    task_config_word_capacity;
     int       found;
-#ifdef CCUBES_TESTING
-    uint64_t  validation_attempts;
-    uint64_t  scalar_off_rows_projected;
-    size_t    scalar_config_scratch_bytes;
-#endif
 } ThreadBuffer;
 
 /*
@@ -261,7 +261,7 @@ char *prefix_basename(
     const char *prefix
 );
 
-void print_info(
+int print_info(
     const char *path,
     const int info_level
 );
@@ -283,7 +283,8 @@ int process_task(
     PICoverageIndex *coverage_indices,
     int *max_shared,
     int increase,
-    int *multiplier
+    int *multiplier,
+    bool retain_all_prime_geometries
 );
 
 bool build_pi_coverage_indices(
@@ -304,14 +305,16 @@ int finalize_pi_level(
     int implicant_words,
     int level_start,
     bool deterministic_order,
-    bool preserve_shared_geometries
+    bool preserve_shared_geometries,
+    bool retain_all_prime_geometries
 );
 
 int canonicalize_pi_order(
     PIstorage *PInfo,
     int implicant_words,
     int level_start,
-    bool preserve_shared_geometries
+    bool preserve_shared_geometries,
+    bool retain_all_prime_geometries
 );
 
 #endif // UTILS_H

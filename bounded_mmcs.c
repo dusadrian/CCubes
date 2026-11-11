@@ -7,10 +7,17 @@
 */
 
 #include "bounded_mmcs.h"
+#include "ccubes_threads.h"
 
 #include <limits.h>
+#include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#define WEIGHTED_MMCS_REDUCED_COST_TOL 1e-8
+#define WEIGHTED_MMCS_TIMEOUT_BOUND_WORK UINT64_C(1000000)
 
 typedef struct {
     int ninputs;
@@ -20,6 +27,10 @@ typedef struct {
     int target_size;
     bool exact_size;
     const uint64_t *edges;
+    const WeightedMMCSPreparedRows *prepared;
+    const uint64_t *anchor_bits;
+    int anchor_index;
+    bool transposed_incidence;
 
     unsigned char *selected;
     unsigned char *forbidden;
@@ -47,11 +58,28 @@ typedef struct {
     int *inc_edges;     /* total incidence entries */
     int *cover;         /* ninputs */
     int *allowed;       /* edge_count */
+    /*
+     * Selected and forbidden vertices are ignored by the max-cover bound.
+     * Weighted pricing tracks them as packed bits so edge transitions update
+     * cover[] only for vertices whose counts can currently be queried.
+     */
+    uint64_t *inactive_vertices; /* edge_words; optional */
 
     bool (*emit)(const int *vertices, int count, void *data);
     void *emit_data;
+    bool (*prune)(const int *vertices, int count, void *data);
+    double (*branch_priority)(
+        const int *vertices,
+        int count,
+        int candidate,
+        void *data
+    );
+    void *search_data;
     BoundedMMCSStats *stats;
+    WeightedMMCSPriceTelemetry *telemetry;
     uint64_t node_limit;
+    uint64_t deadline_nanoseconds;
+    bool disable_cover_bound;
     bool limit_reached;
     bool failed;
 } MMCSState;
@@ -77,15 +105,261 @@ typedef struct {
     BoundedMMCSStats *stats;
 } CubeCollector;
 
+typedef struct {
+    const PIstorage *pi;
+    int ninputs;
+    const int *anchor;
+    int anchor_index;
+    const double *row_weights;
+    int *best_vertices;
+    double best_weight;
+    int best_anchor;
+    int best_support_size;
+    uint64_t weight_prunes;
+    WeightedMMCSPriceBatch *local_batch;
+    WeightedMMCSPriceTelemetry *telemetry;
+    bool collect_timing;
+} WeightedPriceContext;
+
+typedef struct {
+    const PIstorage *pi;
+    int ninputs;
+    int max_level;
+    int edge_words;
+    int max_edges;
+    const double *row_weights;
+    const double *root_upper_bounds;
+    const WeightedMMCSPreparedRows *prepared;
+    bool collect_timing;
+    bool apply_root_gate;
+    bool use_materialized_backend;
+    bool cache_edge_words;
+    bool disable_cover_bound;
+
+    uint64_t *edges;
+    unsigned char *selected;
+    unsigned char *forbidden;
+    int *selected_vertices;
+    int *hit_count;
+    int *critical_count;
+    int *inc_offset;
+    int *inc_cursor;
+    int *cover;
+    int *allowed;
+    uint64_t *inactive_vertices;
+    int *inc_edges;
+    size_t inc_edges_capacity;
+    size_t peak_incidence_entries;
+    int *best_vertices;
+
+    WeightedMMCSPriceBatch local_batch;
+
+    BoundedMMCSStats search_stats;
+    WeightedMMCSPriceTelemetry telemetry;
+    WeightedPriceContext price;
+    WeightedMMCSPriceStatus status;
+    int anchors_completed;
+    int first_incomplete_anchor;
+} WeightedPriceWorker;
+
+typedef struct {
+    WeightedPriceWorker *workers;
+    atomic_int next_anchor;
+    atomic_bool limit_reached;
+    int anchor_count;
+    uint64_t deadline_nanoseconds;
+} WeightedParallelContext;
+
+static uint64_t monotonic_nanoseconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return
+        (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+        (uint64_t)now.tv_nsec;
+}
+
+static void add_price_telemetry(
+    WeightedMMCSPriceTelemetry *target,
+    const WeightedMMCSPriceTelemetry *source
+) {
+    target->anchors_presented += source->anchors_presented;
+    target->anchors_constructed += source->anchors_constructed;
+    target->prospective_gated_anchors +=
+        source->prospective_gated_anchors;
+    target->edges_constructed += source->edges_constructed;
+    target->xor_words += source->xor_words;
+    target->incidences_counted += source->incidences_counted;
+    target->incidences_written += source->incidences_written;
+    target->prospective_gated_edges += source->prospective_gated_edges;
+    target->prospective_gated_incidences +=
+        source->prospective_gated_incidences;
+    target->pivot_selections += source->pivot_selections;
+    target->pivot_edge_entries_inspected +=
+        source->pivot_edge_entries_inspected;
+    target->literal_incidence_entries_visited +=
+        source->literal_incidence_entries_visited;
+    target->edge_literal_entries_visited +=
+        source->edge_literal_entries_visited;
+    target->compatible_bound_calls += source->compatible_bound_calls;
+    target->compatible_bound_rows_examined +=
+        source->compatible_bound_rows_examined;
+    target->edge_build_nanoseconds += source->edge_build_nanoseconds;
+    target->incidence_count_nanoseconds +=
+        source->incidence_count_nanoseconds;
+    target->incidence_fill_nanoseconds +=
+        source->incidence_fill_nanoseconds;
+    target->search_nanoseconds += source->search_nanoseconds;
+    target->candidate_collection_nanoseconds +=
+        source->candidate_collection_nanoseconds;
+    target->merge_nanoseconds += source->merge_nanoseconds;
+    target->pricing_call_nanoseconds += source->pricing_call_nanoseconds;
+}
+
+static uint64_t low_bits_mask(int count) {
+    if (count <= 0) return 0;
+    if (count >= 64) return UINT64_MAX;
+    return (UINT64_C(1) << count) - 1u;
+}
+
+static const uint64_t *mmcs_other_row_bits(
+    const MMCSState *state,
+    int edge
+) {
+    if (edge < state->critical_edge_count) {
+        return &state->prepared->off_bits[
+            (size_t)edge * (size_t)state->edge_words
+        ];
+    }
+    return &state->prepared->on_bits[
+        (size_t)(edge - state->critical_edge_count) *
+        (size_t)state->edge_words
+    ];
+}
+
+static uint64_t mmcs_edge_word(
+    const MMCSState *state,
+    int edge,
+    int word
+) {
+    if (state->edges) {
+        return state->edges[
+            (size_t)edge * (size_t)state->edge_words + (size_t)word
+        ];
+    }
+    return state->anchor_bits[word] ^
+        mmcs_other_row_bits(state, edge)[word];
+}
+
 static bool edge_contains(
     const MMCSState *state,
     int edge,
     int vertex
 ) {
-    const uint64_t *bits = &state->edges[
-        (size_t)edge * (size_t)state->edge_words
-    ];
-    return (bits[vertex / 64] & (UINT64_C(1) << (vertex % 64))) != 0;
+    return (
+        mmcs_edge_word(state, edge, vertex / 64) &
+        (UINT64_C(1) << (vertex % 64))
+    ) != 0;
+}
+
+typedef struct {
+    const MMCSState *state;
+    int vertex;
+    int reference_index;
+    int reference_end;
+    int part;
+    int word;
+    int word_count;
+    int row_limit;
+    int edge_base;
+    uint64_t values;
+} MMCSIncidenceIterator;
+
+static void incidence_iterator_select_part(
+    MMCSIncidenceIterator *iterator,
+    int part
+) {
+    const MMCSState *state = iterator->state;
+    iterator->part = part;
+    iterator->word = 0;
+    iterator->values = 0;
+    if (part == 0) {
+        iterator->row_limit = state->critical_edge_count;
+        iterator->word_count = state->prepared->off_column_words;
+        iterator->edge_base = 0;
+    } else {
+        iterator->row_limit = state->anchor_index;
+        iterator->word_count = (state->anchor_index + 63) / 64;
+        iterator->edge_base = state->critical_edge_count;
+    }
+}
+
+static void incidence_iterator_init(
+    MMCSIncidenceIterator *iterator,
+    const MMCSState *state,
+    int vertex
+) {
+    memset(iterator, 0, sizeof(*iterator));
+    iterator->state = state;
+    iterator->vertex = vertex;
+    if (!state->transposed_incidence) {
+        iterator->reference_index = state->inc_offset[vertex];
+        iterator->reference_end = state->inc_offset[vertex + 1];
+        iterator->part = 2;
+        return;
+    }
+    incidence_iterator_select_part(iterator, 0);
+}
+
+static bool incidence_iterator_next(
+    MMCSIncidenceIterator *iterator,
+    int *edge
+) {
+    const MMCSState *state = iterator->state;
+    if (!state->transposed_incidence) {
+        if (iterator->reference_index >= iterator->reference_end) {
+            return false;
+        }
+        *edge = state->inc_edges[iterator->reference_index++];
+        return true;
+    }
+
+    while (iterator->part < 2) {
+        if (iterator->values != 0) {
+            int bit = __builtin_ctzll(iterator->values);
+            iterator->values &= iterator->values - 1;
+            *edge = iterator->edge_base +
+                (iterator->word - 1) * 64 + bit;
+            return true;
+        }
+        if (iterator->word >= iterator->word_count) {
+            incidence_iterator_select_part(
+                iterator,
+                iterator->part + 1
+            );
+            continue;
+        }
+
+        const uint64_t *columns = iterator->part == 0
+            ? state->prepared->off_columns
+            : state->prepared->on_columns;
+        int column_words = iterator->part == 0
+            ? state->prepared->off_column_words
+            : state->prepared->on_column_words;
+        uint64_t values = columns[
+            (size_t)iterator->vertex * (size_t)column_words +
+            (size_t)iterator->word
+        ];
+        bool anchor_is_one = (
+            state->anchor_bits[iterator->vertex / 64] &
+            (UINT64_C(1) << (iterator->vertex % 64))
+        ) != 0;
+        if (anchor_is_one) values = ~values;
+        int remaining = iterator->row_limit - iterator->word * 64;
+        if (remaining < 64) values &= low_bits_mask(remaining);
+        iterator->word++;
+        iterator->values = values;
+    }
+    return false;
 }
 
 static int unique_selected_on_edge(
@@ -104,14 +378,18 @@ static int unique_selected_on_edge(
 
 /* an edge just became covered: it no longer contributes to any cover[] */
 static void edge_now_covered(MMCSState *state, int edge) {
-    const uint64_t *bits = &state->edges[
-        (size_t)edge * (size_t)state->edge_words
-    ];
+    if (state->disable_cover_bound) return;
     for (int w = 0; w < state->edge_words; ++w) {
-        uint64_t word = bits[w];
+        uint64_t word = mmcs_edge_word(state, edge, w);
+        if (state->inactive_vertices) {
+            word &= ~state->inactive_vertices[w];
+        }
         while (word) {
             int v = w * 64 + __builtin_ctzll(word);
             word &= word - 1;
+            if (state->telemetry) {
+                state->telemetry->edge_literal_entries_visited++;
+            }
             state->cover[v]--;
         }
     }
@@ -119,14 +397,18 @@ static void edge_now_covered(MMCSState *state, int edge) {
 
 /* an edge just became uncovered again on backtrack */
 static void edge_now_uncovered(MMCSState *state, int edge) {
-    const uint64_t *bits = &state->edges[
-        (size_t)edge * (size_t)state->edge_words
-    ];
+    if (state->disable_cover_bound) return;
     for (int w = 0; w < state->edge_words; ++w) {
-        uint64_t word = bits[w];
+        uint64_t word = mmcs_edge_word(state, edge, w);
+        if (state->inactive_vertices) {
+            word &= ~state->inactive_vertices[w];
+        }
         while (word) {
             int v = w * 64 + __builtin_ctzll(word);
             word &= word - 1;
+            if (state->telemetry) {
+                state->telemetry->edge_literal_entries_visited++;
+            }
             state->cover[v]++;
         }
     }
@@ -138,19 +420,26 @@ static bool add_vertex(
 ) {
     bool valid = true;
     state->selected[vertex] = 1;
+    if (state->inactive_vertices) {
+        state->inactive_vertices[vertex / 64] |=
+            UINT64_C(1) << (vertex % 64);
+    }
     state->selected_vertices[state->selected_count++] = vertex;
 
-    for (int idx = state->inc_offset[vertex];
-         idx < state->inc_offset[vertex + 1];
-         ++idx) {
-        int edge = state->inc_edges[idx];
+    MMCSIncidenceIterator iterator;
+    incidence_iterator_init(&iterator, state, vertex);
+    int edge = 0;
+    while (incidence_iterator_next(&iterator, &edge)) {
+        if (state->telemetry) {
+            state->telemetry->literal_incidence_entries_visited++;
+        }
 
         if (state->hit_count[edge] == 0) {
             state->uncovered_count--;
             edge_now_covered(state, edge);
             /*
-             * Only OFF edges establish primality. Canonical earlier-ON edges
-             * constrain ownership, but they must never give a selected
+             * Only OFF edges establish primality.  Canonical earlier-ON
+             * edges constrain ownership, but they must never give a selected
              * literal the private edge needed to call the cube prime.
              */
             if (edge < state->critical_edge_count) {
@@ -172,7 +461,7 @@ static bool add_vertex(
 
     /*
      * MMCS primality pruning: once a selected vertex has no private OFF edge,
-     * adding more vertices cannot make it private again. In particular, a
+     * adding more vertices cannot make it private again.  In particular, a
      * private canonical ownership edge is intentionally insufficient here.
      */
     for (int i = 0; valid && i < state->selected_count; ++i) {
@@ -187,12 +476,17 @@ static void remove_vertex(
     MMCSState *state,
     int vertex
 ) {
-    for (int idx = state->inc_offset[vertex];
-         idx < state->inc_offset[vertex + 1];
-         ++idx) {
-        int edge = state->inc_edges[idx];
+    int restored_cover = 0;
+    MMCSIncidenceIterator iterator;
+    incidence_iterator_init(&iterator, state, vertex);
+    int edge = 0;
+    while (incidence_iterator_next(&iterator, &edge)) {
+        if (state->telemetry) {
+            state->telemetry->literal_incidence_entries_visited++;
+        }
 
         if (state->hit_count[edge] == 1) {
+            if (!state->disable_cover_bound) restored_cover++;
             if (edge < state->critical_edge_count) {
                 state->critical_count[vertex]--;
             }
@@ -209,26 +503,52 @@ static void remove_vertex(
 
     state->selected_count--;
     state->selected[vertex] = 0;
+    if (state->inactive_vertices) {
+        state->cover[vertex] = restored_cover;
+        state->inactive_vertices[vertex / 64] &=
+            ~(UINT64_C(1) << (vertex % 64));
+    }
     state->critical_count[vertex] = 0;
 }
 
 /* forbidding a vertex removes it from every edge's allowed count */
 static void forbid_vertex(MMCSState *state, int vertex) {
     state->forbidden[vertex] = 1;
-    for (int idx = state->inc_offset[vertex];
-         idx < state->inc_offset[vertex + 1];
-         ++idx) {
-        state->allowed[state->inc_edges[idx]]--;
+    if (state->inactive_vertices) {
+        state->inactive_vertices[vertex / 64] |=
+            UINT64_C(1) << (vertex % 64);
+    }
+    MMCSIncidenceIterator iterator;
+    incidence_iterator_init(&iterator, state, vertex);
+    int edge = 0;
+    while (incidence_iterator_next(&iterator, &edge)) {
+        if (state->telemetry) {
+            state->telemetry->literal_incidence_entries_visited++;
+        }
+        state->allowed[edge]--;
     }
 }
 
 static void unforbid_vertex(MMCSState *state, int vertex) {
-    state->forbidden[vertex] = 0;
-    for (int idx = state->inc_offset[vertex];
-         idx < state->inc_offset[vertex + 1];
-         ++idx) {
-        state->allowed[state->inc_edges[idx]]++;
+    int restored_cover = 0;
+    MMCSIncidenceIterator iterator;
+    incidence_iterator_init(&iterator, state, vertex);
+    int edge = 0;
+    while (incidence_iterator_next(&iterator, &edge)) {
+        if (state->telemetry) {
+            state->telemetry->literal_incidence_entries_visited++;
+        }
+        state->allowed[edge]++;
+        if (!state->disable_cover_bound && state->hit_count[edge] == 0) {
+            restored_cover++;
+        }
     }
+    if (state->inactive_vertices) {
+        state->cover[vertex] = restored_cover;
+        state->inactive_vertices[vertex / 64] &=
+            ~(UINT64_C(1) << (vertex % 64));
+    }
+    state->forbidden[vertex] = 0;
 }
 
 static int choose_uncovered_edge(
@@ -236,8 +556,12 @@ static int choose_uncovered_edge(
 ) {
     int best_edge = -1;
     int best_allowed = INT_MAX;
+    if (state->telemetry) state->telemetry->pivot_selections++;
 
     for (int edge = 0; edge < state->edge_count; ++edge) {
+        if (state->telemetry) {
+            state->telemetry->pivot_edge_entries_inspected++;
+        }
         if (state->hit_count[edge] != 0) continue;
 
         int allowed = state->allowed[edge];
@@ -256,6 +580,14 @@ static void mmcs_search(
 ) {
     if (state->failed || state->limit_reached) return;
     if (
+        state->deadline_nanoseconds > 0 &&
+        (state->stats->search_nodes & UINT64_C(1023)) == 0 &&
+        monotonic_nanoseconds() >= state->deadline_nanoseconds
+    ) {
+        state->limit_reached = true;
+        return;
+    }
+    if (
         state->node_limit > 0 &&
         state->stats->search_nodes >= state->node_limit
     ) {
@@ -263,6 +595,17 @@ static void mmcs_search(
         return;
     }
     state->stats->search_nodes++;
+
+    if (
+        state->prune &&
+        state->prune(
+            state->selected_vertices,
+            state->selected_count,
+            state->search_data
+        )
+    ) {
+        return;
+    }
 
     if (state->uncovered_count == 0) {
         if (!state->exact_size || state->selected_count == state->target_size) {
@@ -287,17 +630,23 @@ static void mmcs_search(
      * transversal.  The one-slot case becomes the useful exact test that one
      * allowed input must occur in every remaining blocker edge.
      */
-    int max_cover = 0;
-    for (int vertex = 0; vertex < state->ninputs; ++vertex) {
-        if (state->forbidden[vertex]) continue;
-        if (state->cover[vertex] > max_cover) max_cover = state->cover[vertex];
-    }
-    int slots = state->target_size - state->selected_count;
-    if (
-        max_cover == 0 ||
-        (state->uncovered_count + max_cover - 1) / max_cover > slots
-    ) {
-        return;
+    if (!state->disable_cover_bound) {
+        int max_cover = 0;
+        for (int vertex = 0; vertex < state->ninputs; ++vertex) {
+            if (state->selected[vertex] || state->forbidden[vertex]) {
+                continue;
+            }
+            if (state->cover[vertex] > max_cover) {
+                max_cover = state->cover[vertex];
+            }
+        }
+        int slots = state->target_size - state->selected_count;
+        if (
+            max_cover == 0 ||
+            (state->uncovered_count + max_cover - 1) / max_cover > slots
+        ) {
+            return;
+        }
     }
 
     int pivot = choose_uncovered_edge(state);
@@ -315,6 +664,39 @@ static void mmcs_search(
             edge_contains(state, pivot, vertex)
         ) {
             branch_vertices[branch_count++] = vertex;
+        }
+    }
+
+    if (state->branch_priority && branch_count > 1) {
+        double priorities[state->ninputs];
+        for (int i = 0; i < branch_count; ++i) {
+            priorities[i] = state->branch_priority(
+                state->selected_vertices,
+                state->selected_count,
+                branch_vertices[i],
+                state->search_data
+            );
+        }
+        for (int i = 1; i < branch_count; ++i) {
+            int vertex = branch_vertices[i];
+            double priority = priorities[i];
+            int j = i;
+            while (
+                j > 0 &&
+                (
+                    priority > priorities[j - 1] ||
+                    (
+                        priority == priorities[j - 1] &&
+                        vertex < branch_vertices[j - 1]
+                    )
+                )
+            ) {
+                branch_vertices[j] = branch_vertices[j - 1];
+                priorities[j] = priorities[j - 1];
+                --j;
+            }
+            branch_vertices[j] = vertex;
+            priorities[j] = priority;
         }
     }
 
@@ -339,6 +721,541 @@ static void mmcs_search(
     for (int i = 0; i < branch_count; ++i) {
         unforbid_vertex(state, branch_vertices[i]);
     }
+}
+
+static bool row_matches_partial_cube(
+    const WeightedPriceContext *context,
+    int row,
+    const int *vertices,
+    int count,
+    int candidate
+) {
+    const int *on_row = &context->pi->ON_set[
+        (size_t)row * (size_t)context->ninputs
+    ];
+    for (int i = 0; i < count; ++i) {
+        int vertex = vertices[i];
+        if (on_row[vertex] != context->anchor[vertex]) return false;
+    }
+    return candidate < 0 ||
+        on_row[candidate] == context->anchor[candidate];
+}
+
+static double compatible_positive_weight(
+    const WeightedPriceContext *context,
+    const int *vertices,
+    int count,
+    int candidate
+) {
+    double bound = 0.0;
+    if (context->telemetry) {
+        context->telemetry->compatible_bound_calls++;
+    }
+    /*
+     * Canonical ownership forces every completed cube for this anchor to
+     * exclude all earlier ON rows. They can therefore never contribute to a
+     * descendant's priced weight, even if they still match the partial cube.
+     */
+    for (
+        int row = context->anchor_index;
+        row < context->pi->ON_minterms;
+        ++row
+    ) {
+        if (context->telemetry) {
+            context->telemetry->compatible_bound_rows_examined++;
+        }
+        if (
+            context->row_weights[row] > 0.0 &&
+            row_matches_partial_cube(
+                context,
+                row,
+                vertices,
+                count,
+                candidate
+            )
+        ) {
+            bound += context->row_weights[row];
+        }
+    }
+    return bound;
+}
+
+static int compare_vertex_sets(
+    const int *a,
+    int a_count,
+    const int *b,
+    int b_count,
+    int ninputs
+) {
+    for (int vertex = 0; vertex < ninputs; ++vertex) {
+        bool in_a = false;
+        bool in_b = false;
+        for (int i = 0; i < a_count; ++i) {
+            if (a[i] == vertex) {
+                in_a = true;
+                break;
+            }
+        }
+        for (int i = 0; i < b_count; ++i) {
+            if (b[i] == vertex) {
+                in_b = true;
+                break;
+            }
+        }
+        if (in_a != in_b) return in_a ? -1 : 1;
+    }
+    return 0;
+}
+
+static bool weighted_geometry_precedes(
+    int anchor,
+    int support_size,
+    const int *vertices,
+    int existing_anchor,
+    int existing_support_size,
+    const int *existing_vertices,
+    int ninputs
+) {
+    if (anchor != existing_anchor) return anchor < existing_anchor;
+    if (support_size != existing_support_size) {
+        return support_size < existing_support_size;
+    }
+    return compare_vertex_sets(
+        vertices,
+        support_size,
+        existing_vertices,
+        existing_support_size,
+        ninputs
+    ) < 0;
+}
+
+static bool weighted_batch_candidate_precedes(
+    double weight,
+    int anchor,
+    const uint64_t *coverage,
+    double existing_weight,
+    int existing_anchor,
+    const uint64_t *existing_coverage,
+    int coverage_words
+) {
+    if (weight != existing_weight) return weight > existing_weight;
+    if (anchor != existing_anchor) return anchor < existing_anchor;
+    for (int word = 0; word < coverage_words; ++word) {
+        if (coverage[word] != existing_coverage[word]) {
+            return coverage[word] < existing_coverage[word];
+        }
+    }
+    return false;
+}
+
+static void weighted_batch_store(
+    WeightedMMCSPriceBatch *batch,
+    int index,
+    int ninputs,
+    int coverage_words,
+    double weight,
+    int anchor,
+    int support_size,
+    const int *vertices,
+    const uint64_t *coverage
+) {
+    batch->weights[index] = weight;
+    batch->anchors[index] = anchor;
+    batch->support_sizes[index] = support_size;
+    memset(
+        &batch->vertices[(size_t)index * (size_t)ninputs],
+        0,
+        (size_t)ninputs * sizeof(int)
+    );
+    memcpy(
+        &batch->vertices[(size_t)index * (size_t)ninputs],
+        vertices,
+        (size_t)support_size * sizeof(int)
+    );
+    memcpy(
+        &batch->coverage[(size_t)index * (size_t)coverage_words],
+        coverage,
+        (size_t)coverage_words * sizeof(uint64_t)
+    );
+}
+
+static void weighted_batch_offer(
+    WeightedMMCSPriceBatch *batch,
+    int ninputs,
+    int coverage_words,
+    double weight,
+    int anchor,
+    int support_size,
+    const int *vertices,
+    const uint64_t *coverage
+) {
+    for (int i = 0; i < batch->count; ++i) {
+        uint64_t *existing_coverage = &batch->coverage[
+            (size_t)i * (size_t)coverage_words
+        ];
+        if (memcmp(
+            existing_coverage,
+            coverage,
+            (size_t)coverage_words * sizeof(uint64_t)
+        ) != 0) {
+            continue;
+        }
+        const int *existing_vertices = &batch->vertices[
+            (size_t)i * (size_t)ninputs
+        ];
+        if (weighted_geometry_precedes(
+            anchor,
+            support_size,
+            vertices,
+            batch->anchors[i],
+            batch->support_sizes[i],
+            existing_vertices,
+            ninputs
+        )) {
+            weighted_batch_store(
+                batch,
+                i,
+                ninputs,
+                coverage_words,
+                weight,
+                anchor,
+                support_size,
+                vertices,
+                coverage
+            );
+        }
+        return;
+    }
+
+    int insert = batch->count;
+    while (insert > 0 && weighted_batch_candidate_precedes(
+        weight,
+        anchor,
+        coverage,
+        batch->weights[insert - 1],
+        batch->anchors[insert - 1],
+        &batch->coverage[
+            (size_t)(insert - 1) * (size_t)coverage_words
+        ],
+        coverage_words
+    )) {
+        insert--;
+    }
+    if (insert >= batch->capacity) return;
+
+    int old_count = batch->count;
+    if (old_count < batch->capacity) batch->count++;
+    int move_end = old_count < batch->capacity
+        ? old_count
+        : batch->capacity - 1;
+    for (int i = move_end; i > insert; --i) {
+        batch->weights[i] = batch->weights[i - 1];
+        batch->anchors[i] = batch->anchors[i - 1];
+        batch->support_sizes[i] = batch->support_sizes[i - 1];
+        memcpy(
+            &batch->vertices[(size_t)i * (size_t)ninputs],
+            &batch->vertices[
+                (size_t)(i - 1) * (size_t)ninputs
+            ],
+            (size_t)ninputs * sizeof(int)
+        );
+        memcpy(
+            &batch->coverage[(size_t)i * (size_t)coverage_words],
+            &batch->coverage[
+                (size_t)(i - 1) * (size_t)coverage_words
+            ],
+            (size_t)coverage_words * sizeof(uint64_t)
+        );
+    }
+    weighted_batch_store(
+        batch,
+        insert,
+        ninputs,
+        coverage_words,
+        weight,
+        anchor,
+        support_size,
+        vertices,
+        coverage
+    );
+}
+
+static uint64_t weighted_coverage_hash(
+    const uint64_t *coverage,
+    int words
+) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (int word = 0; word < words; ++word) {
+        hash ^= coverage[word];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static bool weighted_merge_local_batches(
+    WeightedPriceWorker *workers,
+    int nthreads,
+    WeightedMMCSPriceBatch *batch,
+    int ninputs,
+    int coverage_words
+) {
+    if (!batch) return true;
+    batch->count = 0;
+
+    size_t table_size = 2u;
+    size_t needed = (size_t)batch->capacity * 2u;
+    while (table_size < needed) {
+        if (table_size > SIZE_MAX / 2u) return false;
+        table_size *= 2u;
+    }
+    int *slots = (int *)malloc(table_size * sizeof(int));
+    int *cursor = (int *)calloc((size_t)nthreads, sizeof(int));
+    if (!slots || !cursor) {
+        free(slots);
+        free(cursor);
+        return false;
+    }
+    for (size_t slot = 0; slot < table_size; ++slot) slots[slot] = -1;
+
+    size_t mask = table_size - 1u;
+    while (batch->count < batch->capacity) {
+        int best_worker = -1;
+        for (int worker = 0; worker < nthreads; ++worker) {
+            WeightedMMCSPriceBatch *local = &workers[worker].local_batch;
+            if (cursor[worker] >= local->count) continue;
+            if (best_worker < 0) {
+                best_worker = worker;
+                continue;
+            }
+            WeightedMMCSPriceBatch *best =
+                &workers[best_worker].local_batch;
+            int candidate = cursor[worker];
+            int incumbent = cursor[best_worker];
+            if (weighted_batch_candidate_precedes(
+                local->weights[candidate],
+                local->anchors[candidate],
+                &local->coverage[
+                    (size_t)candidate * (size_t)coverage_words
+                ],
+                best->weights[incumbent],
+                best->anchors[incumbent],
+                &best->coverage[
+                    (size_t)incumbent * (size_t)coverage_words
+                ],
+                coverage_words
+            )) {
+                best_worker = worker;
+            }
+        }
+        if (best_worker < 0) break;
+
+        WeightedMMCSPriceBatch *local =
+            &workers[best_worker].local_batch;
+        int candidate = cursor[best_worker]++;
+        const uint64_t *coverage = &local->coverage[
+            (size_t)candidate * (size_t)coverage_words
+        ];
+        size_t slot =
+            (size_t)weighted_coverage_hash(coverage, coverage_words) &
+            mask;
+        while (slots[slot] >= 0) {
+            int existing = slots[slot];
+            uint64_t *existing_coverage = &batch->coverage[
+                (size_t)existing * (size_t)coverage_words
+            ];
+            if (memcmp(
+                existing_coverage,
+                coverage,
+                (size_t)coverage_words * sizeof(uint64_t)
+            ) == 0) {
+                const int *vertices = &local->vertices[
+                    (size_t)candidate * (size_t)ninputs
+                ];
+                const int *existing_vertices = &batch->vertices[
+                    (size_t)existing * (size_t)ninputs
+                ];
+                if (weighted_geometry_precedes(
+                    local->anchors[candidate],
+                    local->support_sizes[candidate],
+                    vertices,
+                    batch->anchors[existing],
+                    batch->support_sizes[existing],
+                    existing_vertices,
+                    ninputs
+                )) {
+                    weighted_batch_store(
+                        batch,
+                        existing,
+                        ninputs,
+                        coverage_words,
+                        local->weights[candidate],
+                        local->anchors[candidate],
+                        local->support_sizes[candidate],
+                        vertices,
+                        coverage
+                    );
+                }
+                goto NEXT_MERGED_CANDIDATE;
+            }
+            slot = (slot + 1u) & mask;
+        }
+
+        int target = batch->count++;
+        weighted_batch_store(
+            batch,
+            target,
+            ninputs,
+            coverage_words,
+            local->weights[candidate],
+            local->anchors[candidate],
+            local->support_sizes[candidate],
+            &local->vertices[
+                (size_t)candidate * (size_t)ninputs
+            ],
+            coverage
+        );
+        slots[slot] = target;
+
+NEXT_MERGED_CANDIDATE:
+        ;
+    }
+    free(slots);
+    free(cursor);
+    return true;
+}
+
+static bool weighted_price_prune(
+    const int *vertices,
+    int count,
+    void *data
+) {
+    WeightedPriceContext *context = (WeightedPriceContext *)data;
+    if (!isfinite(context->best_weight)) return false;
+
+    double threshold = context->best_weight;
+    bool prune_equal = true;
+    WeightedMMCSPriceBatch *local = context->local_batch;
+    if (local && local->count > 0) {
+        if (local->count < local->capacity) {
+            threshold = 1.0;
+        } else {
+            threshold = local->weights[local->count - 1];
+            prune_equal = false;
+        }
+    }
+    double bound = compatible_positive_weight(
+        context,
+        vertices,
+        count,
+        -1
+    );
+    if (
+        bound < threshold - 1e-12 ||
+        (prune_equal && bound <= threshold + 1e-12)
+    ) {
+        context->weight_prunes++;
+        return true;
+    }
+    return false;
+}
+
+static double weighted_branch_priority(
+    const int *vertices,
+    int count,
+    int candidate,
+    void *data
+) {
+    const WeightedPriceContext *context =
+        (const WeightedPriceContext *)data;
+    return compatible_positive_weight(
+        context,
+        vertices,
+        count,
+        candidate
+    );
+}
+
+static bool collect_weighted_price(
+    const int *vertices,
+    int count,
+    void *data
+) {
+    WeightedPriceContext *context = (WeightedPriceContext *)data;
+    uint64_t started = context->collect_timing
+        ? monotonic_nanoseconds()
+        : 0;
+    double weight = 0.0;
+    int coverage_words = context->pi->pichart_words;
+    int coverage_cov_bits = context->pi->cov_bits;
+    uint64_t coverage[
+        coverage_words > 0 ? coverage_words : 1
+    ];
+    memset(coverage, 0, sizeof(coverage));
+    for (int row = 0; row < context->pi->ON_minterms; ++row) {
+        if (row_matches_partial_cube(
+            context,
+            row,
+            vertices,
+            count,
+            -1
+        )) {
+            weight += context->row_weights[row];
+            if (coverage_words > 0 && coverage_cov_bits > 0) {
+                coverage[row / coverage_cov_bits] |=
+                    UINT64_C(1) << (row % coverage_cov_bits);
+            }
+        }
+    }
+
+    if (
+        weight > context->best_weight ||
+        (
+            weight == context->best_weight &&
+            weighted_geometry_precedes(
+                context->anchor_index,
+                count,
+                vertices,
+                context->best_anchor,
+                context->best_support_size,
+                context->best_vertices,
+                context->ninputs
+            )
+        )
+    ) {
+        context->best_weight = weight;
+        context->best_anchor = context->anchor_index;
+        context->best_support_size = count;
+        memcpy(
+            context->best_vertices,
+            vertices,
+            (size_t)count * sizeof(int)
+        );
+    }
+
+    WeightedMMCSPriceBatch *local = context->local_batch;
+    if (!local || weight <= 1.0 + WEIGHTED_MMCS_REDUCED_COST_TOL) {
+        if (context->collect_timing) {
+            context->telemetry->candidate_collection_nanoseconds +=
+                monotonic_nanoseconds() - started;
+        }
+        return true;
+    }
+
+    weighted_batch_offer(
+        local,
+        context->ninputs,
+        coverage_words,
+        weight,
+        context->anchor_index,
+        count,
+        vertices,
+        coverage
+    );
+    if (context->collect_timing) {
+        context->telemetry->candidate_collection_nanoseconds +=
+            monotonic_nanoseconds() - started;
+    }
+    return true;
 }
 
 static uint64_t geometry_hash(
@@ -789,13 +1706,7 @@ static BoundedMMCSResult bounded_mmcs_generate_output_target_limited(
             (size_t)on * (size_t)ninputs
         ];
 
-        /*
-         * Duplicate ON rows describe the same point and do not create a new
-         * canonical owner.  Every cube covering this anchor was already
-         * generated for its first occurrence; its coverage bits include all
-         * duplicate rows.  Skipping here is therefore both complete and
-         * necessary—the corresponding ownership edge would be empty.
-         */
+        /* A duplicate point has the same canonical owner as its first row. */
         bool duplicate_anchor = false;
         for (int earlier = 0; earlier < on; ++earlier) {
             const int *earlier_row = &pi->ON_set[
@@ -1004,6 +1915,1287 @@ static BoundedMMCSResult bounded_mmcs_generate_output_target_limited(
     if (!ok) return BOUNDED_MMCS_ERROR;
     if (limit_reached) return BOUNDED_MMCS_LIMIT_REACHED;
     return BOUNDED_MMCS_COMPLETE;
+}
+
+bool bounded_mmcs_prepare_binary_rows(
+    const PIstorage *pi,
+    int ninputs,
+    WeightedMMCSPreparedRows *prepared
+) {
+    if (prepared) memset(prepared, 0, sizeof(*prepared));
+    if (
+        !pi ||
+        !prepared ||
+        ninputs <= 0 ||
+        pi->ON_minterms < 0 ||
+        pi->OFF_minterms < 0 ||
+        (pi->ON_minterms > 0 && !pi->ON_set) ||
+        (pi->OFF_minterms > 0 && !pi->OFF_set)
+    ) {
+        return false;
+    }
+
+    size_t on_cells = (size_t)pi->ON_minterms * (size_t)ninputs;
+    size_t off_cells = (size_t)pi->OFF_minterms * (size_t)ninputs;
+    for (size_t cell = 0; cell < on_cells; ++cell) {
+        if (pi->ON_set[cell] < 1 || pi->ON_set[cell] > 2) return false;
+    }
+    for (size_t cell = 0; cell < off_cells; ++cell) {
+        if (pi->OFF_set[cell] < 1 || pi->OFF_set[cell] > 2) return false;
+    }
+
+    int row_words = (ninputs + 63) / 64;
+    int on_column_words = (pi->ON_minterms + 63) / 64;
+    int off_column_words = (pi->OFF_minterms + 63) / 64;
+    size_t on_words = (size_t)pi->ON_minterms * (size_t)row_words;
+    size_t off_words = (size_t)pi->OFF_minterms * (size_t)row_words;
+    size_t on_column_cells =
+        (size_t)ninputs * (size_t)on_column_words;
+    size_t off_column_cells =
+        (size_t)ninputs * (size_t)off_column_words;
+    size_t on_prefix_cells =
+        (size_t)ninputs * (size_t)(on_column_words + 1);
+    if (on_words > 0) {
+        prepared->on_bits =
+            (uint64_t *)calloc(on_words, sizeof(uint64_t));
+    }
+    if (off_words > 0) {
+        prepared->off_bits =
+            (uint64_t *)calloc(off_words, sizeof(uint64_t));
+    }
+    if (on_column_cells > 0) {
+        prepared->on_columns =
+            (uint64_t *)calloc(on_column_cells, sizeof(uint64_t));
+    }
+    if (off_column_cells > 0) {
+        prepared->off_columns =
+            (uint64_t *)calloc(off_column_cells, sizeof(uint64_t));
+    }
+    if (on_prefix_cells > 0) {
+        prepared->on_column_prefix_ones =
+            (uint32_t *)calloc(on_prefix_cells, sizeof(uint32_t));
+    }
+    prepared->off_one_counts =
+        (uint32_t *)calloc((size_t)ninputs, sizeof(uint32_t));
+    if (
+        (on_words > 0 && !prepared->on_bits) ||
+        (off_words > 0 && !prepared->off_bits) ||
+        (on_column_cells > 0 && !prepared->on_columns) ||
+        (off_column_cells > 0 && !prepared->off_columns) ||
+        (on_prefix_cells > 0 && !prepared->on_column_prefix_ones) ||
+        !prepared->off_one_counts
+    ) {
+        bounded_mmcs_prepared_rows_destroy(prepared);
+        return false;
+    }
+
+    prepared->ninputs = ninputs;
+    prepared->row_words = row_words;
+    prepared->on_rows = pi->ON_minterms;
+    prepared->off_rows = pi->OFF_minterms;
+    prepared->on_column_words = on_column_words;
+    prepared->off_column_words = off_column_words;
+    for (int row = 0; row < pi->ON_minterms; ++row) {
+        for (int input = 0; input < ninputs; ++input) {
+            if (
+                pi->ON_set[(size_t)row * (size_t)ninputs + input] == 2
+            ) {
+                prepared->on_bits[
+                    (size_t)row * (size_t)row_words +
+                    (size_t)(input / 64)
+                ] |= UINT64_C(1) << (input % 64);
+                prepared->on_columns[
+                    (size_t)input * (size_t)on_column_words +
+                    (size_t)(row / 64)
+                ] |= UINT64_C(1) << (row % 64);
+            }
+        }
+    }
+    for (int row = 0; row < pi->OFF_minterms; ++row) {
+        for (int input = 0; input < ninputs; ++input) {
+            if (
+                pi->OFF_set[(size_t)row * (size_t)ninputs + input] == 2
+            ) {
+                prepared->off_bits[
+                    (size_t)row * (size_t)row_words +
+                    (size_t)(input / 64)
+                ] |= UINT64_C(1) << (input % 64);
+                prepared->off_columns[
+                    (size_t)input * (size_t)off_column_words +
+                    (size_t)(row / 64)
+                ] |= UINT64_C(1) << (row % 64);
+            }
+        }
+    }
+    for (int input = 0; input < ninputs; ++input) {
+        uint32_t *prefix = &prepared->on_column_prefix_ones[
+            (size_t)input * (size_t)(on_column_words + 1)
+        ];
+        if (on_column_words > 0) {
+            const uint64_t *on_column = &prepared->on_columns[
+                (size_t)input * (size_t)on_column_words
+            ];
+            for (int word = 0; word < on_column_words; ++word) {
+                prefix[word + 1] = prefix[word] +
+                    (uint32_t)__builtin_popcountll(on_column[word]);
+            }
+        }
+
+        uint32_t off_ones = 0;
+        if (off_column_words > 0) {
+            const uint64_t *off_column = &prepared->off_columns[
+                (size_t)input * (size_t)off_column_words
+            ];
+            for (int word = 0; word < off_column_words; ++word) {
+                off_ones +=
+                    (uint32_t)__builtin_popcountll(off_column[word]);
+            }
+        }
+        prepared->off_one_counts[input] = off_ones;
+    }
+    return true;
+}
+
+void bounded_mmcs_prepared_rows_destroy(
+    WeightedMMCSPreparedRows *prepared
+) {
+    if (!prepared) return;
+    free(prepared->on_bits);
+    free(prepared->off_bits);
+    free(prepared->on_columns);
+    free(prepared->off_columns);
+    free(prepared->on_column_prefix_ones);
+    free(prepared->off_one_counts);
+    memset(prepared, 0, sizeof(*prepared));
+}
+
+static bool ensure_incidence_capacity(
+    WeightedPriceWorker *worker,
+    size_t entries
+) {
+    if (entries <= worker->inc_edges_capacity) return true;
+    if (entries > SIZE_MAX / sizeof(int)) return false;
+    size_t capacity = worker->inc_edges_capacity > 0
+        ? worker->inc_edges_capacity
+        : 256u;
+    while (capacity < entries) {
+        if (capacity > SIZE_MAX / 2u) {
+            capacity = entries;
+            break;
+        }
+        capacity *= 2u;
+    }
+    int *grown = (int *)realloc(
+        worker->inc_edges,
+        capacity * sizeof(int)
+    );
+    if (!grown) return false;
+    worker->inc_edges = grown;
+    worker->inc_edges_capacity = capacity;
+    return true;
+}
+
+static void weighted_price_worker_destroy(
+    WeightedPriceWorker *worker
+) {
+    if (!worker) return;
+    free(worker->edges);
+    free(worker->selected);
+    free(worker->forbidden);
+    free(worker->selected_vertices);
+    free(worker->hit_count);
+    free(worker->critical_count);
+    free(worker->inc_offset);
+    free(worker->inc_cursor);
+    free(worker->cover);
+    free(worker->allowed);
+    free(worker->inactive_vertices);
+    free(worker->inc_edges);
+    free(worker->best_vertices);
+    free(worker->local_batch.weights);
+    free(worker->local_batch.anchors);
+    free(worker->local_batch.support_sizes);
+    free(worker->local_batch.vertices);
+    free(worker->local_batch.coverage);
+    memset(worker, 0, sizeof(*worker));
+}
+
+static bool weighted_price_worker_init(
+    WeightedPriceWorker *worker,
+    const PIstorage *pi,
+    const WeightedMMCSPreparedRows *prepared,
+    int max_level,
+    const double *row_weights,
+    const double *root_upper_bounds,
+    int local_batch_capacity,
+    bool collect_timing,
+    bool apply_root_gate,
+    bool use_materialized_backend,
+    bool cache_edge_words,
+    bool disable_cover_bound
+) {
+    memset(worker, 0, sizeof(*worker));
+    worker->pi = pi;
+    worker->ninputs = prepared->ninputs;
+    worker->max_level = max_level;
+    worker->edge_words = prepared->row_words;
+    worker->max_edges = pi->OFF_minterms + pi->ON_minterms - 1;
+    worker->row_weights = row_weights;
+    worker->root_upper_bounds = root_upper_bounds;
+    worker->prepared = prepared;
+    worker->collect_timing = collect_timing;
+    worker->apply_root_gate = apply_root_gate;
+    worker->use_materialized_backend = use_materialized_backend;
+    worker->cache_edge_words = cache_edge_words && max_level > 1;
+    worker->disable_cover_bound = disable_cover_bound;
+    worker->status = WEIGHTED_MMCS_PRICE_OK;
+    worker->first_incomplete_anchor = -1;
+    int ninputs = prepared->ninputs;
+
+    if (use_materialized_backend || worker->cache_edge_words) {
+        worker->edges = (uint64_t *)calloc(
+            (size_t)worker->max_edges * (size_t)worker->edge_words,
+            sizeof(uint64_t)
+        );
+    }
+    worker->selected = (unsigned char *)calloc(
+        (size_t)ninputs,
+        sizeof(unsigned char)
+    );
+    worker->forbidden = (unsigned char *)calloc(
+        (size_t)ninputs,
+        sizeof(unsigned char)
+    );
+    worker->selected_vertices =
+        (int *)calloc((size_t)ninputs, sizeof(int));
+    worker->hit_count =
+        (int *)calloc((size_t)worker->max_edges, sizeof(int));
+    worker->critical_count =
+        (int *)calloc((size_t)ninputs, sizeof(int));
+    if (use_materialized_backend) {
+        worker->inc_offset =
+            (int *)calloc((size_t)ninputs + 1, sizeof(int));
+        worker->inc_cursor =
+            (int *)calloc((size_t)ninputs + 1, sizeof(int));
+    }
+    worker->cover = (int *)calloc((size_t)ninputs, sizeof(int));
+    worker->allowed =
+        (int *)calloc((size_t)worker->max_edges, sizeof(int));
+    worker->inactive_vertices = (uint64_t *)calloc(
+        (size_t)worker->edge_words,
+        sizeof(uint64_t)
+    );
+    worker->best_vertices =
+        (int *)calloc((size_t)ninputs, sizeof(int));
+    if (local_batch_capacity > 0) {
+        WeightedMMCSPriceBatch *local = &worker->local_batch;
+        local->capacity = local_batch_capacity;
+        local->weights = (double *)malloc(
+            (size_t)local_batch_capacity * sizeof(double)
+        );
+        local->anchors = (int *)malloc(
+            (size_t)local_batch_capacity * sizeof(int)
+        );
+        local->support_sizes = (int *)malloc(
+            (size_t)local_batch_capacity * sizeof(int)
+        );
+        local->vertices = (int *)malloc(
+            (size_t)local_batch_capacity *
+            (size_t)ninputs *
+            sizeof(int)
+        );
+        local->coverage = (uint64_t *)malloc(
+            (size_t)local_batch_capacity *
+            (size_t)pi->pichart_words *
+            sizeof(uint64_t)
+        );
+    }
+    if (
+        (
+            (use_materialized_backend || worker->cache_edge_words) &&
+            !worker->edges
+        ) ||
+        !worker->selected ||
+        !worker->forbidden ||
+        !worker->selected_vertices ||
+        !worker->hit_count ||
+        !worker->critical_count ||
+        (use_materialized_backend && !worker->inc_offset) ||
+        (use_materialized_backend && !worker->inc_cursor) ||
+        !worker->cover ||
+        !worker->allowed ||
+        !worker->inactive_vertices ||
+        !worker->best_vertices ||
+        (
+            local_batch_capacity > 0 &&
+            (
+                !worker->local_batch.weights ||
+                !worker->local_batch.anchors ||
+                !worker->local_batch.support_sizes ||
+                !worker->local_batch.vertices ||
+                !worker->local_batch.coverage
+            )
+        )
+    ) {
+        weighted_price_worker_destroy(worker);
+        return false;
+    }
+
+    worker->price = (WeightedPriceContext){
+        .pi = pi,
+        .ninputs = ninputs,
+        .row_weights = row_weights,
+        .best_vertices = worker->best_vertices,
+        .best_weight = -INFINITY,
+        .best_anchor = -1,
+        .best_support_size = 0,
+        .weight_prunes = 0,
+        .local_batch = local_batch_capacity > 0
+            ? &worker->local_batch
+            : NULL,
+        .telemetry = collect_timing ? &worker->telemetry : NULL,
+        .collect_timing = collect_timing
+    };
+    return true;
+}
+
+static uint32_t prepared_on_ones_before(
+    const WeightedMMCSPreparedRows *prepared,
+    int vertex,
+    int row_limit
+) {
+    int full_words = row_limit / 64;
+    int remaining = row_limit % 64;
+    const uint32_t *prefix = &prepared->on_column_prefix_ones[
+        (size_t)vertex * (size_t)(prepared->on_column_words + 1)
+    ];
+    uint32_t ones = prefix[full_words];
+    if (remaining > 0) {
+        const uint64_t *column = &prepared->on_columns[
+            (size_t)vertex * (size_t)prepared->on_column_words
+        ];
+        ones += (uint32_t)__builtin_popcountll(
+            column[full_words] & low_bits_mask(remaining)
+        );
+    }
+    return ones;
+}
+
+static uint64_t prepared_anchor_incidence_count(
+    const WeightedMMCSPreparedRows *prepared,
+    const uint64_t *anchor_bits,
+    int anchor_index
+) {
+    uint64_t count = 0;
+    for (int vertex = 0; vertex < prepared->ninputs; ++vertex) {
+        bool anchor_is_one = (
+            anchor_bits[vertex / 64] &
+            (UINT64_C(1) << (vertex % 64))
+        ) != 0;
+        uint32_t off_ones = prepared->off_one_counts[vertex];
+        uint32_t on_ones = prepared_on_ones_before(
+            prepared,
+            vertex,
+            anchor_index
+        );
+        count += anchor_is_one
+            ? (uint64_t)(prepared->off_rows - (int)off_ones) +
+                (uint64_t)(anchor_index - (int)on_ones)
+            : (uint64_t)off_ones + (uint64_t)on_ones;
+    }
+    return count;
+}
+
+typedef struct {
+    int index;
+    int edge_count;
+    const int *values;
+    const uint64_t *packed_values;
+} WeightedAnchorPlan;
+
+static bool weighted_price_anchor_precheck(
+    WeightedPriceWorker *worker,
+    int on,
+    WeightedAnchorPlan *anchor
+) {
+    const PIstorage *pi = worker->pi;
+    *anchor = (WeightedAnchorPlan){
+        .index = on,
+        .edge_count = pi->OFF_minterms + on,
+        .values = &pi->ON_set[
+            (size_t)on * (size_t)worker->ninputs
+        ],
+        .packed_values = &worker->prepared->on_bits[
+            (size_t)on * (size_t)worker->edge_words
+        ]
+    };
+    WeightedMMCSPriceTelemetry *telemetry = &worker->telemetry;
+    telemetry->anchors_presented++;
+    if (
+        worker->root_upper_bounds[on] >
+        1.0 + WEIGHTED_MMCS_REDUCED_COST_TOL
+    ) {
+        return true;
+    }
+
+    telemetry->prospective_gated_anchors++;
+    telemetry->prospective_gated_edges +=
+        (uint64_t)anchor->edge_count;
+    telemetry->prospective_gated_incidences +=
+        prepared_anchor_incidence_count(
+            worker->prepared,
+            anchor->packed_values,
+            on
+        );
+    return !worker->apply_root_gate;
+}
+
+static bool weighted_price_anchor_prepare(
+    WeightedPriceWorker *worker,
+    const WeightedAnchorPlan *anchor
+) {
+    const PIstorage *pi = worker->pi;
+    int ninputs = worker->ninputs;
+    int edge_words = worker->edge_words;
+    int on = anchor->index;
+    int edge_count = anchor->edge_count;
+    const uint64_t *packed_anchor = anchor->packed_values;
+    WeightedMMCSPriceTelemetry *telemetry = &worker->telemetry;
+
+    telemetry->anchors_constructed++;
+    if (worker->edges) {
+        telemetry->edges_constructed += (uint64_t)edge_count;
+    }
+    telemetry->xor_words +=
+        (uint64_t)edge_count * (uint64_t)edge_words;
+
+    uint64_t edge_started = worker->collect_timing
+        ? monotonic_nanoseconds()
+        : 0;
+    for (int edge = 0; edge < edge_count; ++edge) {
+        const uint64_t *other = edge < pi->OFF_minterms
+            ? &worker->prepared->off_bits[
+                (size_t)edge * (size_t)edge_words
+            ]
+            : &worker->prepared->on_bits[
+                (size_t)(edge - pi->OFF_minterms) *
+                (size_t)edge_words
+            ];
+        uint64_t combined = 0;
+        int edge_size = 0;
+        for (int word = 0; word < edge_words; ++word) {
+            uint64_t difference = packed_anchor[word] ^ other[word];
+            if (worker->edges) {
+                worker->edges[
+                    (size_t)edge * (size_t)edge_words + (size_t)word
+                ] = difference;
+            }
+            combined |= difference;
+            edge_size += __builtin_popcountll(difference);
+        }
+        if (combined == 0) {
+            worker->status = WEIGHTED_MMCS_PRICE_INVALID;
+            return false;
+        }
+        worker->allowed[edge] = edge_size;
+    }
+    if (edge_started > 0) {
+        telemetry->edge_build_nanoseconds +=
+            monotonic_nanoseconds() - edge_started;
+    }
+
+    uint64_t count_started = worker->collect_timing
+        ? monotonic_nanoseconds()
+        : 0;
+    memset(worker->selected, 0, (size_t)ninputs * sizeof(unsigned char));
+    memset(worker->forbidden, 0, (size_t)ninputs * sizeof(unsigned char));
+    memset(worker->selected_vertices, 0, (size_t)ninputs * sizeof(int));
+    memset(worker->hit_count, 0, (size_t)edge_count * sizeof(int));
+    memset(worker->critical_count, 0, (size_t)ninputs * sizeof(int));
+    memset(
+        worker->inactive_vertices,
+        0,
+        (size_t)edge_words * sizeof(uint64_t)
+    );
+    if (worker->use_materialized_backend) {
+        memset(
+            worker->inc_offset,
+            0,
+            (size_t)(ninputs + 1) * sizeof(int)
+        );
+
+        size_t incidence_entries = 0;
+        for (int edge = 0; edge < edge_count; ++edge) {
+            const uint64_t *bits = &worker->edges[
+                (size_t)edge * (size_t)edge_words
+            ];
+            int size = 0;
+            for (int word = 0; word < edge_words; ++word) {
+                uint64_t values = bits[word];
+                while (values) {
+                    int vertex = word * 64 + __builtin_ctzll(values);
+                    values &= values - 1;
+                    worker->inc_offset[vertex + 1]++;
+                    size++;
+                }
+            }
+            incidence_entries += (size_t)size;
+        }
+        telemetry->incidences_counted += (uint64_t)incidence_entries;
+        if (count_started > 0) {
+            telemetry->incidence_count_nanoseconds +=
+                monotonic_nanoseconds() - count_started;
+        }
+        if (!ensure_incidence_capacity(worker, incidence_entries)) {
+            worker->status = WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+            return false;
+        }
+        if (incidence_entries > worker->peak_incidence_entries) {
+            worker->peak_incidence_entries = incidence_entries;
+        }
+        uint64_t fill_started = worker->collect_timing
+            ? monotonic_nanoseconds()
+            : 0;
+        for (int vertex = 0; vertex < ninputs; ++vertex) {
+            worker->inc_offset[vertex + 1] +=
+                worker->inc_offset[vertex];
+            worker->cover[vertex] = 0;
+        }
+        memcpy(
+            worker->inc_cursor,
+            worker->inc_offset,
+            (size_t)ninputs * sizeof(int)
+        );
+        for (int edge = 0; edge < edge_count; ++edge) {
+            const uint64_t *bits = &worker->edges[
+                (size_t)edge * (size_t)edge_words
+            ];
+            for (int word = 0; word < edge_words; ++word) {
+                uint64_t values = bits[word];
+                while (values) {
+                    int vertex = word * 64 + __builtin_ctzll(values);
+                    values &= values - 1;
+                    worker->inc_edges[
+                        worker->inc_cursor[vertex]++
+                    ] = edge;
+                    if (!worker->disable_cover_bound) {
+                        worker->cover[vertex]++;
+                    }
+                }
+            }
+        }
+        telemetry->incidences_written += (uint64_t)incidence_entries;
+        if (fill_started > 0) {
+            telemetry->incidence_fill_nanoseconds +=
+                monotonic_nanoseconds() - fill_started;
+        }
+    } else {
+        if (!worker->disable_cover_bound) {
+            for (int vertex = 0; vertex < ninputs; ++vertex) {
+                bool anchor_is_one = (
+                    packed_anchor[vertex / 64] &
+                    (UINT64_C(1) << (vertex % 64))
+                ) != 0;
+                uint32_t off_ones =
+                    worker->prepared->off_one_counts[vertex];
+                uint32_t on_ones = prepared_on_ones_before(
+                    worker->prepared,
+                    vertex,
+                    on
+                );
+                worker->cover[vertex] = anchor_is_one
+                    ? pi->OFF_minterms - (int)off_ones +
+                        on - (int)on_ones
+                    : (int)off_ones + (int)on_ones;
+            }
+        }
+        if (count_started > 0) {
+            telemetry->incidence_count_nanoseconds +=
+                monotonic_nanoseconds() - count_started;
+        }
+    }
+    return true;
+}
+
+static void weighted_price_anchor_search(
+    WeightedPriceWorker *worker,
+    const WeightedAnchorPlan *anchor,
+    uint64_t deadline_nanoseconds
+) {
+    const PIstorage *pi = worker->pi;
+    WeightedMMCSPriceTelemetry *telemetry = &worker->telemetry;
+    worker->price.anchor = anchor->values;
+    worker->price.anchor_index = anchor->index;
+    MMCSState state = {
+        .ninputs = worker->ninputs,
+        .edge_count = anchor->edge_count,
+        .critical_edge_count = pi->OFF_minterms,
+        .edge_words = worker->edge_words,
+        .target_size = worker->max_level,
+        .exact_size = false,
+        .edges = worker->edges,
+        .prepared = worker->prepared,
+        .anchor_bits = anchor->packed_values,
+        .anchor_index = anchor->index,
+        .transposed_incidence = !worker->use_materialized_backend,
+        .selected = worker->selected,
+        .forbidden = worker->forbidden,
+        .selected_vertices = worker->selected_vertices,
+        .selected_count = 0,
+        .hit_count = worker->hit_count,
+        .critical_count = worker->critical_count,
+        .uncovered_count = anchor->edge_count,
+        .inc_offset = worker->inc_offset,
+        .inc_edges = worker->inc_edges,
+        .cover = worker->cover,
+        .allowed = worker->allowed,
+        .inactive_vertices = worker->inactive_vertices,
+        .emit = collect_weighted_price,
+        .emit_data = &worker->price,
+        .prune = weighted_price_prune,
+        .branch_priority = weighted_branch_priority,
+        .search_data = &worker->price,
+        .stats = &worker->search_stats,
+        .telemetry = worker->collect_timing ? telemetry : NULL,
+        .node_limit = 0,
+        .deadline_nanoseconds = deadline_nanoseconds,
+        .disable_cover_bound = worker->disable_cover_bound,
+        .limit_reached = false,
+        .failed = false
+    };
+    uint64_t search_started = worker->collect_timing
+        ? monotonic_nanoseconds()
+        : 0;
+    mmcs_search(&state);
+    if (search_started > 0) {
+        telemetry->search_nanoseconds +=
+            monotonic_nanoseconds() - search_started;
+    }
+    if (state.failed) {
+        worker->status = WEIGHTED_MMCS_PRICE_INVALID;
+    } else if (state.limit_reached) {
+        worker->status = WEIGHTED_MMCS_PRICE_LIMIT_REACHED;
+        worker->first_incomplete_anchor = anchor->index;
+    } else {
+        worker->anchors_completed++;
+    }
+}
+
+static void weighted_price_search_anchor(
+    WeightedPriceWorker *worker,
+    int on,
+    uint64_t deadline_nanoseconds
+) {
+    WeightedAnchorPlan anchor;
+    if (!weighted_price_anchor_precheck(worker, on, &anchor)) {
+        worker->anchors_completed++;
+        return;
+    }
+    if (!weighted_price_anchor_prepare(worker, &anchor)) return;
+    weighted_price_anchor_search(worker, &anchor, deadline_nanoseconds);
+}
+
+static void weighted_price_worker_range(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)start;
+    (void)end;
+    (void)stride;
+    (void)worker_count;
+    WeightedParallelContext *parallel =
+        (WeightedParallelContext *)data;
+    WeightedPriceWorker *worker = &parallel->workers[worker_id];
+    while (worker->status == WEIGHTED_MMCS_PRICE_OK) {
+        if (atomic_load_explicit(
+            &parallel->limit_reached,
+            memory_order_acquire
+        )) {
+            break;
+        }
+        if (
+            parallel->deadline_nanoseconds > 0 &&
+            monotonic_nanoseconds() >= parallel->deadline_nanoseconds &&
+            atomic_load_explicit(
+                &parallel->next_anchor,
+                memory_order_relaxed
+            ) < parallel->anchor_count
+        ) {
+            atomic_store_explicit(
+                &parallel->limit_reached,
+                true,
+                memory_order_release
+            );
+            break;
+        }
+        int on = atomic_fetch_add_explicit(
+            &parallel->next_anchor,
+            1,
+            memory_order_relaxed
+        );
+        if (on >= parallel->anchor_count) break;
+        weighted_price_search_anchor(
+            worker,
+            on,
+            parallel->deadline_nanoseconds
+        );
+        if (worker->status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED) {
+            atomic_store_explicit(
+                &parallel->limit_reached,
+                true,
+                memory_order_release
+            );
+            break;
+        }
+        if (
+            parallel->deadline_nanoseconds > 0 &&
+            monotonic_nanoseconds() >= parallel->deadline_nanoseconds &&
+            atomic_load_explicit(
+                &parallel->next_anchor,
+                memory_order_relaxed
+            ) < parallel->anchor_count
+        ) {
+            atomic_store_explicit(
+                &parallel->limit_reached,
+                true,
+                memory_order_release
+            );
+        }
+    }
+}
+
+static uint64_t weighted_worker_bytes_estimate(
+    const PIstorage *pi,
+    int ninputs,
+    bool use_materialized_backend,
+    bool cache_edge_words
+) {
+    uint64_t edges =
+        (uint64_t)pi->OFF_minterms + (uint64_t)pi->ON_minterms - 1u;
+    uint64_t edge_words = ((uint64_t)ninputs + 63u) / 64u;
+    uint64_t bytes = 0;
+
+    if (use_materialized_backend || cache_edge_words) {
+        if (edges > UINT64_MAX / edge_words / sizeof(uint64_t)) {
+            return UINT64_MAX;
+        }
+        bytes += edges * edge_words * sizeof(uint64_t);
+    }
+
+    if (use_materialized_backend) {
+        if (edges > UINT64_MAX / (uint64_t)ninputs / sizeof(int)) {
+            return UINT64_MAX;
+        }
+        uint64_t worst_incidence =
+            edges * (uint64_t)ninputs * sizeof(int);
+        if (bytes > UINT64_MAX - worst_incidence) return UINT64_MAX;
+        bytes += worst_incidence;
+    }
+
+    uint64_t edge_arrays = edges * 2u * sizeof(int);
+    uint64_t input_arrays =
+        (
+            (uint64_t)ninputs *
+            (use_materialized_backend ? 7u : 4u) +
+            (use_materialized_backend ? 2u : 0u)
+        ) * sizeof(int) +
+        (uint64_t)ninputs * 2u * sizeof(unsigned char) +
+        edge_words * sizeof(uint64_t);
+    if (
+        bytes > UINT64_MAX - edge_arrays ||
+        bytes + edge_arrays > UINT64_MAX - input_arrays
+    ) {
+        return UINT64_MAX;
+    }
+    return bytes + edge_arrays + input_arrays;
+}
+
+typedef struct {
+    double mass;
+    int input;
+} WeightedAnchorLiteral;
+
+static int compare_anchor_literal_mass(const void *lhs, const void *rhs) {
+    const WeightedAnchorLiteral *a = lhs;
+    const WeightedAnchorLiteral *b = rhs;
+    if (a->mass != b->mass) return a->mass > b->mass ? -1 : 1;
+    return (a->input > b->input) - (a->input < b->input);
+}
+
+static double interrupted_anchor_upper_bound(
+    const PIstorage *pi,
+    const WeightedMMCSPreparedRows *prepared,
+    const double *weights,
+    int anchor,
+    double suffix,
+    WeightedAnchorLiteral *literals,
+    uint64_t *remaining_off
+) {
+    int ninputs = prepared->ninputs;
+    const int *point = &pi->ON_set[(size_t)anchor * (size_t)ninputs];
+    for (int input = 0; input < ninputs; ++input) {
+        double mass = 0.0;
+        for (int row = anchor; row < pi->ON_minterms; ++row) {
+            if (
+                weights[row] > 0.0 &&
+                pi->ON_set[(size_t)row * (size_t)ninputs + (size_t)input]
+                    == point[input]
+            ) {
+                mass = nextafter(mass + weights[row], INFINITY);
+            }
+        }
+        literals[input] = (WeightedAnchorLiteral){ .mass = mass, .input = input };
+    }
+    qsort(literals, (size_t)ninputs, sizeof(*literals), compare_anchor_literal_mass);
+
+    int words = prepared->off_column_words;
+    memset(remaining_off, 0xff, (size_t)words * sizeof(*remaining_off));
+    int tail = pi->OFF_minterms % 64;
+    if (tail) remaining_off[words - 1] = (UINT64_C(1) << tail) - 1;
+    for (int index = 0; index < ninputs; ++index) {
+        int input = literals[index].input;
+        const uint64_t *column = &prepared->off_columns[(size_t)input * (size_t)words];
+        uint64_t any_remaining = 0;
+        for (int word = 0; word < words; ++word) {
+            remaining_off[word] &= point[input] == 2 ? column[word] : ~column[word];
+            any_remaining |= remaining_off[word];
+        }
+        // The last OFF point blocked by this prefix supplies the smallest
+        // maximum literal mass among all OFF difference edges.
+        if (!any_remaining) return fmin(suffix, literals[index].mass);
+    }
+    return suffix;
+}
+
+WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
+    const PIstorage *pi,
+    const WeightedMMCSPreparedRows *prepared,
+    int max_level,
+    const double *row_weights,
+    int *best_vertices,
+    WeightedMMCSPriceBatch *batch,
+    const WeightedMMCSPriceOptions *options,
+    WeightedMMCSPriceResult *result
+) {
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->best_weight = -INFINITY;
+        result->max_weight_upper_bound = INFINITY;
+        result->best_anchor = -1;
+    }
+    if (
+        !pi ||
+        !prepared ||
+        prepared->ninputs <= 0 ||
+        max_level <= 0 ||
+        max_level > prepared->ninputs ||
+        !row_weights ||
+        !best_vertices ||
+        !result ||
+        (options && options->anchor_limit < 0) ||
+        pi->ON_minterms <= 0 ||
+        pi->OFF_minterms <= 0 ||
+        !pi->ON_set ||
+        !pi->OFF_set
+    ) {
+        return WEIGHTED_MMCS_PRICE_INVALID;
+    }
+    int ninputs = prepared->ninputs;
+    if (
+        prepared->row_words != (ninputs + 63) / 64 ||
+        prepared->on_rows != pi->ON_minterms ||
+        prepared->off_rows != pi->OFF_minterms ||
+        prepared->on_column_words != (pi->ON_minterms + 63) / 64 ||
+        prepared->off_column_words != (pi->OFF_minterms + 63) / 64 ||
+        !prepared->on_bits ||
+        !prepared->off_bits ||
+        !prepared->on_columns ||
+        !prepared->off_columns ||
+        !prepared->on_column_prefix_ones ||
+        !prepared->off_one_counts
+    ) {
+        return WEIGHTED_MMCS_PRICE_INVALID;
+    }
+    if (batch) {
+        batch->count = 0;
+        if (
+            batch->capacity <= 0 ||
+            !batch->weights ||
+            !batch->anchors ||
+            !batch->support_sizes ||
+            !batch->vertices ||
+            !batch->coverage ||
+            pi->pichart_words <= 0 ||
+            pi->cov_bits <= 0
+        ) {
+            return WEIGHTED_MMCS_PRICE_INVALID;
+        }
+    }
+
+    for (int row = 0; row < pi->ON_minterms; ++row) {
+        if (!isfinite(row_weights[row])) {
+            return WEIGHTED_MMCS_PRICE_INVALID;
+        }
+    }
+
+    int anchor_count = pi->ON_minterms;
+    if (
+        options &&
+        options->anchor_limit > 0 &&
+        options->anchor_limit < anchor_count
+    ) {
+        anchor_count = options->anchor_limit;
+    }
+    result->anchors_total = pi->ON_minterms;
+    int nthreads = options && options->requested_threads > 0
+        ? options->requested_threads
+        : ccubes_thread_count();
+    nthreads = ccubes_effective_thread_count(nthreads);
+    if (nthreads > anchor_count) nthreads = anchor_count;
+    if (nthreads < 1) nthreads = 1;
+
+    bool apply_root_gate = options && options->enable_root_gate;
+    bool use_materialized_backend =
+        options && options->use_materialized_backend;
+    bool cache_edge_words = options && options->cache_edge_words;
+    bool disable_cover_bound =
+        options && options->disable_cover_bound;
+    uint64_t estimated_worker_bytes = weighted_worker_bytes_estimate(
+        pi,
+        ninputs,
+        use_materialized_backend,
+        cache_edge_words && max_level > 1
+    );
+    uint64_t worker_budget = options
+        ? options->worker_memory_budget_bytes
+        : 0;
+    if (worker_budget > 0) {
+        if (estimated_worker_bytes == 0 || estimated_worker_bytes == UINT64_MAX) {
+            return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+        }
+        uint64_t memory_threads = worker_budget / estimated_worker_bytes;
+        if (memory_threads < 1u) {
+            return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+        }
+        if ((uint64_t)nthreads > memory_threads) {
+            nthreads = memory_threads > (uint64_t)INT_MAX
+                ? INT_MAX
+                : (int)memory_threads;
+        }
+    }
+    result->effective_threads = nthreads;
+    result->estimated_bytes_per_worker = estimated_worker_bytes;
+    bool collect_timing = options && options->collect_timing;
+    uint64_t pricing_call_started = collect_timing
+        ? monotonic_nanoseconds()
+        : 0;
+
+    double *root_upper_bounds = (double *)malloc(
+        (size_t)pi->ON_minterms * sizeof(double)
+    );
+    if (!root_upper_bounds) {
+        return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+    }
+    double suffix = 0.0;
+    for (int row = pi->ON_minterms - 1; row >= 0; --row) {
+        if (row_weights[row] > 0.0) suffix += row_weights[row];
+        root_upper_bounds[row] = suffix;
+    }
+
+    WeightedPriceWorker *workers = (WeightedPriceWorker *)calloc(
+        (size_t)nthreads,
+        sizeof(WeightedPriceWorker)
+    );
+    if (!workers) {
+        free(root_upper_bounds);
+        return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+    }
+
+    int initialized = 0;
+    for (; initialized < nthreads; ++initialized) {
+        int local_batch_capacity = batch ? batch->capacity : 0;
+        if (!weighted_price_worker_init(
+            &workers[initialized],
+            pi,
+            prepared,
+            max_level,
+            row_weights,
+            root_upper_bounds,
+            local_batch_capacity,
+            collect_timing,
+            apply_root_gate,
+            use_materialized_backend,
+            cache_edge_words,
+            disable_cover_bound
+        )) {
+            break;
+        }
+    }
+    if (initialized != nthreads) {
+        for (int i = 0; i < initialized; ++i) {
+            weighted_price_worker_destroy(&workers[i]);
+        }
+        free(workers);
+        free(root_upper_bounds);
+        return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+    }
+
+    WeightedParallelContext parallel = {
+        .workers = workers,
+        .anchor_count = anchor_count,
+        .deadline_nanoseconds = options
+            ? options->deadline_nanoseconds
+            : 0
+    };
+    atomic_init(&parallel.next_anchor, 0);
+    atomic_init(&parallel.limit_reached, false);
+    WeightedMMCSPriceStatus status = WEIGHTED_MMCS_PRICE_OK;
+    if (!ccubes_parallel_for(
+        0,
+        (uint64_t)nthreads,
+        nthreads,
+        false,
+        weighted_price_worker_range,
+        &parallel
+    )) {
+        status = WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+    }
+    if (
+        status == WEIGHTED_MMCS_PRICE_OK &&
+        atomic_load_explicit(
+            &parallel.limit_reached,
+            memory_order_acquire
+        )
+    ) {
+        status = WEIGHTED_MMCS_PRICE_LIMIT_REACHED;
+        result->limit_reached = true;
+    }
+    result->anchor_sweep_complete =
+        status == WEIGHTED_MMCS_PRICE_OK &&
+        anchor_count == pi->ON_minterms;
+
+    int assigned_anchors = atomic_load_explicit(
+        &parallel.next_anchor,
+        memory_order_acquire
+    );
+    if (assigned_anchors < 0) assigned_anchors = 0;
+    if (assigned_anchors > anchor_count) assigned_anchors = anchor_count;
+    int earliest_unfinished = assigned_anchors;
+
+    int best_worker = -1;
+    for (int worker = 0; worker < nthreads; ++worker) {
+        if (
+            workers[worker].status != WEIGHTED_MMCS_PRICE_OK &&
+            (
+                status == WEIGHTED_MMCS_PRICE_OK ||
+                status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED
+            )
+        ) {
+            status = workers[worker].status;
+        }
+        result->search_nodes +=
+            workers[worker].search_stats.search_nodes;
+        result->anchors_completed += workers[worker].anchors_completed;
+        if (
+            workers[worker].first_incomplete_anchor >= 0 &&
+            workers[worker].first_incomplete_anchor < earliest_unfinished
+        ) {
+            earliest_unfinished =
+                workers[worker].first_incomplete_anchor;
+        }
+        result->completed_transversals +=
+            workers[worker].search_stats.completed_transversals;
+        result->weight_prunes += workers[worker].price.weight_prunes;
+        add_price_telemetry(
+            &result->telemetry,
+            &workers[worker].telemetry
+        );
+        if (
+            workers[worker].peak_incidence_entries >
+            result->peak_incidence_entries
+        ) {
+            result->peak_incidence_entries =
+                workers[worker].peak_incidence_entries;
+        }
+
+        if (workers[worker].price.best_anchor < 0) continue;
+        if (
+            best_worker < 0 ||
+            workers[worker].price.best_weight >
+                workers[best_worker].price.best_weight ||
+            (
+                workers[worker].price.best_weight ==
+                    workers[best_worker].price.best_weight &&
+                weighted_geometry_precedes(
+                    workers[worker].price.best_anchor,
+                    workers[worker].price.best_support_size,
+                    workers[worker].best_vertices,
+                    workers[best_worker].price.best_anchor,
+                    workers[best_worker].price.best_support_size,
+                    workers[best_worker].best_vertices,
+                    ninputs
+                )
+            )
+        ) {
+            best_worker = worker;
+        }
+    }
+
+    if (
+        (
+            status == WEIGHTED_MMCS_PRICE_OK ||
+            status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED
+        ) &&
+        best_worker >= 0
+    ) {
+        result->best_weight = workers[best_worker].price.best_weight;
+        result->best_anchor = workers[best_worker].price.best_anchor;
+        result->best_support_size =
+            workers[best_worker].price.best_support_size;
+        memcpy(
+            best_vertices,
+            workers[best_worker].best_vertices,
+            (size_t)result->best_support_size * sizeof(int)
+        );
+    }
+    if (
+        status == WEIGHTED_MMCS_PRICE_OK ||
+        status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED
+    ) {
+        double upper = best_worker >= 0
+            ? workers[best_worker].price.best_weight
+            : 0.0;
+        /*
+         * Workers claim anchors monotonically. After joining, every claimed
+         * anchor either finished or is recorded as interrupted by its worker.
+         * Use the original suffix for unassigned anchors and tighten each
+         * interrupted anchor separately. Root-gated pricing retains its
+         * existing fallback.
+         */
+        if (
+            status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED &&
+            !apply_root_gate &&
+            earliest_unfinished < assigned_anchors
+        ) {
+            // Never-assigned anchors remain covered by their original suffix.
+            if (assigned_anchors < pi->ON_minterms) {
+                upper = fmax(upper, root_upper_bounds[assigned_anchors]);
+            }
+            WeightedAnchorLiteral *literals = malloc((size_t)ninputs * sizeof(*literals));
+            uint64_t *remaining_off = malloc(
+                (size_t)prepared->off_column_words * sizeof(*remaining_off)
+            );
+            uint64_t work_left = WEIGHTED_MMCS_TIMEOUT_BOUND_WORK;
+            for (int worker = 0; worker < nthreads; ++worker) {
+                int anchor = workers[worker].first_incomplete_anchor;
+                if (anchor < 0 || root_upper_bounds[anchor] <= upper) continue;
+                double unfinished = root_upper_bounds[anchor];
+                uint64_t work = (uint64_t)ninputs * (
+                    (uint64_t)(pi->ON_minterms - anchor) +
+                    (uint64_t)prepared->off_column_words
+                );
+                if (literals && remaining_off && work <= work_left) {
+                    work_left -= work;
+                    unfinished = interrupted_anchor_upper_bound(
+                        pi, prepared, row_weights, anchor, unfinished, literals, remaining_off
+                    );
+                }
+                upper = fmax(upper, unfinished);
+            }
+            free(remaining_off);
+            free(literals);
+        } else if (earliest_unfinished < pi->ON_minterms) {
+            double unfinished = root_upper_bounds[earliest_unfinished];
+            if (unfinished > upper) upper = unfinished;
+        }
+        result->max_weight_upper_bound = upper;
+    }
+    if (
+        (
+            status == WEIGHTED_MMCS_PRICE_OK ||
+            status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED
+        ) &&
+        batch
+    ) {
+        uint64_t merge_started = collect_timing
+            ? monotonic_nanoseconds()
+            : 0;
+        if (!weighted_merge_local_batches(
+            workers,
+            nthreads,
+            batch,
+            ninputs,
+            pi->pichart_words
+        )) {
+            status = WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+        }
+        if (merge_started > 0) {
+            result->telemetry.merge_nanoseconds +=
+                monotonic_nanoseconds() - merge_started;
+        }
+    }
+
+    for (int worker = 0; worker < nthreads; ++worker) {
+        weighted_price_worker_destroy(&workers[worker]);
+    }
+    free(workers);
+    free(root_upper_bounds);
+    if (pricing_call_started > 0) {
+        result->telemetry.pricing_call_nanoseconds +=
+            monotonic_nanoseconds() - pricing_call_started;
+    }
+    return status;
+}
+
+WeightedMMCSPriceStatus bounded_mmcs_price_output_batch(
+    const PIstorage *pi,
+    int ninputs,
+    int max_level,
+    const double *row_weights,
+    int *best_vertices,
+    WeightedMMCSPriceBatch *batch,
+    WeightedMMCSPriceResult *result
+) {
+    WeightedMMCSPreparedRows prepared;
+    if (!bounded_mmcs_prepare_binary_rows(pi, ninputs, &prepared)) {
+        return WEIGHTED_MMCS_PRICE_UNSUPPORTED;
+    }
+    WeightedMMCSPriceStatus status =
+        bounded_mmcs_price_output_batch_prepared(
+            pi,
+            &prepared,
+            max_level,
+            row_weights,
+            best_vertices,
+            batch,
+            NULL,
+            result
+        );
+    bounded_mmcs_prepared_rows_destroy(&prepared);
+    return status;
+}
+
+WeightedMMCSPriceStatus bounded_mmcs_price_output(
+    const PIstorage *pi,
+    int ninputs,
+    int max_level,
+    const double *row_weights,
+    int *best_vertices,
+    WeightedMMCSPriceResult *result
+) {
+    return bounded_mmcs_price_output_batch(
+        pi,
+        ninputs,
+        max_level,
+        row_weights,
+        best_vertices,
+        NULL,
+        result
+    );
 }
 
 BoundedMMCSResult bounded_mmcs_generate_output_level_limited(

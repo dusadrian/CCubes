@@ -1,6 +1,6 @@
 # Configuration cleanup and migration
 
-This first cleanup covers the tracked executable sources, build rules, maintained tests, and README. There were four live application environment settings in that code. Older ignored experiments, benchmark archives, generated objects, and results are not part of the supported interface and have not been deleted.
+The public solver uses formal command-line arguments. The table below records the four former ordinary environment controls. Native IPC uses the same explicit configuration model.
 
 ## Runtime environment audit
 
@@ -8,10 +8,10 @@ This first cleanup covers the tracked executable sources, build rules, maintaine
 | --- | --- | --- |
 | `CCUBES_DETERMINISTIC` | Keep reproducible PI ordering; remove environment lookup. | `--deterministic` |
 | `CCUBES_LOCK_STATS` | Keep useful contention profiling; pass enablement explicitly to the profiler. | `--lock-stats` |
-| `CCUBES_TEST_PI_GENERATOR` | Remove forced-generator overrides from the production CLI; keep differential testing. | `--test-pi-generator` in the separate test executable only. |
-| `CCUBES_TEST_PROJECTION_RWLS` | Remove experimental RWLS activation from production; retain the implementation and its regression evidence for research. | `--test-projection-rwls` in the separate test executable only. |
+| `CCUBES_TEST_PI_GENERATOR` | Retire forced-generator overrides. | Generator comparisons live in CCubesIPC. |
+| `CCUBES_TEST_PROJECTION_RWLS` | Retire experimental RWLS activation. | The ordinary projection RWLS test build lives in CCubesIPC. |
 
-Neither executable reads these variables. The generic `env_flag_enabled()` helper was removed. `GRBgetenv(model)` is Gurobi's model-environment API, not a process-environment lookup, and remains unchanged. Standard runtime settings consumed by OpenMP and Gurobi, including license configuration, are outside the removed application switches.
+CCubes reads its application settings from command-line arguments. OpenMP and Gurobi still read their own runtime settings, including the Gurobi license configuration.
 
 The ordinary executable retains the existing automatic projection/MMCS policy, certified complete-prime enumeration, hybrid effort profiles, bounded plateau probe, and automatic pool budgets. Removing an experimental override does not remove algorithms already used by the normal policy. Internal search budgets remain implementation constants; they have not been expanded into new public tuning options.
 
@@ -41,24 +41,13 @@ Long names are canonical in help, examples, and maintained integration tests. Va
 
 The parser lives in `cli.c`/`cli.h`. One option registry supplies name matching, value requirements, and help descriptions. Parsing does not open files. `main.c` receives explicit settings, and the lock profiler receives an explicit Boolean. This keeps future configuration additions reviewable in one place.
 
-Checkpoint versions and serialized layout are unchanged. Resuming restores the saved word width, weights, solver, and pool settings as before. Other invocation settings are not newly persisted by this cleanup. Automatic Gurobi fallback when unavailable also remains unchanged.
+The writer uses checkpoint version 9. When resuming version 8, CCubes replays the interrupted generation level from task zero. Resume restores the saved word width, weights, solver, and pool settings. Supply invocation-specific controls again as needed. Ordinary runs fall back to the bundled hybrid solver when Gurobi is unavailable.
 
-## Experimental code and tests
+## IPC configuration
 
-`make` builds `ccubes` from an explicit production source list. It does not link `projection_rwls.c`, and rejects both `--test-*` options. Test builds use separate objects under `.build/testing/`, so enabling tests cannot contaminate production objects.
+Ordinary solving remains the default. Use `--route ipc` to select the native solver or `--route auto` for automatic selection. The legacy route value `e0` means ordinary, and `--progressive-cover` selects IPC. IPC-only resource, pool, and finishing options require a run routed to IPC.
 
-```sh
-make test
-make .build/ccubes-testing
-./.build/ccubes-testing --test-pi-generator projection --threads 1 \
-  examples/certified_F2.pla /tmp/projection.pla
-./.build/ccubes-testing --test-projection-rwls --deterministic --threads 4 \
-  examples/boom_15x1x300.pla /tmp/rwls.pla
-```
-
-The test-only generator accepts `auto`, `projection`, `mmcs`, and `complete-mmcs`; the last requires `--certify`. These are research controls, not supported production arguments. RWLS stays disabled even in the test executable unless explicitly requested. Its existing integration test still checks the 27-to-25-term improvement fixture and the exact-boundary skip. Promoting RWLS into the default algorithm would require a separate performance and quality decision.
-
-CLI regressions cover strict validation, long/legacy equivalence, word widths, Boolean semantics, paths containing spaces or `=`, option termination, parsing without log-file side effects, removed environment behavior, and rejection of test controls in production. Existing solver, certification, pooling, generator, and checkpoint tests remain in `make test`.
+Use `--ipc-time-limit` for a soft per-output target, `--memory-mb` for the native memory budget, and `--log-file` for either route. The [complete argument reference](README.md#complete-argument-reference) lists the supported controls. Older experiment settings remain documented with their original development revisions.
 
 ## Build and dependency settings retained
 

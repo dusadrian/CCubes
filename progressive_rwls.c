@@ -6,7 +6,7 @@
     SPDX-License-Identifier: LicenseRef-ANCL-AdrianDusa
 */
 
-#include "projection_rwls.h"
+#include "progressive_rwls.h"
 
 #include "ccubes_threads.h"
 
@@ -37,7 +37,7 @@
 
 typedef struct {
     uint64_t bytes;
-    ProjectionRWLSSharedCacheSource source;
+    ProgressiveRWLSSharedCacheSource source;
 } RWLSSharedCacheInfo;
 
 static atomic_int rwls_shared_cache_state = 0;
@@ -67,7 +67,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
     if (rwls_darwin_sysctl_u64("hw.l3cachesize", &bytes)) {
         return (RWLSSharedCacheInfo){
             .bytes = bytes,
-            .source = PROJECTION_RWLS_SHARED_CACHE_DARWIN_L3
+            .source = PROGRESSIVE_RWLS_SHARED_CACHE_DARWIN_L3
         };
     }
 
@@ -110,7 +110,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
         return (RWLSSharedCacheInfo){
             .bytes = largest,
             .source =
-                PROJECTION_RWLS_SHARED_CACHE_DARWIN_PERFORMANCE_L2
+                PROGRESSIVE_RWLS_SHARED_CACHE_DARWIN_PERFORMANCE_L2
         };
     }
 
@@ -118,7 +118,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
         .bytes = RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES > 0
             ? RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES
             : UINT64_C(8388608),
-        .source = PROJECTION_RWLS_SHARED_CACHE_FALLBACK
+        .source = PROGRESSIVE_RWLS_SHARED_CACHE_FALLBACK
     };
 }
 #elif defined(__linux__)
@@ -166,7 +166,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
     if (sysconf_bytes > 0) {
         return (RWLSSharedCacheInfo){
             .bytes = (uint64_t)sysconf_bytes,
-            .source = PROJECTION_RWLS_SHARED_CACHE_LINUX_SYSCONF_L3
+            .source = PROGRESSIVE_RWLS_SHARED_CACHE_LINUX_SYSCONF_L3
         };
     }
 #endif
@@ -228,7 +228,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
     if (largest_at_level > 0) {
         return (RWLSSharedCacheInfo){
             .bytes = largest_at_level,
-            .source = PROJECTION_RWLS_SHARED_CACHE_LINUX_SYSFS
+            .source = PROGRESSIVE_RWLS_SHARED_CACHE_LINUX_SYSFS
         };
     }
 
@@ -236,7 +236,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
         .bytes = RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES > 0
             ? RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES
             : UINT64_C(8388608),
-        .source = PROJECTION_RWLS_SHARED_CACHE_FALLBACK
+        .source = PROGRESSIVE_RWLS_SHARED_CACHE_FALLBACK
     };
 }
 #elif defined(_WIN32)
@@ -293,7 +293,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
                     return (RWLSSharedCacheInfo){
                         .bytes = largest_at_level,
                         .source =
-                            PROJECTION_RWLS_SHARED_CACHE_WINDOWS_API
+                            PROGRESSIVE_RWLS_SHARED_CACHE_WINDOWS_API
                     };
                 }
             } else {
@@ -305,7 +305,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
         .bytes = RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES > 0
             ? RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES
             : UINT64_C(8388608),
-        .source = PROJECTION_RWLS_SHARED_CACHE_FALLBACK
+        .source = PROGRESSIVE_RWLS_SHARED_CACHE_FALLBACK
     };
 }
 #else
@@ -314,7 +314,7 @@ static RWLSSharedCacheInfo rwls_detect_shared_cache(void) {
         .bytes = RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES > 0
             ? RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES
             : UINT64_C(8388608),
-        .source = PROJECTION_RWLS_SHARED_CACHE_FALLBACK
+        .source = PROGRESSIVE_RWLS_SHARED_CACHE_FALLBACK
     };
 }
 #endif
@@ -351,42 +351,42 @@ static RWLSSharedCacheInfo rwls_get_shared_cache_info(void) {
     return rwls_shared_cache_info;
 }
 
-uint64_t projection_rwls_shared_cache_bytes(void) {
+uint64_t progressive_rwls_shared_cache_bytes(void) {
     return rwls_get_shared_cache_info().bytes;
 }
 
-ProjectionRWLSSharedCacheSource
-projection_rwls_shared_cache_source(void) {
+ProgressiveRWLSSharedCacheSource
+progressive_rwls_shared_cache_source(void) {
     return rwls_get_shared_cache_info().source;
 }
 
-const char *projection_rwls_shared_cache_source_name(
-    ProjectionRWLSSharedCacheSource source
+const char *progressive_rwls_shared_cache_source_name(
+    ProgressiveRWLSSharedCacheSource source
 ) {
     switch (source) {
-        case PROJECTION_RWLS_SHARED_CACHE_DARWIN_L3:
+        case PROGRESSIVE_RWLS_SHARED_CACHE_DARWIN_L3:
             return "darwin-l3";
-        case PROJECTION_RWLS_SHARED_CACHE_DARWIN_PERFORMANCE_L2:
+        case PROGRESSIVE_RWLS_SHARED_CACHE_DARWIN_PERFORMANCE_L2:
             return "darwin-performance-l2";
-        case PROJECTION_RWLS_SHARED_CACHE_LINUX_SYSCONF_L3:
+        case PROGRESSIVE_RWLS_SHARED_CACHE_LINUX_SYSCONF_L3:
             return "linux-sysconf-l3";
-        case PROJECTION_RWLS_SHARED_CACHE_LINUX_SYSFS:
+        case PROGRESSIVE_RWLS_SHARED_CACHE_LINUX_SYSFS:
             return "linux-sysfs";
-        case PROJECTION_RWLS_SHARED_CACHE_WINDOWS_API:
+        case PROGRESSIVE_RWLS_SHARED_CACHE_WINDOWS_API:
             return "windows-api";
-        case PROJECTION_RWLS_SHARED_CACHE_FALLBACK:
+        case PROGRESSIVE_RWLS_SHARED_CACHE_FALLBACK:
         default:
             return "fallback";
     }
 }
 
-uint64_t projection_rwls_packed_incidence_threshold_bytes(void) {
+uint64_t progressive_rwls_packed_incidence_threshold_bytes(void) {
     if ((uint64_t)RWLS_PACKED_MIN_DENSE_COVERAGE_BYTES == 0) return 0;
-    return projection_rwls_shared_cache_bytes();
+    return progressive_rwls_shared_cache_bytes();
 }
 
 typedef struct {
-    const PIChartView *chart;
+    const ProgressiveNativeMaster *master;
     size_t *row_offsets;
     size_t *column_offsets;
     uint16_t *column_rows16;
@@ -396,7 +396,7 @@ typedef struct {
 } FeasibilityJumpIncidence;
 
 typedef struct {
-    const PIChartView *chart;
+    const ProgressiveNativeMaster *master;
     const FeasibilityJumpIncidence *incidence;
     unsigned char *selected;
     unsigned char *ever_selected;
@@ -422,7 +422,7 @@ typedef struct {
     int64_t rwls_step;
     int64_t soft_pressure;
     bool rwls_weights_initialized;
-    ProjectionRWLSWorkerPolicy rwls_policy;
+    ProgressiveRWLSWorkerPolicy rwls_policy;
     int64_t maximum_row_penalty;
     int64_t maximum_uncovered_gain;
     int64_t maximum_private_loss;
@@ -433,7 +433,7 @@ typedef struct {
     int *candidate;
     bool improved;
     bool attempted;
-    ProjectionRWLSStats stats;
+    ProgressiveNativeFeasibilityJumpStats stats;
 } FeasibilityJumpWorker;
 
 typedef struct {
@@ -442,7 +442,7 @@ typedef struct {
     int physical_threads_used;
     int incumbent_cardinality;
     const int *incumbent;
-    ProjectionRWLSOptions options;
+    ProgressiveNativeFeasibilityJumpOptions options;
     int target_ordinal;
     int adaptive_round;
     bool fixed_only;
@@ -470,23 +470,23 @@ static uint64_t jump_mix64(uint64_t value) {
 }
 
 static bool jump_column_covers(
-    const PIChartView *chart,
+    const ProgressiveNativeMaster *master,
     int column,
     int row
 ) {
     return (
-        chart->bits[
-            (size_t)column * (size_t)chart->words +
-            (size_t)(row / chart->cov_bits)
-        ] >> (row % chart->cov_bits)
+        master->coverage[
+            (size_t)column * (size_t)master->words +
+            (size_t)(row / 64)
+        ] >> (row % 64)
     ) & UINT64_C(1);
 }
 
-void projection_rwls_options_default(
-    ProjectionRWLSOptions *options
+void progressive_native_feasibility_jump_options_default(
+    ProgressiveNativeFeasibilityJumpOptions *options
 ) {
     if (!options) return;
-    *options = (ProjectionRWLSOptions){
+    *options = (ProgressiveNativeFeasibilityJumpOptions){
         .steps_per_family = UINT64_C(8192),
         .max_adaptive_rounds = 8,
         .requested_threads = 0,
@@ -496,40 +496,25 @@ void projection_rwls_options_default(
         .seed = 0,
         .deadline_nanoseconds = 0,
         .memory_budget_bytes = 0,
-        .budget_mode = PROJECTION_RWLS_BUDGET_WORK,
-        .worker_policy = PROJECTION_RWLS_WORKER_MIXED
+        .budget_mode = PROGRESSIVE_RWLS_BUDGET_WORK,
+        .worker_policy = PROGRESSIVE_RWLS_WORKER_MIXED
     };
 }
 
-bool projection_rwls_should_run(
-    bool enabled,
-    bool certified_mode,
-    bool boundary_exact,
-    bool plateau_due,
-    int incumbent_cardinality
-) {
-    return
-        enabled &&
-        !certified_mode &&
-        !boundary_exact &&
-        plateau_due &&
-        incumbent_cardinality > 1;
-}
-
-ProjectionRWLSWorkerPolicy projection_rwls_mixed_family_policy(
+ProgressiveRWLSWorkerPolicy progressive_rwls_mixed_family_policy(
     int soft_divisor,
     uint64_t family_ordinal
 ) {
     if (soft_divisor < 2) {
-        return PROJECTION_RWLS_WORKER_FIXED_TARGET;
+        return PROGRESSIVE_RWLS_WORKER_FIXED_TARGET;
     }
     const uint64_t divisor = (uint64_t)soft_divisor;
     return family_ordinal % divisor == 1
-        ? PROJECTION_RWLS_WORKER_SOFT_PRESSURE
-        : PROJECTION_RWLS_WORKER_FIXED_TARGET;
+        ? PROGRESSIVE_RWLS_WORKER_SOFT_PRESSURE
+        : PROGRESSIVE_RWLS_WORKER_FIXED_TARGET;
 }
 
-int projection_rwls_mixed_logical_family_count(
+int progressive_rwls_mixed_logical_family_count(
     int physical_thread_count,
     int soft_divisor
 ) {
@@ -565,29 +550,29 @@ static bool checked_mul_u64(uint64_t left, uint64_t right, uint64_t *value) {
 }
 
 static bool should_use_packed_bidirectional_incidence(
-    const PIChartView *chart,
+    const ProgressiveNativeMaster *master,
     uint64_t incidence_entries
 ) {
     if (
-        !chart ||
-        chart->rows > (int)UINT16_MAX + 1 ||
+        !master ||
+        master->rows > (int)UINT16_MAX + 1 ||
         incidence_entries > UINT64_MAX / sizeof(uint16_t)
     ) {
         return false;
     }
     const uint64_t dense_coverage_bytes =
-        (uint64_t)chart->cols * (uint64_t)chart->words *
+        (uint64_t)master->count * (uint64_t)master->words *
         sizeof(uint64_t);
     const uint64_t sparse_column_bytes =
         incidence_entries * sizeof(uint16_t);
     return
         dense_coverage_bytes >=
-            projection_rwls_packed_incidence_threshold_bytes() &&
+            progressive_rwls_packed_incidence_threshold_bytes() &&
         sparse_column_bytes < dense_coverage_bytes;
 }
 
 static bool estimate_shared_memory(
-    const PIChartView *chart,
+    const ProgressiveNativeMaster *master,
     uint64_t incidence_entries,
     uint64_t *bytes
 ) {
@@ -595,12 +580,12 @@ static bool estimate_shared_memory(
     uint64_t total = 0;
     const bool packed_bidirectional =
         should_use_packed_bidirectional_incidence(
-            chart,
+            master,
             incidence_entries
         );
     if (!checked_add_u64(
         &total,
-        ((uint64_t)chart->rows + 1u) * sizeof(size_t)
+        ((uint64_t)master->rows + 1u) * sizeof(size_t)
     )) {
         return false;
     }
@@ -614,7 +599,7 @@ static bool estimate_shared_memory(
         if (
             !checked_add_u64(
                 &total,
-                ((uint64_t)chart->cols + 1u) * sizeof(size_t)
+                ((uint64_t)master->count + 1u) * sizeof(size_t)
             ) ||
             !checked_add_u64(
                 &total,
@@ -627,13 +612,13 @@ static bool estimate_shared_memory(
     return
         checked_add_u64(
             &total,
-            (uint64_t)chart->cols * sizeof(unsigned char)
+            (uint64_t)master->count * sizeof(unsigned char)
         ) &&
         ((*bytes = total), true);
 }
 
 static bool estimate_worker_memory(
-    const PIChartView *chart,
+    const ProgressiveNativeMaster *master,
     int incumbent_cardinality,
     int selected_capacity,
     uint64_t *bytes
@@ -643,28 +628,28 @@ static bool estimate_worker_memory(
     return
         checked_add_u64(
             &total,
-            (uint64_t)chart->cols * 2u * sizeof(unsigned char)
+            (uint64_t)master->count * 2u * sizeof(unsigned char)
         ) &&
         checked_add_u64(
             &total,
-            (uint64_t)chart->rows * 4u * sizeof(int)
+            (uint64_t)master->rows * 4u * sizeof(int)
         ) &&
         checked_add_u64(
             &total,
-            ((uint64_t)chart->rows + 63u) / 64u * sizeof(uint64_t)
+            ((uint64_t)master->rows + 63u) / 64u * sizeof(uint64_t)
         ) &&
         checked_add_u64(
             &total,
-            (uint64_t)chart->rows * sizeof(int64_t)
+            (uint64_t)master->rows * sizeof(int64_t)
         ) &&
         checked_add_u64(
             &total,
-            (uint64_t)chart->cols * 3u *
+            (uint64_t)master->count * 3u *
                 sizeof(int64_t)
         ) &&
         checked_add_u64(
             &total,
-            (uint64_t)chart->cols * 3u * sizeof(int)
+            (uint64_t)master->count * 3u * sizeof(int)
         ) &&
         checked_add_u64(
             &total,
@@ -677,7 +662,7 @@ static bool estimate_worker_memory(
 }
 
 static bool estimate_peak_memory(
-    const PIChartView *chart,
+    const ProgressiveNativeMaster *master,
     uint64_t shared_bytes,
     uint64_t worker_bytes,
     int families,
@@ -702,7 +687,7 @@ static bool estimate_peak_memory(
         return false;
     }
     const uint64_t build_scratch =
-        (uint64_t)chart->rows * sizeof(size_t);
+        (uint64_t)master->rows * sizeof(size_t);
     uint64_t peak = shared_bytes;
     if (!checked_add_u64(
         &peak,
@@ -716,18 +701,18 @@ static bool estimate_peak_memory(
 
 static bool build_incidence(
     FeasibilityJumpIncidence *incidence,
-    const PIChartView *chart,
+    const ProgressiveNativeMaster *master,
     uint64_t incidence_entries
 ) {
     memset(incidence, 0, sizeof(*incidence));
-    incidence->chart = chart;
+    incidence->master = master;
     incidence->packed_bidirectional =
         should_use_packed_bidirectional_incidence(
-            chart,
+            master,
             incidence_entries
         );
     incidence->row_offsets = (size_t *)calloc(
-        (size_t)chart->rows + 1u,
+        (size_t)master->rows + 1u,
         sizeof(size_t)
     );
     incidence->row_columns = (int *)malloc(
@@ -735,7 +720,7 @@ static bool build_incidence(
     );
     if (incidence->packed_bidirectional) {
         incidence->column_offsets = (size_t *)calloc(
-            (size_t)chart->cols + 1u,
+            (size_t)master->count + 1u,
             sizeof(size_t)
         );
         incidence->column_rows16 = (uint16_t *)malloc(
@@ -743,11 +728,11 @@ static bool build_incidence(
         );
     }
     incidence->compulsory_columns = (unsigned char *)calloc(
-        (size_t)chart->cols,
+        (size_t)master->count,
         sizeof(unsigned char)
     );
     size_t *cursor = (size_t *)malloc(
-        (size_t)chart->rows * sizeof(size_t)
+        (size_t)master->rows * sizeof(size_t)
     );
     if (
         !incidence->row_offsets ||
@@ -765,16 +750,16 @@ static bool build_incidence(
         free(cursor);
         return false;
     }
-    for (int column = 0; column < chart->cols; ++column) {
-        const uint64_t *coverage = chart->bits +
-            (size_t)column * (size_t)chart->words;
+    for (int column = 0; column < master->count; ++column) {
+        const uint64_t *coverage = master->coverage +
+            (size_t)column * (size_t)master->words;
         size_t column_degree = 0;
-        for (int word = 0; word < chart->words; ++word) {
+        for (int word = 0; word < master->words; ++word) {
             uint64_t bits = coverage[word];
             while (bits != 0) {
                 const int bit = __builtin_ctzll(bits);
-                const int row = word * chart->cov_bits + bit;
-                if (row < chart->rows) {
+                const int row = word * 64 + bit;
+                if (row < master->rows) {
                     incidence->row_offsets[row + 1]++;
                     column_degree++;
                 }
@@ -786,23 +771,23 @@ static bool build_incidence(
                 incidence->column_offsets[column] + column_degree;
         }
     }
-    for (int row = 0; row < chart->rows; ++row) {
+    for (int row = 0; row < master->rows; ++row) {
         incidence->row_offsets[row + 1] +=
             incidence->row_offsets[row];
         cursor[row] = incidence->row_offsets[row];
     }
-    for (int column = 0; column < chart->cols; ++column) {
-        const uint64_t *coverage = chart->bits +
-            (size_t)column * (size_t)chart->words;
+    for (int column = 0; column < master->count; ++column) {
+        const uint64_t *coverage = master->coverage +
+            (size_t)column * (size_t)master->words;
         size_t column_cursor = incidence->packed_bidirectional
             ? incidence->column_offsets[column]
             : 0;
-        for (int word = 0; word < chart->words; ++word) {
+        for (int word = 0; word < master->words; ++word) {
             uint64_t bits = coverage[word];
             while (bits != 0) {
                 const int bit = __builtin_ctzll(bits);
-                const int row = word * chart->cov_bits + bit;
-                if (row < chart->rows) {
+                const int row = word * 64 + bit;
+                if (row < master->rows) {
                     incidence->row_columns[cursor[row]++] = column;
                     if (incidence->packed_bidirectional) {
                         incidence->column_rows16[column_cursor++] =
@@ -813,7 +798,7 @@ static bool build_incidence(
             }
         }
     }
-    for (int row = 0; row < chart->rows; ++row) {
+    for (int row = 0; row < master->rows; ++row) {
         const size_t degree =
             incidence->row_offsets[row + 1] -
             incidence->row_offsets[row];
@@ -861,67 +846,67 @@ static void destroy_state(FeasibilityJumpState *state) {
 
 static bool allocate_state(
     FeasibilityJumpState *state,
-    const PIChartView *chart,
+    const ProgressiveNativeMaster *master,
     const FeasibilityJumpIncidence *incidence,
     int selected_capacity
 ) {
     memset(state, 0, sizeof(*state));
-    state->chart = chart;
+    state->master = master;
     state->incidence = incidence;
     state->selected = (unsigned char *)calloc(
-        (size_t)chart->cols,
+        (size_t)master->count,
         sizeof(unsigned char)
     );
     state->ever_selected = (unsigned char *)calloc(
-        (size_t)chart->cols,
+        (size_t)master->count,
         sizeof(unsigned char)
     );
     state->selected_list = (int *)malloc(
         (size_t)selected_capacity * sizeof(int)
     );
     state->selected_position = (int *)malloc(
-        (size_t)chart->cols * sizeof(int)
+        (size_t)master->count * sizeof(int)
     );
     state->selected_capacity = selected_capacity;
     state->coverage_count = (int *)calloc(
-        (size_t)chart->rows,
+        (size_t)master->rows,
         sizeof(int)
     );
     state->sole_column = (int *)malloc(
-        (size_t)chart->rows * sizeof(int)
+        (size_t)master->rows * sizeof(int)
     );
     state->uncovered_list = (int *)malloc(
-        (size_t)chart->rows * sizeof(int)
+        (size_t)master->rows * sizeof(int)
     );
     state->uncovered_position = (int *)malloc(
-        (size_t)chart->rows * sizeof(int)
+        (size_t)master->rows * sizeof(int)
     );
-    state->uncovered_words = (chart->rows + 63) / 64;
+    state->uncovered_words = (master->rows + 63) / 64;
     state->uncovered_bits = (uint64_t *)calloc(
         (size_t)state->uncovered_words,
         sizeof(uint64_t)
     );
     state->row_penalty = (int64_t *)malloc(
-        (size_t)chart->rows * sizeof(int64_t)
+        (size_t)master->rows * sizeof(int64_t)
     );
     state->uncovered_gain = (int64_t *)calloc(
-        (size_t)chart->cols,
+        (size_t)master->count,
         sizeof(int64_t)
     );
     state->private_loss = (int64_t *)calloc(
-        (size_t)chart->cols,
+        (size_t)master->count,
         sizeof(int64_t)
     );
     state->timestamp = (int64_t *)calloc(
-        (size_t)chart->cols,
+        (size_t)master->count,
         sizeof(int64_t)
     );
     state->add_tabu_until = (int *)calloc(
-        (size_t)chart->cols,
+        (size_t)master->count,
         sizeof(int)
     );
     state->remove_tabu_until = (int *)calloc(
-        (size_t)chart->cols,
+        (size_t)master->count,
         sizeof(int)
     );
     if (
@@ -948,7 +933,7 @@ static bool allocate_state(
 }
 
 static void select_column(FeasibilityJumpState *state, int column) {
-    assert(column >= 0 && column < state->chart->cols);
+    assert(column >= 0 && column < state->master->count);
     assert(!state->selected[column]);
     assert(state->selected_columns < state->selected_capacity);
     const int position = state->selected_columns++;
@@ -962,7 +947,7 @@ static void select_column(FeasibilityJumpState *state, int column) {
 }
 
 static void deselect_column(FeasibilityJumpState *state, int column) {
-    assert(column >= 0 && column < state->chart->cols);
+    assert(column >= 0 && column < state->master->count);
     assert(state->selected[column]);
     const int position = state->selected_position[column];
     assert(position >= 0 && position < state->selected_columns);
@@ -976,9 +961,9 @@ static void deselect_column(FeasibilityJumpState *state, int column) {
 }
 
 static void mark_row_uncovered(FeasibilityJumpState *state, int row) {
-    assert(row >= 0 && row < state->chart->rows);
+    assert(row >= 0 && row < state->master->rows);
     assert(state->coverage_count[row] == 0);
-    assert(state->uncovered_rows < state->chart->rows);
+    assert(state->uncovered_rows < state->master->rows);
     assert(
         !(state->uncovered_bits[row / 64] &
             (UINT64_C(1) << (row % 64)))
@@ -990,7 +975,7 @@ static void mark_row_uncovered(FeasibilityJumpState *state, int row) {
 }
 
 static void mark_row_covered(FeasibilityJumpState *state, int row) {
-    assert(row >= 0 && row < state->chart->rows);
+    assert(row >= 0 && row < state->master->rows);
     assert(state->coverage_count[row] == 0);
     assert(
         state->uncovered_bits[row / 64] &
@@ -1008,24 +993,24 @@ static void mark_row_covered(FeasibilityJumpState *state, int row) {
 }
 
 static bool selection_is_cover(
-    const PIChartView *chart,
+    const ProgressiveNativeMaster *master,
     int cardinality,
     const int *columns
 ) {
     if (cardinality <= 0 || !columns) return false;
     for (int index = 0; index < cardinality; ++index) {
-        if (columns[index] < 0 || columns[index] >= chart->cols) {
+        if (columns[index] < 0 || columns[index] >= master->count) {
             return false;
         }
         for (int previous = 0; previous < index; ++previous) {
             if (columns[previous] == columns[index]) return false;
         }
     }
-    for (int row = 0; row < chart->rows; ++row) {
+    for (int row = 0; row < master->rows; ++row) {
         bool covered = false;
         for (int index = 0; index < cardinality; ++index) {
             const int column = columns[index];
-            if (!jump_column_covers(chart, column, row)) continue;
+            if (!jump_column_covers(master, column, row)) continue;
             covered = true;
             break;
         }
@@ -1133,26 +1118,26 @@ static void initialize_selection(
     const int *columns,
     bool reset_search_memory
 ) {
-    const PIChartView *chart = state->chart;
+    const ProgressiveNativeMaster *master = state->master;
     memset(
         state->selected,
         0,
-        (size_t)chart->cols * sizeof(unsigned char)
+        (size_t)master->count * sizeof(unsigned char)
     );
     memset(
         state->coverage_count,
         0,
-        (size_t)chart->rows * sizeof(int)
+        (size_t)master->rows * sizeof(int)
     );
     memset(
         state->uncovered_gain,
         0,
-        (size_t)chart->cols * sizeof(int64_t)
+        (size_t)master->count * sizeof(int64_t)
     );
     memset(
         state->private_loss,
         0,
-        (size_t)chart->cols * sizeof(int64_t)
+        (size_t)master->count * sizeof(int64_t)
     );
     memset(
         state->uncovered_bits,
@@ -1163,24 +1148,24 @@ static void initialize_selection(
         memset(
             state->add_tabu_until,
             0,
-            (size_t)chart->cols * sizeof(int)
+            (size_t)master->count * sizeof(int)
         );
         memset(
             state->remove_tabu_until,
             0,
-            (size_t)chart->cols * sizeof(int)
+            (size_t)master->count * sizeof(int)
         );
         if (state->timestamp) {
             memset(
                 state->timestamp,
                 0,
-                (size_t)chart->cols * sizeof(int64_t)
+                (size_t)master->count * sizeof(int64_t)
             );
         }
         state->rwls_step = 0;
         state->soft_pressure = 1;
     }
-    for (int row = 0; row < chart->rows; ++row) {
+    for (int row = 0; row < master->rows; ++row) {
         state->sole_column[row] = -1;
         if (reset_search_memory || !state->rwls_weights_initialized) {
             state->row_penalty[row] = 1;
@@ -1204,14 +1189,14 @@ static void initialize_selection(
                 ]++;
             }
         } else {
-            const uint64_t *coverage = chart->bits +
-                (size_t)column * (size_t)chart->words;
-            for (int word = 0; word < chart->words; ++word) {
+            const uint64_t *coverage = master->coverage +
+                (size_t)column * (size_t)master->words;
+            for (int word = 0; word < master->words; ++word) {
                 uint64_t bits = coverage[word];
                 while (bits != 0) {
                     const int bit = __builtin_ctzll(bits);
-                    const int row = word * chart->cov_bits + bit;
-                    if (row < chart->rows) state->coverage_count[row]++;
+                    const int row = word * 64 + bit;
+                    if (row < master->rows) state->coverage_count[row]++;
                     bits &= bits - 1;
                 }
             }
@@ -1219,7 +1204,7 @@ static void initialize_selection(
     }
     state->uncovered_rows = 0;
     state->uncovered_weight = 0;
-    for (int row = 0; row < chart->rows; ++row) {
+    for (int row = 0; row < master->rows; ++row) {
         if (state->coverage_count[row] == 0) {
             mark_row_uncovered(state, row);
             state->uncovered_weight += state->row_penalty[row];
@@ -1256,7 +1241,7 @@ static void initialize_selection(
 }
 
 static void add_column(FeasibilityJumpState *state, int column) {
-    const PIChartView *chart = state->chart;
+    const ProgressiveNativeMaster *master = state->master;
     select_column(state, column);
     if (state->incidence->packed_bidirectional) {
         for (
@@ -1272,22 +1257,22 @@ static void add_column(FeasibilityJumpState *state, int column) {
         }
         return;
     }
-    const uint64_t *coverage = chart->bits +
-        (size_t)column * (size_t)chart->words;
-    for (int word = 0; word < chart->words; ++word) {
+    const uint64_t *coverage = master->coverage +
+        (size_t)column * (size_t)master->words;
+    for (int word = 0; word < master->words; ++word) {
         uint64_t bits = coverage[word];
         while (bits != 0) {
             const int bit = __builtin_ctzll(bits);
-            const int row = word * chart->cov_bits + bit;
+            const int row = word * 64 + bit;
             bits &= bits - 1;
-            if (row >= chart->rows) continue;
+            if (row >= master->rows) continue;
             add_column_row(state, column, row);
         }
     }
 }
 
 static void remove_column(FeasibilityJumpState *state, int column) {
-    const PIChartView *chart = state->chart;
+    const ProgressiveNativeMaster *master = state->master;
     deselect_column(state, column);
     if (state->incidence->packed_bidirectional) {
         for (
@@ -1304,15 +1289,15 @@ static void remove_column(FeasibilityJumpState *state, int column) {
         state->private_loss[column] = 0;
         return;
     }
-    const uint64_t *coverage = chart->bits +
-        (size_t)column * (size_t)chart->words;
-    for (int word = 0; word < chart->words; ++word) {
+    const uint64_t *coverage = master->coverage +
+        (size_t)column * (size_t)master->words;
+    for (int word = 0; word < master->words; ++word) {
         uint64_t bits = coverage[word];
         while (bits != 0) {
             const int bit = __builtin_ctzll(bits);
-            const int row = word * chart->cov_bits + bit;
+            const int row = word * 64 + bit;
             bits &= bits - 1;
-            if (row >= chart->rows) continue;
+            if (row >= master->rows) continue;
             remove_column_row(state, column, row);
         }
     }
@@ -1321,7 +1306,7 @@ static void remove_column(FeasibilityJumpState *state, int column) {
 
 static void raise_uncovered_penalties(
     FeasibilityJumpState *state,
-    ProjectionRWLSStats *stats
+    ProgressiveNativeFeasibilityJumpStats *stats
 ) {
     for (int position = 0; position < state->uncovered_rows; ++position) {
         const int row = state->uncovered_list[position];
@@ -1366,7 +1351,7 @@ static int choose_rwls_uncovered_row(
         }
         while (ordinal-- > 0) bits &= bits - 1;
         const int row = word * 64 + __builtin_ctzll(bits);
-        return row < state->chart->rows ? row : -1;
+        return row < state->master->rows ? row : -1;
     }
     return -1;
 }
@@ -1479,7 +1464,7 @@ static int collect_selection(
     int *columns
 ) {
     int count = 0;
-    for (int column = 0; column < state->chart->cols; ++column) {
+    for (int column = 0; column < state->master->count; ++column) {
         if (state->selected[column]) columns[count++] = column;
     }
     return count;
@@ -1505,7 +1490,7 @@ static uint64_t selected_state_signature(
 static void note_best_failed_state(
     const FeasibilityJumpState *state,
     int target,
-    ProjectionRWLSStats *stats
+    ProgressiveNativeFeasibilityJumpStats *stats
 ) {
     if (
         !state ||
@@ -1527,14 +1512,14 @@ static bool search_target_rwls(
     FeasibilityJumpState *state,
     int incumbent_cardinality,
     const int *incumbent,
-    const ProjectionRWLSOptions *options,
+    const ProgressiveNativeFeasibilityJumpOptions *options,
     int *candidate,
-    ProjectionRWLSStats *stats
+    ProgressiveNativeFeasibilityJumpStats *stats
 ) {
     const int target = incumbent_cardinality - 1;
     const bool reuse_weights =
         state->rwls_weights_initialized &&
-        state->rwls_policy == PROJECTION_RWLS_WORKER_FIXED_TARGET;
+        state->rwls_policy == PROGRESSIVE_RWLS_WORKER_FIXED_TARGET;
     initialize_selection(
         state,
         incumbent_cardinality,
@@ -1542,7 +1527,7 @@ static bool search_target_rwls(
         !reuse_weights
     );
     state->rwls_weights_initialized = true;
-    state->rwls_policy = PROJECTION_RWLS_WORKER_FIXED_TARGET;
+    state->rwls_policy = PROGRESSIVE_RWLS_WORKER_FIXED_TARGET;
     if (reuse_weights) stats->weight_reuses++;
     if (state->selected_columns > stats->maximum_selected_columns) {
         stats->maximum_selected_columns = state->selected_columns;
@@ -1569,7 +1554,7 @@ static bool search_target_rwls(
     const uint64_t step_limit = options->steps_per_family;
     for (uint64_t step = 0; step < step_limit; ++step) {
         if (
-            options->budget_mode == PROJECTION_RWLS_BUDGET_WALL &&
+            options->budget_mode == PROGRESSIVE_RWLS_BUDGET_WALL &&
             (step & UINT64_C(31)) == 0 &&
             jump_deadline_reached(options->deadline_nanoseconds)
         ) {
@@ -1626,9 +1611,9 @@ static bool search_target_soft_pressure(
     FeasibilityJumpState *state,
     int incumbent_cardinality,
     const int *incumbent,
-    const ProjectionRWLSOptions *options,
+    const ProgressiveNativeFeasibilityJumpOptions *options,
     int *candidate,
-    ProjectionRWLSStats *stats
+    ProgressiveNativeFeasibilityJumpStats *stats
 ) {
     const int target = incumbent_cardinality - 1;
     const bool reuse_weights =
@@ -1651,7 +1636,7 @@ static bool search_target_soft_pressure(
     const uint64_t step_limit = options->steps_per_family;
     for (uint64_t step = 0; step < step_limit; ++step) {
         if (
-            options->budget_mode == PROJECTION_RWLS_BUDGET_WALL &&
+            options->budget_mode == PROGRESSIVE_RWLS_BUDGET_WALL &&
             (step & UINT64_C(31)) == 0 &&
             jump_deadline_reached(options->deadline_nanoseconds)
         ) {
@@ -1785,7 +1770,7 @@ static void search_restart_family_worker(
     for (uint64_t family = start; family < end; family += stride) {
         if (family >= (uint64_t)parallel->family_count) break;
         FeasibilityJumpWorker *worker = &parallel->workers[family];
-        ProjectionRWLSOptions family_options =
+        ProgressiveNativeFeasibilityJumpOptions family_options =
             parallel->options;
         family_options.seed = jump_mix64(
             parallel->options.seed ^
@@ -1806,10 +1791,10 @@ static void search_restart_family_worker(
         }
         if (
             family_options.worker_policy ==
-                PROJECTION_RWLS_WORKER_MIXED
+                PROGRESSIVE_RWLS_WORKER_MIXED
         ) {
             family_options.worker_policy =
-                projection_rwls_mixed_family_policy(
+                progressive_rwls_mixed_family_policy(
                     family_options.mixed_soft_worker_divisor,
                     family
                 );
@@ -1817,14 +1802,14 @@ static void search_restart_family_worker(
         if (
             parallel->fixed_only &&
             family_options.worker_policy !=
-                PROJECTION_RWLS_WORKER_FIXED_TARGET
+                PROGRESSIVE_RWLS_WORKER_FIXED_TARGET
         ) {
             continue;
         }
         worker->attempted = true;
         if (
             family_options.worker_policy ==
-                PROJECTION_RWLS_WORKER_FIXED_TARGET
+                PROGRESSIVE_RWLS_WORKER_FIXED_TARGET
         ) {
             worker->improved = search_target_rwls(
                 &worker->state,
@@ -1885,7 +1870,7 @@ static void update_success_telemetry(
     int family_count,
     int cardinality,
     int winner_family,
-    ProjectionRWLSStats *stats
+    ProgressiveNativeFeasibilityJumpStats *stats
 ) {
     int successful = 0;
     int distinct = 0;
@@ -1898,7 +1883,7 @@ static void update_success_telemetry(
         successful++;
         if (
             workers[family].state.rwls_policy ==
-                PROJECTION_RWLS_WORKER_FIXED_TARGET
+                PROGRESSIVE_RWLS_WORKER_FIXED_TARGET
         ) {
             stats->fixed_successful_candidates++;
         } else {
@@ -1940,7 +1925,7 @@ static void update_success_telemetry(
             (int)workers[winner_family].state.rwls_policy;
         if (
             workers[winner_family].state.rwls_policy ==
-                PROJECTION_RWLS_WORKER_FIXED_TARGET
+                PROGRESSIVE_RWLS_WORKER_FIXED_TARGET
         ) {
             stats->fixed_winning_targets++;
         } else {
@@ -1952,7 +1937,7 @@ static void update_success_telemetry(
 static void update_failure_witness_telemetry(
     const FeasibilityJumpWorker *workers,
     int family_count,
-    ProjectionRWLSStats *stats
+    ProgressiveNativeFeasibilityJumpStats *stats
 ) {
     stats->last_failed_witness_row = -1;
     stats->last_failed_witness_frequency = 0;
@@ -2006,8 +1991,8 @@ static void update_failure_witness_telemetry(
 }
 
 static void merge_worker_stats(
-    ProjectionRWLSStats *total,
-    const ProjectionRWLSStats *worker
+    ProgressiveNativeFeasibilityJumpStats *total,
+    const ProgressiveNativeFeasibilityJumpStats *worker
 ) {
     total->restarts += worker->restarts;
     total->iterations += worker->iterations;
@@ -2031,7 +2016,7 @@ static void merge_worker_stats(
 }
 
 static void collect_invocation_telemetry(
-    ProjectionRWLSStats *stats,
+    ProgressiveNativeFeasibilityJumpStats *stats,
     const FeasibilityJumpWorker *workers,
     int family_count,
     int column_count
@@ -2084,23 +2069,23 @@ static bool search_target_adaptive(
     int physical_thread_count,
     int incumbent_cardinality,
     const int *incumbent,
-    const ProjectionRWLSOptions *options,
+    const ProgressiveNativeFeasibilityJumpOptions *options,
     int target_ordinal,
     bool recent_improvement,
     int *candidate,
     int *best_failed_uncovered_rows,
-    ProjectionRWLSStats *stats,
+    ProgressiveNativeFeasibilityJumpStats *stats,
     bool fixed_only
 ) {
     const int target = incumbent_cardinality - 1;
-    int best_failed_uncovered = workers[0].state.chart->rows;
+    int best_failed_uncovered = workers[0].state.master->rows;
     for (
         int round = 0;
         round < options->max_adaptive_rounds;
         ++round
     ) {
         if (
-            options->budget_mode == PROJECTION_RWLS_BUDGET_WALL &&
+            options->budget_mode == PROGRESSIVE_RWLS_BUDGET_WALL &&
             jump_deadline_reached(options->deadline_nanoseconds)
         ) {
             stats->deadline_reached = true;
@@ -2109,7 +2094,7 @@ static bool search_target_adaptive(
         for (int family = 0; family < family_count; ++family) {
             reset_worker_result(
                 &workers[family],
-                workers[family].state.chart->rows
+                workers[family].state.master->rows
             );
         }
         FeasibilityJumpParallelContext parallel = {
@@ -2135,7 +2120,7 @@ static bool search_target_adaptive(
             for (int family = 0; family < family_count; ++family) {
                 reset_worker_result(
                     &workers[family],
-                    workers[family].state.chart->rows
+                    workers[family].state.master->rows
                 );
             }
             search_restart_family_worker(
@@ -2160,13 +2145,13 @@ static bool search_target_adaptive(
         if (round > 0) stats->adaptive_rounds++;
         bool improved = false;
         int winner_family = -1;
-        int round_best_uncovered = workers[0].state.chart->rows;
+        int round_best_uncovered = workers[0].state.master->rows;
         for (int family = 0; family < family_count; ++family) {
             if (!workers[family].attempted) continue;
             merge_worker_stats(stats, &workers[family].stats);
             if (
                 workers[family].state.rwls_policy ==
-                    PROJECTION_RWLS_WORKER_FIXED_TARGET
+                    PROGRESSIVE_RWLS_WORKER_FIXED_TARGET
             ) {
                 stats->fixed_restart_families++;
                 stats->fixed_iterations += workers[family].stats.iterations;
@@ -2226,15 +2211,15 @@ static bool search_target_adaptive(
     return false;
 }
 
-ProjectionRWLSStatus
-projection_rwls_improve(
-    const PIChartView *chart,
+ProgressiveNativeFeasibilityJumpStatus
+progressive_native_feasibility_jump_improve(
+    const ProgressiveNativeMaster *master,
     int incumbent_cardinality,
     const int *incumbent_columns,
-    const ProjectionRWLSOptions *options,
+    const ProgressiveNativeFeasibilityJumpOptions *options,
     int **selected_columns,
     int *cardinality,
-    ProjectionRWLSStats *stats
+    ProgressiveNativeFeasibilityJumpStats *stats
 ) {
     if (selected_columns) *selected_columns = NULL;
     if (cardinality) *cardinality = -1;
@@ -2245,13 +2230,11 @@ projection_rwls_improve(
         stats->last_winning_policy = -1;
     }
     if (
-        !chart ||
-        chart->rows <= 0 ||
-        chart->words <= 0 ||
-        chart->cov_bits <= 0 ||
-        chart->cov_bits > 64 ||
-        chart->cols <= 0 ||
-        !chart->bits ||
+        !master ||
+        master->rows <= 0 ||
+        master->words <= 0 ||
+        master->count <= 0 ||
+        !master->coverage ||
         incumbent_cardinality <= 1 ||
         !incumbent_columns ||
         !options ||
@@ -2261,34 +2244,34 @@ projection_rwls_improve(
         options->mixed_soft_worker_divisor < 2 ||
         options->mixed_soft_worker_divisor >
             RWLS_MAX_MIXED_DIVISOR ||
-        options->worker_policy < PROJECTION_RWLS_WORKER_FIXED_TARGET ||
-        options->worker_policy > PROJECTION_RWLS_WORKER_MIXED ||
+        options->worker_policy < PROGRESSIVE_RWLS_WORKER_FIXED_TARGET ||
+        options->worker_policy > PROGRESSIVE_RWLS_WORKER_MIXED ||
         (
-            options->budget_mode != PROJECTION_RWLS_BUDGET_WORK &&
-            options->budget_mode != PROJECTION_RWLS_BUDGET_WALL
+            options->budget_mode != PROGRESSIVE_RWLS_BUDGET_WORK &&
+            options->budget_mode != PROGRESSIVE_RWLS_BUDGET_WALL
         ) ||
         (
-            options->budget_mode == PROJECTION_RWLS_BUDGET_WALL &&
+            options->budget_mode == PROGRESSIVE_RWLS_BUDGET_WALL &&
             options->deadline_nanoseconds == 0
         ) ||
         !selected_columns ||
         !cardinality ||
         !stats ||
         !selection_is_cover(
-            chart,
+            master,
             incumbent_cardinality,
             incumbent_columns
         )
     ) {
-        return PROJECTION_RWLS_INVALID;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_INVALID;
     }
 
     const uint64_t started = jump_monotonic_nanoseconds();
     uint64_t incidence_entries = 0;
-    for (int column = 0; column < chart->cols; ++column) {
-        const uint64_t *coverage = chart->bits +
-            (size_t)column * (size_t)chart->words;
-        for (int word = 0; word < chart->words; ++word) {
+    for (int column = 0; column < master->count; ++column) {
+        const uint64_t *coverage = master->coverage +
+            (size_t)column * (size_t)master->words;
+        for (int word = 0; word < master->words; ++word) {
             incidence_entries += (uint64_t)__builtin_popcountll(
                 coverage[word]
             );
@@ -2297,30 +2280,30 @@ projection_rwls_improve(
     uint64_t shared_bytes = 0;
     uint64_t worker_bytes = 0;
     const int selected_capacity = options->worker_policy ==
-            PROJECTION_RWLS_WORKER_FIXED_TARGET
+            PROGRESSIVE_RWLS_WORKER_FIXED_TARGET
         ? incumbent_cardinality
-        : chart->cols;
+        : master->count;
     if (
         !estimate_shared_memory(
-            chart,
+            master,
             incidence_entries,
             &shared_bytes
         ) ||
         !estimate_worker_memory(
-            chart,
+            master,
             incumbent_cardinality,
             selected_capacity,
             &worker_bytes
         )
     ) {
-        return PROJECTION_RWLS_OUT_OF_MEMORY;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY;
     }
     int physical_thread_count = ccubes_effective_thread_count(
         options->requested_threads
     );
     int family_count = options->logical_family_count;
     if (family_count == 0) {
-        family_count = projection_rwls_mixed_logical_family_count(
+        family_count = progressive_rwls_mixed_logical_family_count(
             physical_thread_count,
             options->mixed_soft_worker_divisor
         );
@@ -2329,36 +2312,36 @@ projection_rwls_improve(
         family_count > RWLS_MAX_LOGICAL_FAMILIES ||
         family_count % options->mixed_soft_worker_divisor != 0
     ) {
-        return PROJECTION_RWLS_INVALID;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_INVALID;
     }
     if (family_count <= 0) {
-        return PROJECTION_RWLS_INVALID;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_INVALID;
     }
     uint64_t allocated_bytes = 0;
     if (!estimate_peak_memory(
-        chart,
+        master,
         shared_bytes,
         worker_bytes,
         family_count,
         incumbent_cardinality,
         &allocated_bytes
     )) {
-        return PROJECTION_RWLS_OUT_OF_MEMORY;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY;
     }
     stats->initial_cardinality = incumbent_cardinality;
     stats->final_cardinality = incumbent_cardinality;
-    stats->best_uncovered_rows = chart->rows;
-    stats->last_failed_uncovered_rows = chart->rows;
+    stats->best_uncovered_rows = master->rows;
+    stats->last_failed_uncovered_rows = master->rows;
     stats->incidence_entries = incidence_entries;
     stats->bidirectional_incidence =
         should_use_packed_bidirectional_incidence(
-            chart,
+            master,
             incidence_entries
         );
-    stats->shared_cache_bytes = projection_rwls_shared_cache_bytes();
+    stats->shared_cache_bytes = progressive_rwls_shared_cache_bytes();
     stats->packed_incidence_threshold_bytes =
-        projection_rwls_packed_incidence_threshold_bytes();
-    stats->shared_cache_source = projection_rwls_shared_cache_source();
+        progressive_rwls_packed_incidence_threshold_bytes();
+    stats->shared_cache_source = progressive_rwls_shared_cache_source();
     stats->packed_incidence_invocations =
         stats->bidirectional_incidence ? 1 : 0;
     stats->dense_incidence_invocations =
@@ -2379,17 +2362,17 @@ projection_rwls_improve(
     ) {
         stats->elapsed_nanoseconds =
             jump_monotonic_nanoseconds() - started;
-        return PROJECTION_RWLS_MEMORY_LIMIT;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_MEMORY_LIMIT;
     }
 
     FeasibilityJumpIncidence incidence;
-    if (!build_incidence(&incidence, chart, incidence_entries)) {
+    if (!build_incidence(&incidence, master, incidence_entries)) {
         destroy_incidence(&incidence);
         stats->elapsed_nanoseconds =
             jump_monotonic_nanoseconds() - started;
-        return PROJECTION_RWLS_OUT_OF_MEMORY;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY;
     }
-    for (int column = 0; column < chart->cols; ++column) {
+    for (int column = 0; column < master->count; ++column) {
         if (incidence.compulsory_columns[column]) {
             stats->compulsory_columns++;
         }
@@ -2408,14 +2391,14 @@ projection_rwls_improve(
         destroy_incidence(&incidence);
         stats->elapsed_nanoseconds =
             jump_monotonic_nanoseconds() - started;
-        return PROJECTION_RWLS_OUT_OF_MEMORY;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY;
     }
     int allocated_families = 0;
     for (; allocated_families < family_count; ++allocated_families) {
         FeasibilityJumpWorker *worker = &workers[allocated_families];
         if (!allocate_state(
             &worker->state,
-            chart,
+            master,
             &incidence,
             selected_capacity
         )) {
@@ -2439,7 +2422,7 @@ projection_rwls_improve(
         destroy_incidence(&incidence);
         stats->elapsed_nanoseconds =
             jump_monotonic_nanoseconds() - started;
-        return PROJECTION_RWLS_OUT_OF_MEMORY;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY;
     }
     stats->logical_family_states = family_count;
     memcpy(
@@ -2455,9 +2438,9 @@ projection_rwls_improve(
         stats->work_epochs++;
         while (best_cardinality > 1) {
             stats->targets_attempted++;
-            int best_failed_uncovered = chart->rows;
+            int best_failed_uncovered = master->rows;
             stats->deadline_reached = false;
-            ProjectionRWLSOptions search_options =
+            ProgressiveNativeFeasibilityJumpOptions search_options =
                 *options;
             if (work_epoch > 0) {
                 search_options.seed = jump_mix64(
@@ -2483,10 +2466,10 @@ projection_rwls_improve(
             if (
                 !improved &&
                 options->worker_policy ==
-                    PROJECTION_RWLS_WORKER_MIXED &&
+                    PROGRESSIVE_RWLS_WORKER_MIXED &&
                 !stats->deadline_reached
             ) {
-                int recovery_failed_uncovered = chart->rows;
+                int recovery_failed_uncovered = master->rows;
                 improved = search_target_adaptive(
                     workers,
                     family_count,
@@ -2542,7 +2525,7 @@ projection_rwls_improve(
         destroy_incidence(&incidence);
         stats->elapsed_nanoseconds =
             jump_monotonic_nanoseconds() - started;
-        return PROJECTION_RWLS_OUT_OF_MEMORY;
+        return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY;
     }
     memcpy(
         returned,
@@ -2556,7 +2539,7 @@ projection_rwls_improve(
         stats,
         workers,
         family_count,
-        chart->cols
+        master->count
     );
     stats->elapsed_nanoseconds = jump_monotonic_nanoseconds() - started;
     free(best);
@@ -2566,5 +2549,5 @@ projection_rwls_improve(
     }
     free(workers);
     destroy_incidence(&incidence);
-    return PROJECTION_RWLS_OK;
+    return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OK;
 }

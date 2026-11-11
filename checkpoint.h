@@ -30,6 +30,7 @@ int save_checkpoint(
 // Load the search state from a binary checkpoint file.
 // On success, allocates and fills PInfo and stop_counter_out. Caller must free PInfo via cleanup()
 // and free(*stop_counter_out) manually.
+// Returns a zero resume task for v8 files so the interrupted level is replayed.
 // Returns 0 on success, -1 on error.
 int load_checkpoint(
     const char *path,
@@ -50,7 +51,8 @@ int load_checkpoint(
     char **dst_path_out,
     double *elapsed_total_out,
     double *elapsed_scp_out,
-    uint64_t *resume_task_out
+    uint64_t *resume_task_out,
+    uint32_t *version_out
 );
 
 #endif // CHECKPOINT_H

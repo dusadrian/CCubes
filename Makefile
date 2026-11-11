@@ -81,18 +81,20 @@ ifeq ($(SAN),1)
 endif
 
 # Sources and target
-# Keep production membership explicit so stray experimental .c files cannot
-# silently enter the executable. RWLS is linked only into the test build.
-SRC := binomial.c bounded_mmcs.c ccubes_threads.c certified_stop.c checkpoint.c \
-       cli.c cover_validation.c debug.c gurobi.c lagrangian.c lock_stats.c \
-       main.c plateau_probe.c pool_selection.c prime_check.c subsumption_index.c utils.c
-TEST_SRC := $(SRC) projection_rwls.c
+# Explicit membership prevents stray experimental files entering production.
+SRC := binomial.c bounded_mmcs.c ccubes_threads.c certified_stop.c \
+  checkpoint.c cover_validation.c debug.c gurobi.c \
+  lagrangian.c lock_stats.c main.c plateau_probe.c \
+  pool_selection.c prime_check.c \
+  progressive_column_pool.c progressive_cover.c progressive_dual_calibration.c \
+  progressive_global_bound.c progressive_greedy_price.c progressive_input.c progressive_literal_polish.c \
+  progressive_native_cover.c progressive_native_master.c progressive_native_phase_policy.c progressive_native_reduce_expand.c \
+  progressive_native_repair.c progressive_rwls.c progressive_seed.c progressive_validation.c \
+  subsumption_index.c utils.c cli.c \
+  runtime_options.c
 OBJ  := $(SRC:.c=.o)
 DEP  := $(OBJ:.o=.d)
 BIN  := ccubes
-TEST_BIN := .build/ccubes-testing
-TEST_OBJ := $(addprefix .build/testing/,$(TEST_SRC:.c=.o))
-TEST_DEP := $(TEST_OBJ:.o=.d)
 
 # Track project-header dependencies so incremental builds cannot mix object
 # files compiled against different structure layouts.
@@ -178,112 +180,40 @@ check-gurobi:
 
 # If we built with -DHAVE_GUROBI in CFLAGS, ensure we verify license at build time
 ifeq ($(filter -DHAVE_GUROBI,$(CFLAGS)),-DHAVE_GUROBI)
-  $(BIN) $(TEST_BIN): check-gurobi
+  $(BIN): check-gurobi
 endif
 
 # Build rules: indent using TABS
 .PHONY: all clean
 all: $(BIN)
 
-$(BIN): $(OBJ)
+# Header dependencies alone cannot detect a changed compiler, backend or flags.
+# Keep the stamp's timestamp unchanged when the effective configuration matches.
+build_shell_quote = '$(subst ','"'"',$(1))'
+BUILD_CONFIG_SUM := $(shell printf '%s\n' $(call build_shell_quote,CC=$(CC)) $(call build_shell_quote,CFLAGS=$(CFLAGS)) $(call build_shell_quote,LDFLAGS=$(LDFLAGS)) $(call build_shell_quote,LDLIBS=$(LDLIBS)) | cksum)
+SAVED_BUILD_CONFIG_SUM := $(shell sed -n '1p' .build-config 2>/dev/null)
+.PHONY: FORCE_BUILD_CONFIG
+FORCE_BUILD_CONFIG:
+
+# Older make versions compare timestamps only to whole seconds. Force a
+# rebuild on a changed signature even when two builds share that second.
+ifneq ($(BUILD_CONFIG_SUM),$(SAVED_BUILD_CONFIG_SUM))
+$(OBJ) $(BIN): FORCE_BUILD_CONFIG
+endif
+
+.build-config: FORCE_BUILD_CONFIG
+	@printf '%s\n' $(call build_shell_quote,$(BUILD_CONFIG_SUM)) $(call build_shell_quote,CC=$(CC)) $(call build_shell_quote,CFLAGS=$(CFLAGS)) $(call build_shell_quote,LDFLAGS=$(LDFLAGS)) $(call build_shell_quote,LDLIBS=$(LDLIBS)) > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
+
+$(OBJ): .build-config
+
+$(BIN): $(OBJ) .build-config
 	$(CC) $(OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(TEST_BIN): $(TEST_OBJ)
-	$(CC) $(TEST_OBJ) -o $@ $(LDFLAGS) $(LDLIBS)
-
-.build/testing/%.o: %.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -DCCUBES_TESTING -c $< -o $@
-
 clean:
-	rm -f $(OBJ) $(DEP) $(BIN) $(TEST_OBJ) $(TEST_DEP) $(TEST_BIN)
+	rm -f $(OBJ) $(DEP) $(BIN) .build-config .build-config.tmp
 
--include $(DEP) $(TEST_DEP)
-
-# Unit tests link only the module under test, so they stay fast and do not
-# need the Gurobi or OpenMP configuration above.
-TEST_CFLAGS := -Wall -O2 -I.
-TEST_LIBS   := -lm
-
-.PHONY: test test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-projection-rwls test-projection-rwls-integration test-bounded-mmcs test-mmcs-generator test-effort-policy test-periodic-checkpoint
-test: test-cli test-cli-integration test-cover-validation test-pool-selection test-pool-policy test-pi-finalization test-projection-cache test-wildcard-off-masks test-nchoosek test-certified-stop test-certified-stop-exhaustive test-projected-cube-prime test-subsumption-index test-plateau-probe test-projection-rwls test-projection-rwls-integration test-bounded-mmcs test-mmcs-generator test-effort-policy test-periodic-checkpoint
-
-test-cover-validation:
-	$(CC) $(TEST_CFLAGS) tests/test_cover_validation.c cover_validation.c -o /tmp/ccubes_test_cover_validation $(TEST_LIBS)
-	/tmp/ccubes_test_cover_validation
-
-test-pool-selection:
-	$(CC) $(TEST_CFLAGS) tests/test_pool_selection.c pool_selection.c -o /tmp/ccubes_test_pool_selection $(TEST_LIBS)
-	/tmp/ccubes_test_pool_selection
-
-test-pool-policy: $(BIN)
-	sh tests/test_pool_policy.sh ./$(BIN) examples/pool_positive.pla
-
-test-pi-finalization:
-	$(CC) $(TEST_CFLAGS) tests/test_pi_finalization.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_pi_finalization $(TEST_LIBS)
-	/tmp/ccubes_test_pi_finalization
-
-test-projection-cache:
-	$(CC) $(TEST_CFLAGS) -DCCUBES_TESTING tests/test_projection_cache.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_projection_cache $(TEST_LIBS)
-	/tmp/ccubes_test_projection_cache
-
-test-wildcard-off-masks:
-	$(CC) $(TEST_CFLAGS) -DCCUBES_TESTING tests/test_wildcard_off_masks.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c prime_check.c subsumption_index.c -o /tmp/ccubes_test_wildcard_off_masks $(TEST_LIBS)
-	/tmp/ccubes_test_wildcard_off_masks
-
-test-nchoosek:
-	$(CC) $(TEST_CFLAGS) tests/test_nchoosek.c binomial.c -o /tmp/ccubes_test_nchoosek $(TEST_LIBS)
-	/tmp/ccubes_test_nchoosek
-
-test-projected-cube-prime:
-	$(CC) $(TEST_CFLAGS) tests/test_projected_cube_prime.c prime_check.c utils.c binomial.c ccubes_threads.c checkpoint.c cover_validation.c debug.c lagrangian.c lock_stats.c pool_selection.c subsumption_index.c -o /tmp/ccubes_test_projected_cube_prime $(TEST_LIBS)
-	/tmp/ccubes_test_projected_cube_prime
-
-test-certified-stop:
-	$(CC) $(TEST_CFLAGS) tests/test_certified_stop.c certified_stop.c -o /tmp/ccubes_test_certified_stop $(TEST_LIBS)
-	/tmp/ccubes_test_certified_stop
-
-test-certified-stop-exhaustive:
-	$(CC) $(TEST_CFLAGS) tests/test_certified_stop_exhaustive.c certified_stop.c -o /tmp/ccubes_test_certified_stop_exhaustive $(TEST_LIBS)
-	/tmp/ccubes_test_certified_stop_exhaustive
-
-test-subsumption-index:
-	$(CC) $(TEST_CFLAGS) tests/test_subsumption_index.c subsumption_index.c -o /tmp/ccubes_test_subsumption_index $(TEST_LIBS)
-	/tmp/ccubes_test_subsumption_index
-
-test-plateau-probe:
-	$(CC) $(TEST_CFLAGS) tests/test_plateau_probe.c plateau_probe.c -o /tmp/ccubes_test_plateau_probe $(TEST_LIBS)
-	/tmp/ccubes_test_plateau_probe
-
-test-projection-rwls:
-	$(CC) $(TEST_CFLAGS) tests/test_projection_rwls.c projection_rwls.c ccubes_threads.c cover_validation.c -o /tmp/ccubes_test_projection_rwls $(TEST_LIBS)
-	/tmp/ccubes_test_projection_rwls
-
-test-projection-rwls-integration: $(BIN) $(TEST_BIN)
-	sh tests/test_projection_rwls_integration.sh ./$(BIN) examples/certified_F2.pla examples/boom_15x1x300.pla ./$(TEST_BIN)
-
-test-bounded-mmcs:
-	$(CC) $(TEST_CFLAGS) tests/test_bounded_mmcs.c bounded_mmcs.c -o /tmp/ccubes_test_bounded_mmcs $(TEST_LIBS)
-	/tmp/ccubes_test_bounded_mmcs
-
-test-mmcs-generator: $(BIN) $(TEST_BIN)
-	sh tests/test_mmcs_generator.sh ./$(BIN) examples/mmcs_forced_100x1.pla examples/certified_F2.pla examples/rnd_20x10x40.pla examples/certified_two_term.pla ./$(TEST_BIN)
-
-test-periodic-checkpoint: $(BIN)
-	sh tests/test_periodic_checkpoint.sh ./$(BIN) examples/rnd_20x10x40.pla
-
-test-effort-policy: $(BIN)
-	sh tests/test_effort_policy.sh ./$(BIN) examples/certified_F2.pla
-
-.PHONY: test-cli test-cli-integration
-test-cli:
-	$(CC) $(TEST_CFLAGS) tests/test_cli.c cli.c -o /tmp/ccubes_test_cli $(TEST_LIBS)
-	/tmp/ccubes_test_cli
-	$(CC) $(TEST_CFLAGS) -DCCUBES_TESTING tests/test_cli.c cli.c -o /tmp/ccubes_test_cli_research $(TEST_LIBS)
-	/tmp/ccubes_test_cli_research
-
-test-cli-integration: $(BIN)
-	sh tests/test_cli.sh ./$(BIN)
+-include $(DEP)

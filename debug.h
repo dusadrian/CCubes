@@ -2,6 +2,13 @@
 #define DEBUG_H
 
 #include <stdio.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+/* Shared run log for every backend. NULL keeps normal console diagnostics. */
+extern const char *run_log_path;
+bool run_log_init(const char *filename, const char *const protected_paths[], size_t count);
+bool run_log_check_path(const char *path);
 
 // Debug levels (incremental thresholds)
 enum {

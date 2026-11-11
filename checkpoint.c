@@ -7,26 +7,29 @@
 */
 
 #include "checkpoint.h"
+#include "file_replace.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
-#ifdef _WIN32
-#include <windows.h>
+#ifndef _WIN32
+#include <unistd.h>
 #endif
 
 #define CK_MAGIC "CCCHKv1"  // 7 chars + \0
-/* v9: the task field is the earliest safe task to resume, not a sampled task */
+/* v9 records the earliest unfinished task. v8 recorded a sampled task. */
 #define CK_VERSION 9u
 #define CK_OLDEST_SUPPORTED_VERSION 8u
 
 static int write_bytes(FILE *f, const void *buf, size_t len) {
-    return fwrite(buf, 1, len, f) == len ? 0 : -1;
+    return len == 0 || fwrite(buf, 1, len, f) == len ? 0 : -1;
 }
 
 static int read_bytes(FILE *f, void *buf, size_t len) {
-    return fread(buf, 1, len, f) == len ? 0 : -1;
+    return len == 0 || fread(buf, 1, len, f) == len ? 0 : -1;
 }
 
 static int write_int(FILE *f, int v) {
@@ -102,14 +105,27 @@ int save_checkpoint(
 ) {
     if (!path || !*path) return -1;
 
+    /* Create an exclusive sibling so a partial save cannot touch the old
+     * checkpoint or truncate a pre-existing file (including a run log). */
+    enum { TEMP_SUFFIX_CAPACITY = 64 };
     size_t path_len = strlen(path);
-    if (path_len > SIZE_MAX - 5u) return -1;
-    char *tmp_path = (char *)malloc(path_len + 5u);
+    if (path_len > SIZE_MAX - TEMP_SUFFIX_CAPACITY) return -1;
+    char *tmp_path = malloc(path_len + TEMP_SUFFIX_CAPACITY);
     if (!tmp_path) return -1;
     memcpy(tmp_path, path, path_len);
-    memcpy(tmp_path + path_len, ".tmp", 5u);
 
-    FILE *f = fopen(tmp_path, "wb");
+#ifdef _WIN32
+    unsigned long process_id = (unsigned long)GetCurrentProcessId();
+#else
+    unsigned long process_id = (unsigned long)getpid();
+#endif
+    FILE *f = NULL;
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        snprintf(tmp_path + path_len, TEMP_SUFFIX_CAPACITY,
+                 ".tmp.%lu.%u", process_id, attempt);
+        f = fopen(tmp_path, "wbx");
+        if (f || errno != EEXIST) break;
+    }
     if (!f) {
         free(tmp_path);
         return -1;
@@ -138,7 +154,7 @@ int save_checkpoint(
     if (write_double(f, elapsed_total) < 0) goto FAIL;
     if (write_double(f, elapsed_scp) < 0) goto FAIL;
 
-    // Earliest task that must be rerun at current_k.
+    // Earliest task to run again at current_k.
     if (write_u64(f, resume_task) < 0) goto FAIL;
 
     // stop_counter per output
@@ -187,22 +203,12 @@ int save_checkpoint(
         if (write_bytes(f, pi->shifted_cov_mask, onm * sizeof(uint64_t)) < 0) goto FAIL;
     }
 
-    int flush_failed = fflush(f) != 0;
-    int close_failed = fclose(f) != 0;
+    if (fflush(f) != 0) goto FAIL;
+    int close_result = fclose(f);
     f = NULL;
-    if (flush_failed || close_failed) goto FAIL;
+    if (close_result != 0) goto FAIL;
 
-#ifdef _WIN32
-    if (!MoveFileExA(
-        tmp_path,
-        path,
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
-    )) {
-        goto FAIL;
-    }
-#else
-    if (rename(tmp_path, path) != 0) goto FAIL;
-#endif
+    if (!ccubes_replace_file(tmp_path, path)) goto FAIL;
 
     free(tmp_path);
     return 0;
@@ -232,7 +238,8 @@ int load_checkpoint(
     char **dst_path_out,
     double *elapsed_total_out,
     double *elapsed_scp_out,
-    uint64_t *resume_task_out
+    uint64_t *resume_task_out,
+    uint32_t *version_out
 ) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -255,6 +262,8 @@ int load_checkpoint(
     if (read_u32(f, &wp) < 0) goto FAIL;
     if (read_u32(f, &st) < 0) goto FAIL;
     if (read_u32(f, &pm) < 0) goto FAIL;
+    if (ni == 0 || ni > INT_MAX || no == 0 || no > INT_MAX ||
+        ck == 0 || ck > ni) goto FAIL;
 
     *ninputs = (int)ni;
     *noutputs = (int)no;
@@ -274,10 +283,10 @@ int load_checkpoint(
         if (read_str(f, &loaded_dst) < 0) { free(loaded_src); goto FAIL; }
     }
     double loaded_elapsed_total = 0.0, loaded_elapsed_scp = 0.0;
-    uint64_t loaded_resume_task = 0ull;
+    uint64_t saved_task = 0;
     if (read_double(f, &loaded_elapsed_total) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
     if (read_double(f, &loaded_elapsed_scp) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
-    if (read_u64(f, &loaded_resume_task) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
+    if (read_u64(f, &saved_task) < 0) { free(loaded_src); free(loaded_dst); goto FAIL; }
 
     int *stopc = (int*)calloc((size_t)no, sizeof(int));
     if (!stopc) {
@@ -294,10 +303,9 @@ int load_checkpoint(
             goto FAIL;
         }
     }
-    *stop_counter_out = stopc;
-
     PIstorage *pi = (PIstorage*)calloc((size_t)no, sizeof(PIstorage));
-    if (!pi) { free(loaded_src); free(loaded_dst); goto FAIL; }
+    if (!pi) { free(stopc); free(loaded_src); free(loaded_dst); goto FAIL; }
+    pi[0].outputs = (int)no;
 
     // initialize pointers to NULL for safe cleanup()
     for (int o = 0; o < (int)no; ++o) {
@@ -326,6 +334,9 @@ int load_checkpoint(
         if (read_int(f, &po->ON_minterms) < 0) goto READ_FAIL;
         if (read_int(f, &po->OFF_minterms) < 0) goto READ_FAIL;
         if (read_int(f, &po->foundPI) < 0) goto READ_FAIL;
+        if (po->ON_minterms < 0 || po->OFF_minterms < 0 || po->foundPI < 0) {
+            goto READ_FAIL;
+        }
         if (read_int(f, &po->solmin) < 0) goto READ_FAIL;
         if (read_int(f, &po->prevsolmin) < 0) goto READ_FAIL;
         int flags=0; if (read_int(f, &flags) < 0) goto READ_FAIL;
@@ -356,14 +367,16 @@ int load_checkpoint(
         size_t ipw_s = (size_t)(*implicant_words);
         size_t pcw = (size_t)po->pichart_words;
 
-        po->covered = (int*)calloc(fp, sizeof(int));
+        /* Leave empty column arrays for the resume path to allocate at
+         * its initial capacity. calloc(0) may return a non-null pointer. */
+        po->covered = fp ? (int*)calloc(fp, sizeof(int)) : NULL;
         po->last_index = (int*)calloc(onm, sizeof(int));
         po->k_last_index = (int*)calloc(onm, sizeof(int));
-        po->pichart_pos = (uint64_t*)calloc(fp * pcw, sizeof(uint64_t));
-        po->implicants_pos = (uint64_t*)calloc(fp * ipw_s, sizeof(uint64_t));
-        po->implicants_val = (uint64_t*)calloc(fp * ipw_s, sizeof(uint64_t));
-        po->shared = (int*)calloc(fp, sizeof(int));
-        po->covsum = (int*)calloc(fp, sizeof(int));
+        po->pichart_pos = fp ? (uint64_t*)calloc(fp * pcw, sizeof(uint64_t)) : NULL;
+        po->implicants_pos = fp ? (uint64_t*)calloc(fp * ipw_s, sizeof(uint64_t)) : NULL;
+        po->implicants_val = fp ? (uint64_t*)calloc(fp * ipw_s, sizeof(uint64_t)) : NULL;
+        po->shared = fp ? (int*)calloc(fp, sizeof(int)) : NULL;
+        po->covsum = fp ? (int*)calloc(fp, sizeof(int)) : NULL;
         po->previndices = (int*)calloc(onm, sizeof(int));
         po->indices = (int*)calloc(onm, sizeof(int));
         po->cov_word_index = (int*)calloc(onm, sizeof(int));
@@ -408,17 +421,10 @@ int load_checkpoint(
         if (read_bytes(f, po->shifted_cov_mask, onm * sizeof(uint64_t)) < 0) goto READ_FAIL;
     }
 
-    fclose(f);
-
     // Build nofvalues from ON/OFF sets
     int *nofvals = (int*)calloc((size_t)(*ninputs), sizeof(int));
-    if (!nofvals) {
-        free(pi);
-        free(*stop_counter_out);
-        free(loaded_src);
-        free(loaded_dst);
-        return -1;
-    }
+    if (!nofvals) goto READ_FAIL;
+    fclose(f);
 
     for (int j = 0; j < *ninputs; ++j) nofvals[j] = 0;
 
@@ -439,6 +445,7 @@ int load_checkpoint(
     }
 
     *nofvalues_out = nofvals;
+    *stop_counter_out = stopc;
 
     if (src_path_out) {
         *src_path_out = loaded_src;
@@ -454,32 +461,18 @@ int load_checkpoint(
 
     if (elapsed_total_out) *elapsed_total_out = loaded_elapsed_total;
     if (elapsed_scp_out) *elapsed_scp_out = loaded_elapsed_scp;
-    if (resume_task_out) *resume_task_out = loaded_resume_task;
+    /* A sampled v8 task can be ahead of unfinished tasks on other workers. */
+    if (resume_task_out) *resume_task_out = ver == 8u ? 0 : saved_task;
+    if (version_out) *version_out = ver;
 
     *PInfo = pi;
     return 0;
 
 READ_FAIL:
-    // cleanup allocations on error
-    for (int o = 0; o < (int)no; ++o) {
-        free(pi[o].ON_set);
-        free(pi[o].OFF_set);
-        free(pi[o].covered);
-        free(pi[o].last_index);
-        free(pi[o].k_last_index);
-        free(pi[o].pichart_pos);
-        free(pi[o].implicants_pos);
-        free(pi[o].implicants_val);
-        free(pi[o].shared);
-        free(pi[o].covsum);
-        free(pi[o].previndices);
-        free(pi[o].indices);
-        free(pi[o].cov_word_index);
-        free(pi[o].shifted_cov_mask);
-        free(pi[o].nofpi);
-    }
-    free(pi);
-    free(*stop_counter_out);
+    cleanup(pi, NULL);
+    free(stopc);
+    free(loaded_src);
+    free(loaded_dst);
 FAIL:
     fclose(f);
     return -1;

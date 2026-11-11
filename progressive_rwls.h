@@ -6,40 +6,40 @@
     SPDX-License-Identifier: LicenseRef-ANCL-AdrianDusa
 */
 
-#ifndef PROJECTION_RWLS_H
-#define PROJECTION_RWLS_H
+#ifndef PROGRESSIVE_RWLS_H
+#define PROGRESSIVE_RWLS_H
 
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "pichart_view.h"
+#include "progressive_native_master.h"
 
 typedef enum {
-    PROJECTION_RWLS_OK = 0,
-    PROJECTION_RWLS_INVALID,
-    PROJECTION_RWLS_OUT_OF_MEMORY,
-    PROJECTION_RWLS_MEMORY_LIMIT
-} ProjectionRWLSStatus;
+    PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OK = 0,
+    PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_INVALID,
+    PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY,
+    PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_MEMORY_LIMIT
+} ProgressiveNativeFeasibilityJumpStatus;
 
 typedef enum {
-    PROJECTION_RWLS_BUDGET_WORK = 0,
-    PROJECTION_RWLS_BUDGET_WALL
-} ProjectionRWLSBudgetMode;
+    PROGRESSIVE_RWLS_BUDGET_WORK = 0,
+    PROGRESSIVE_RWLS_BUDGET_WALL
+} ProgressiveRWLSBudgetMode;
 
 typedef enum {
-    PROJECTION_RWLS_WORKER_FIXED_TARGET = 0,
-    PROJECTION_RWLS_WORKER_SOFT_PRESSURE,
-    PROJECTION_RWLS_WORKER_MIXED
-} ProjectionRWLSWorkerPolicy;
+    PROGRESSIVE_RWLS_WORKER_FIXED_TARGET = 0,
+    PROGRESSIVE_RWLS_WORKER_SOFT_PRESSURE,
+    PROGRESSIVE_RWLS_WORKER_MIXED
+} ProgressiveRWLSWorkerPolicy;
 
 typedef enum {
-    PROJECTION_RWLS_SHARED_CACHE_FALLBACK = 0,
-    PROJECTION_RWLS_SHARED_CACHE_DARWIN_L3,
-    PROJECTION_RWLS_SHARED_CACHE_DARWIN_PERFORMANCE_L2,
-    PROJECTION_RWLS_SHARED_CACHE_LINUX_SYSCONF_L3,
-    PROJECTION_RWLS_SHARED_CACHE_LINUX_SYSFS,
-    PROJECTION_RWLS_SHARED_CACHE_WINDOWS_API
-} ProjectionRWLSSharedCacheSource;
+    PROGRESSIVE_RWLS_SHARED_CACHE_FALLBACK = 0,
+    PROGRESSIVE_RWLS_SHARED_CACHE_DARWIN_L3,
+    PROGRESSIVE_RWLS_SHARED_CACHE_DARWIN_PERFORMANCE_L2,
+    PROGRESSIVE_RWLS_SHARED_CACHE_LINUX_SYSCONF_L3,
+    PROGRESSIVE_RWLS_SHARED_CACHE_LINUX_SYSFS,
+    PROGRESSIVE_RWLS_SHARED_CACHE_WINDOWS_API
+} ProgressiveRWLSSharedCacheSource;
 
 typedef struct {
     uint64_t steps_per_family;
@@ -51,9 +51,9 @@ typedef struct {
     uint64_t seed;
     uint64_t deadline_nanoseconds;
     uint64_t memory_budget_bytes;
-    ProjectionRWLSBudgetMode budget_mode;
-    ProjectionRWLSWorkerPolicy worker_policy;
-} ProjectionRWLSOptions;
+    ProgressiveRWLSBudgetMode budget_mode;
+    ProgressiveRWLSWorkerPolicy worker_policy;
+} ProgressiveNativeFeasibilityJumpOptions;
 
 typedef struct {
     int initial_cardinality;
@@ -104,7 +104,7 @@ typedef struct {
     bool bidirectional_incidence;
     uint64_t shared_cache_bytes;
     uint64_t packed_incidence_threshold_bytes;
-    ProjectionRWLSSharedCacheSource shared_cache_source;
+    ProgressiveRWLSSharedCacheSource shared_cache_source;
     int dense_incidence_invocations;
     int packed_incidence_invocations;
     uint64_t allocated_bytes;
@@ -116,25 +116,11 @@ typedef struct {
     int64_t maximum_timestamp;
     uint64_t elapsed_nanoseconds;
     bool deadline_reached;
-    ProjectionRWLSBudgetMode budget_mode;
-} ProjectionRWLSStats;
+    ProgressiveRWLSBudgetMode budget_mode;
+} ProgressiveNativeFeasibilityJumpStats;
 
-void projection_rwls_options_default(
-    ProjectionRWLSOptions *options
-);
-
-/*
- * Keep the projection integration policy explicit and independently testable.
- * RWLS is a heuristic fixed-chart finisher: it is useful only at a plateau,
- * only above the one-column global floor, and never after the chart solver has
- * proved its incumbent optimal. Certified mode retains its existing path.
- */
-bool projection_rwls_should_run(
-    bool enabled,
-    bool certified_mode,
-    bool boundary_exact,
-    bool plateau_due,
-    int incumbent_cardinality
+void progressive_native_feasibility_jump_options_default(
+    ProgressiveNativeFeasibilityJumpOptions *options
 );
 
 /*
@@ -142,7 +128,7 @@ bool projection_rwls_should_run(
  * Families [0, N) therefore form the same persistent policy prefix at every
  * thread count and across every target and adaptive round.
  */
-ProjectionRWLSWorkerPolicy projection_rwls_mixed_family_policy(
+ProgressiveRWLSWorkerPolicy progressive_rwls_mixed_family_policy(
     int soft_divisor,
     uint64_t family_ordinal
 );
@@ -153,7 +139,7 @@ ProjectionRWLSWorkerPolicy projection_rwls_mixed_family_policy(
  * so the fixed/soft proportion never depends on a partial final block. Zero
  * reports invalid arguments or an unsupported family count.
  */
-int projection_rwls_mixed_logical_family_count(
+int progressive_rwls_mixed_logical_family_count(
     int physical_thread_count,
     int soft_divisor
 );
@@ -164,23 +150,23 @@ int projection_rwls_mixed_logical_family_count(
  * aggregate cache across independent domains would overstate its residency.
  * The result is detected once and then cached for the life of the process.
  */
-uint64_t projection_rwls_shared_cache_bytes(void);
+uint64_t progressive_rwls_shared_cache_bytes(void);
 
-ProjectionRWLSSharedCacheSource
-projection_rwls_shared_cache_source(void);
+ProgressiveRWLSSharedCacheSource
+progressive_rwls_shared_cache_source(void);
 
-const char *projection_rwls_shared_cache_source_name(
-    ProjectionRWLSSharedCacheSource source
+const char *progressive_rwls_shared_cache_source_name(
+    ProgressiveRWLSSharedCacheSource source
 );
 
 /* Zero is retained as the compile-time test override that forces packing. */
-uint64_t projection_rwls_packed_incidence_threshold_bytes(void);
+uint64_t progressive_rwls_packed_incidence_threshold_bytes(void);
 
 /*
- * Search a fixed projection PI chart for a cover smaller than `incumbent`.
+ * Search the retained native master for a cover smaller than `incumbent`.
  * Complete blocks in the default logical-family mix contain three fixed-target
  * RWLS trajectories and one scalar-soft-pressure trajectory; logical growth
- * and memory admission retain complete blocks in deterministic order.
+ * and memory fallback retain complete blocks in deterministic order.
  * Fixed-target families cross between
  * checkpoints through infeasible add/remove pairs. Soft-pressure families may
  * temporarily grow the selection and trade row penalties against one global
@@ -188,18 +174,18 @@ uint64_t projection_rwls_packed_incidence_threshold_bytes(void);
  * fixed-target families retry before stopping; soft-family states are not
  * repurposed. Persistent uncovered rows gain weight in both policies.
  *
- * Returned indices belong to `chart`. The returned cover is always valid;
+ * Returned indices belong to `master`. The returned cover is always valid;
  * when no improvement is found it is a copy of the supplied incumbent.
  */
-ProjectionRWLSStatus
-projection_rwls_improve(
-    const PIChartView *chart,
+ProgressiveNativeFeasibilityJumpStatus
+progressive_native_feasibility_jump_improve(
+    const ProgressiveNativeMaster *master,
     int incumbent_cardinality,
     const int *incumbent_columns,
-    const ProjectionRWLSOptions *options,
+    const ProgressiveNativeFeasibilityJumpOptions *options,
     int **selected_columns,
     int *cardinality,
-    ProjectionRWLSStats *stats
+    ProgressiveNativeFeasibilityJumpStats *stats
 );
 
 #endif

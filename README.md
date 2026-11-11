@@ -1,6 +1,8 @@
-# DESCRIPTION
+# CCubes
 
-CCubes is a Boolean minimizer designed to efficiently minimize functions with multiple outputs. For the moment, it only accepts a PLA file as an input and produces a PLA file as output.
+## Ordinary solver
+
+CCubes is a Boolean minimizer designed to efficiently minimize functions with multiple outputs. It reads and writes PLA files. The ordinary solver is the default. Choose native incremental prime cover (IPC) explicitly with `--route ipc`, or use `--route auto` to select a route from the input and the requested options.
 
 The minimization process is extremely efficient with incompletely specified functions with many don't cares. It compares the ON set minterms with the OFF set minterms, and for this reasons it needs a ".type fr" PLA file.
 
@@ -14,7 +16,7 @@ If the probe does not improve the cover, CCubes applies the existing adaptive di
 
 The small `examples/certified_F2.pla` instance demonstrates the plateau probe under every hybrid effort profile. Its ordinary boundary cover has two terms at levels one and two. At the level-two plateau, the probe constructs the delayed prime and obtains the one-term cover without enumerating level three, including under the default `--effort=0` profile.
 
-Input-dash PLA pattern rows are accepted through a separate, explicitly announced heuristic path, provided every output has nonempty ON and OFF sets. That path uses the first plateau and does not claim the point-row blocking diagnostic or a global certificate; `--certify` is rejected.
+Input-dash PLA pattern rows are accepted through a separate, explicitly announced heuristic path, with direct handling of constant outputs. That path uses the first plateau and does not claim the point-row blocking diagnostic or a global certificate; `--certify` is rejected.
 
 Minimum covering of the PI chart is NP-hard. The `--solver=gurobi` option delegates this boundary problem to the Gurobi optimizer. For compilation, Gurobi's path is configured in the Makefile and may need to be adjusted for the local installation and operating system. At runtime, Gurobi searches for a valid license; academic licences are available from Gurobi.
 
@@ -34,7 +36,7 @@ Parallel search supports both OpenMP and pthreads. The build automatically uses 
 
 PI coverage patterns from completed complexity levels are kept in a per-output hash index. Worker threads can therefore reject duplicate coverage in constant expected time without scanning the global PI chart under a lock. New PIs use only a short synchronized append, and coverage buckets are rebuilt once after the parallel level completes. This keeps the expensive generation phase parallel even when the PI chart contains tens of thousands of columns.
 
-For fully specified binary point rows in heuristic mode, CCubes automatically chooses between projection and an experimental bounded MMCS-style generator at each level. Small support spaces remain on projection. Once a level exceeds 8,192 projection tasks, CCubes screens the estimated branching cost and may give MMCS a transactional trial. Its node budget scales with the estimated projection work, with a floor of 8,192 and a ceiling of 100 million nodes per output, using at most four concurrent trial workers. A completed trial is retained; if any output reaches the budget, every trial append is rolled back to the common level boundary and projection completes the entire level. Thus partial MMCS work can never contaminate a boundary evaluation. Checkpoint/resume, time-limit checkpoints, and input-dash pattern rows remain on projection. Certified mode always uses complete MMCS.
+For fully specified binary point rows in heuristic mode, CCubes automatically chooses between projection and an experimental bounded MMCS-style generator at each level. Small support spaces remain on projection. Once a level exceeds 8,192 projection tasks, CCubes screens the estimated branching cost and may give MMCS a transactional trial. Its node budget scales with the estimated projection work, with a floor of 8,192 and a ceiling of 100 million nodes per output, using at most four concurrent trial workers. A completed trial is retained; if any output reaches the budget, every trial append is rolled back to the common level boundary and projection completes the entire level. Thus partial MMCS work can never contaminate a boundary evaluation. Checkpointed runs and input-dash pattern rows remain on projection. Certified mode always uses complete MMCS.
 
 The MMCS-style backend forms the OFF-row difference hypergraph for each ON row and enumerates exact-cardinality minimal transversals using an independently implemented uncovered-edge and critical-edge search. Every cube is assigned to the earliest ON row it covers, preventing repeated enumeration from later ON rows; complete ON coverage and cross-output sharing are rebuilt before the ordinary level-boundary evaluation. The included `examples/mmcs_forced_100x1.pla` fixture demonstrates the intended sparse-transversal regime: its sole PI has six literals, so the projection backend must pass through all 75,287,520 five-input supports before level six, whereas the bounded search reaches the forced level-six transversal directly. Difficult dense transversal families can still require exponential work, which is why automatic selection retains the projection fallback.
 
@@ -44,7 +46,7 @@ Projection validation builds wildcard-aware OFF-row bit masks only for outputs w
 
 There is a minimal help system integrated into CCubes. Users can enable diagnostic logging with `--debug LEVEL`; this provides insights into the minimization process and can be useful for troubleshooting. The debug levels are preliminary, and more detailed logging functionality will be added in the future.
 
-For very large heuristic runs, CCubes can save its state into a binary checkpoint file and exit when a specified `--time-limit` time limit is reached. The process can be resumed later without re-specifying the input and output files. If the binary checkpoint file is not specified, it defaults to `chk_<basename(source)>.bin`. Even when resuming with `--resume FILE`, another time limit can save a later intermediate checkpoint, overwriting the binary checkpoint unless a different path is given.
+For very large heuristic runs, CCubes can save its state into a binary checkpoint file and exit when a specified `--time-limit` time limit is reached. The process can be resumed later without re-specifying the input and output files. If the binary checkpoint file is not specified, it defaults to the source basename prefixed with `chk_`. Even when resuming with `--resume FILE`, another time limit can save a later intermediate checkpoint, overwriting the binary checkpoint unless a different path is given.
 
 `--checkpoint-every=<sec>` adds periodic checkpoints without ending the process. At each interval, the projection workers stop at a safe shared frontier, CCubes atomically replaces the checkpoint file, and generation continues at the same complexity level. When it is combined with `--time-limit`, periodic checkpoints continue until the overall per-invocation time limit is reached; that final checkpoint still ends the process. For example, a seven-hour resumed run with hourly checkpoints is:
 
@@ -53,71 +55,72 @@ For very large heuristic runs, CCubes can save its state into a binary checkpoin
   --checkpoint-every 3600 --resume output096.chk
 ```
 
-Checkpoint polling occurs during interruptible projection generation. A long covering solve cannot be serialized halfway through; an overdue checkpoint is written when generation next reaches a safe point. Complete-prime certified mode and the experimental MMCS generator do not support checkpoints. Checkpoint version 9 stores the earliest safe resume task and accepts existing version 8 files. Each save is first written beside the target as `<file>.tmp` and then replaces the target, so a failed partial write does not truncate the previous checkpoint.
+Checkpoint polling occurs during interruptible projection generation. A long covering solve can delay a save until generation next reaches a safe point. Checkpoints apply to ordinary runs without complete-prime certification. Checkpoint version 9 stores the earliest unfinished task across workers. Resuming a version 8 file replays the interrupted level from task zero while retaining its saved chart. Each save writes to an exclusive temporary file beside the target and replaces the previous checkpoint after the write succeeds.
 
 The binary checkpoint file can be inspected using the `--inspect` option with various progress information in the metadata.
 
 Compile the binary according to your system using `make`, with various options and customization indicated in the Makefile.
 
-The destination .pla file is optional. If not specified, a `ccubes_<basename(source)>.pla` file will be created in the current directory.
+The destination .pla file is optional. If not specified, the result uses the input basename prefixed by `ccubes_` for ordinary runs or `progressive_` for IPC.
 
-# USAGE
+## Usage
 
 Use descriptive long options. Options taking values accept either `--name VALUE` or `--name=VALUE`. Boolean switches take no value. Use `--` before filenames beginning with a dash.
 
 ```sh
 ./ccubes --threads 8 --solver hybrid --effort 1 --pool source.pla result.pla
 ./ccubes --certify --deterministic source.pla result.pla
+./ccubes --route ipc --threads 8 --ipc-time-limit 180 source.pla result.pla
 ./ccubes --inspect run.chk --inspect-level 1
 ```
 
+## Complete argument reference
+
+The following table lists all formal arguments printed by `./ccubes --help`.
+The CCubesIPC development checks compare this table with the built executable's help. Update the reference when an argument, allowed value, or default changes.
+
 ```text
-Usage: ccubes [options] source.pla [dest.pla]
-       ccubes --resume FILE [options]
-       ccubes --inspect FILE [--inspect-level 0|1]
-Options (values accept --name VALUE or --name=VALUE):
-  --bits-per-word VALUE
-      8, 16, 32, 64 (default), or 128
-  --threads VALUE
-      CPU worker threads; 0 (default) uses available cores
-  --weights VALUE
-      none, complexity (default), or sharing
-  --solver VALUE
-      hybrid (default) or gurobi
-  --effort VALUE
-      hybrid effort: 0 (default), 1, or 2
-  --deterministic
-      canonical PI ordering
-  --certify
-      complete-prime enumeration and exact cover (point rows only)
-  --blocking-diagnostic
-      report the adaptive blocking diagnostic at the first plateau
-  --pool
-      automatic equal-cardinality cover pooling; implies sharing weights
-  --lock-stats
-      report PI-insertion lock contention
-  --time-limit VALUE
-      nonnegative seconds until checkpoint and exit; 0 disables
-  --checkpoint-every VALUE
-      nonnegative seconds between checkpoints; 0 disables
-  --checkpoint VALUE
-      checkpoint save path (otherwise derived from source/resume)
-  --resume VALUE
-      resume from this checkpoint file
-  --inspect VALUE
-      inspect this checkpoint file and exit
-  --inspect-level VALUE
-      0 (default) progress, 1 full metadata
-  --debug VALUE
-      0 warnings, 1 info, 2 trace; logging is off unless requested
-  --debug-file VALUE
-      write debug logging to this file (otherwise stderr)
-  --help
-      show this help message
-Use -- to end option parsing for filenames beginning with '-'.
-Legacy short options are deprecated; use the long names above.
-No CCUBES_* environment settings are read.
+ccubes [options] source.pla [dest.pla]
+ccubes --resume FILE [options]
+ccubes --inspect FILE [--inspect-level 0|1]
 ```
+
+Arguments with values accept either `--name VALUE` or `--name=VALUE`. A dash in the Value column means a Boolean switch that takes no value. `--` ends option parsing. Deprecated short aliases and their replacements are listed in [CONFIGURATION.md](CONFIGURATION.md#short-option-migration).
+
+| Argument | Value | Meaning |
+| --- | --- | --- |
+| `--bits-per-word` | `8`, `16`, `32`, `64`, `128` | Ordinary PI storage word width; default `64`. |
+| `--threads` | Integer ≥ 0 | CPU worker threads; `0` (default) selects available cores. |
+| `--weights` | `none`, `complexity`, `sharing` | Ordinary cover weighting; default `complexity`. |
+| `--solver` | `hybrid`, `gurobi` | Ordinary cover solver; default `hybrid`. |
+| `--effort` | `0`, `1`, `2` | Ordinary hybrid solver effort; default `0`. |
+| `--deterministic` | — | Canonicalize ordinary PI ordering; not a guarantee of identical time-limited or IPC results. |
+| `--certify` | — | Complete-prime enumeration and exact cover for supported binary point inputs. |
+| `--blocking-diagnostic` | — | Report the ordinary adaptive blocking diagnostic at the first plateau. |
+| `--pool` | — | Enable bounded equal-cardinality cover pooling; implies sharing weights. |
+| `--lock-stats` | — | Report PI-insertion lock contention. |
+| `--time-limit` | Nonnegative seconds | Ordinary generation budget before checkpoint and exit; `0` disables. |
+| `--checkpoint-every` | Nonnegative seconds | Interval between ordinary generation checkpoints. Generation continues after each save. `0` disables periodic saves. |
+| `--checkpoint` | File path | Checkpoint save path. Requires a positive `--time-limit` or `--checkpoint-every`. If omitted, the path is derived from the source or resumed checkpoint. |
+| `--resume` | File path | Resume an ordinary generation checkpoint. |
+| `--inspect` | File path | Inspect a checkpoint and exit. |
+| `--inspect-level` | `0`, `1` | Inspection detail: progress (`0`, default) or full metadata (`1`); requires `--inspect`. |
+| `--debug` | `0`, `1`, `2` | Logging detail: warnings, information, or trace; logging is off unless requested. |
+| `--debug-file` | File path | Write debug logging to this file; otherwise use standard error. |
+| `--log-file` | File path | Append run diagnostics and solver logs for any backend and output count; defaults to debug level `1` unless `--debug` is supplied. |
+| `--help` | — | Print usage and the complete argument list, then exit. |
+| `--progressive-cover` | — | Select IPC; equivalent to `--route ipc`. |
+| `--route` | `auto`, `ordinary`, `ipc` | Select the minimization pipeline; default `ordinary`. The legacy value `e0` means `ordinary`. |
+| `--literal-polish` | `0`, `1`, `2`, `3` | IPC finishing: off, one pass (default), yield-gated passes, or four passes. |
+| `--pool-input` | File path | Load a validated single-output IPC pool and continue normal minimization. |
+| `--pool-output` | File path | Save the validated single-output IPC pool. |
+| `--global-bound-time-limit` | Nonnegative seconds | Optional IPC global-bound budget; `0` disables. |
+| `--literal-polish-time-limit` | Nonnegative seconds | Separate allowance for final IPC literal polishing; `0` means unlimited. |
+| `--ipc-master` | `native` | Select the native IPC restricted master (default). |
+| `--memory-mb` | Positive integer | IPC process memory envelope in MiB. |
+| `--ipc-effort` | `0`, `1`, `2` | Native IPC master effort; default `0`. |
+| `--profile-pricing` | `0`, `1` | IPC pricing telemetry; default off (`0`). |
+| `--ipc-time-limit` | Nonnegative seconds | Soft per-output IPC wall target; `0` disables. Finishing work can exceed the target. |
 
 The default solver remains the bundled hybrid solver, with effort 0 and complexity weights. Numeric solver values `0`/`1` and weights `0`/`1`/`2` are also accepted. `--threads 0` selects available cores, just like omitting the option. Invalid, empty, out-of-range, or partially numeric values are rejected before opening a debug log or starting minimization.
 
@@ -125,4 +128,32 @@ The default solver remains the bundled hybrid solver, with effort 0 and complexi
 
 Resume retains the existing checkpoint behavior: saved word width, weights, solver, and pooling settings are restored from the file. Thread count, effort, diagnostics, deterministic ordering, time limit, and checkpoint interval are settings for the current invocation and should be supplied again when needed.
 
-Short options still work as deprecated aliases during migration. The four former `CCUBES_*` environment switches are no longer read. See [CONFIGURATION.md](CONFIGURATION.md) for the complete migration table, audit decisions, and isolated experimental test commands.
+Short options still work as deprecated aliases during migration. The four former `CCUBES_*` environment switches are retired. See [CONFIGURATION.md](CONFIGURATION.md) for the migration table.
+
+
+## Native IPC
+
+Use `--route ipc` for the native incremental prime-cover solver. It handles constant outputs directly and solves and merges supported outputs independently. With `--route auto`, eligible wide or dense inputs can select IPC. Ordinary-only requests such as checkpoints, certification, pooling, and an explicit Gurobi solver keep the ordinary route when automatic routing is selected. The `CCUBES_ROUTE` line records the choice and reason.
+
+IPC defaults to the native master at effort zero with greedy pricing, native repair, bounded recovery, and one final literal-polish pass. It runs without Gurobi. The ordinary route retains its optional Gurobi solver and falls back to the hybrid solver if Gurobi support was not built in. The IPC wall target is soft because current work and finalization may extend beyond it. On a single-output run, the solver can publish validated incumbents atomically as it progresses.
+
+Use `--pool-output` to retain a single-output IPC pool and `--pool-input` to validate and continue minimization from a compatible pool. These files have a different format from ordinary checkpoints. Restricted-master bounds and proofs apply to the retained pool. A global bound requires separate verification against the full pricing domain.
+
+### Shared rows under a whole-PLA budget
+
+The Python runner accepts an explicit binary care table and a new output directory. It runs native IPC on each nonconstant output and searches for a smaller merged cover using geometries already in the validated merged seed.
+
+```sh
+python3 scripts/run_ipc_shared_cover.py --binary ./ccubes \
+  --source source.pla --output joint-result --threads 8 --seconds 180
+```
+
+The runner reserves finishing time inside the total budget. It retains the validated seed if the post-pass times out or would increase the merged row count. The optional `--checker` accepts an independent executable that validates the source and serialized result. The run records merged rows, output connections, and any optimum proved within the selected pool.
+
+### Run logs
+
+Use `--log-file FILE` to append diagnostics from either route. It defaults to information level. Set `--debug` to change the level or `--debug-file` to send debug output to a separate file. Keep logs separate from inputs, outputs, checkpoint and pool files. Help and checkpoint inspection still use standard output.
+
+## Verification
+
+The ordinary and IPC regression suites are maintained in the CCubesIPC development repository.

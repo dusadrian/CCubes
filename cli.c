@@ -7,6 +7,7 @@
 */
 
 #include "cli.h"
+#include "runtime_options.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -18,10 +19,9 @@
 typedef enum {
     BITS, THREADS, WEIGHTS, SOLVER, EFFORT, DETERMINISTIC, CERTIFY,
     BLOCKING, POOL, LOCK_STATS, TIME_LIMIT, CHECKPOINT_EVERY, CHECKPOINT,
-    RESUME, INSPECT, INSPECT_LEVEL, DEBUG, DEBUG_FILE, HELP,
-#ifdef CCUBES_TESTING
-    TEST_PI_GENERATOR, TEST_PROJECTION_RWLS,
-#endif
+    RESUME, INSPECT, INSPECT_LEVEL, DEBUG, DEBUG_FILE, LOG_FILE, HELP,
+    PROGRESSIVE_COVER, ROUTE, LITERAL_POLISH,
+
 } OptionId;
 
 typedef struct {
@@ -52,11 +52,11 @@ static const Option option_table[] = {
     {"inspect-level", NULL, true, INSPECT_LEVEL, "0 (default) progress, 1 full metadata"},
     {"debug", "dbg", true, DEBUG, "0 warnings, 1 info, 2 trace; logging is off unless requested"},
     {"debug-file", NULL, true, DEBUG_FILE, "write debug logging to this file (otherwise stderr)"},
+    {"log-file", NULL, true, LOG_FILE, "append run diagnostics and solver logs for any backend; defaults to debug level 1"},
     {"help", "h", false, HELP, "show this help message"},
-#ifdef CCUBES_TESTING
-    {"test-pi-generator", NULL, true, TEST_PI_GENERATOR, "TEST BUILD ONLY: auto, projection, mmcs, complete-mmcs"},
-    {"test-projection-rwls", NULL, false, TEST_PROJECTION_RWLS, "TEST BUILD ONLY: experimental fixed-chart RWLS finisher"},
-#endif
+    {"progressive-cover", NULL, false, PROGRESSIVE_COVER, "select IPC (same as --route ipc)"},
+    {"route", NULL, true, ROUTE, "ordinary (default, legacy: e0), auto, or ipc"},
+    {"literal-polish", NULL, true, LITERAL_POLISH, "IPC finishing: 0 off, 1 one pass (default), 2 yield-gated, 3 four passes"},
 };
 
 void cli_help(FILE *out) {
@@ -69,6 +69,7 @@ void cli_help(FILE *out) {
         fprintf(out, "  --%s%s\n      %s\n", option->name,
                 option->takes_value ? " VALUE" : "", option->description);
     }
+    ccubes_options_help(out);
     fprintf(out, "Use -- to end option parsing for filenames beginning with '-'.\n"
                  "Legacy short options are deprecated; use the long names above.\n"
                  "No CCUBES_* environment settings are read.\n");
@@ -128,25 +129,26 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
         case INSPECT_LEVEL: return parse_integer(value, &o->inspect_level) && o->inspect_level <= 1;
         case DEBUG:
             o->debug = true;
+            o->debug_level_explicit = true;
             return parse_integer(value, &o->debug_level) && o->debug_level <= 2;
         case DEBUG_FILE: o->debug = true; o->debug_file = value; return true;
+        case LOG_FILE: o->log_file = value; return true;
         case HELP: return true;
-#ifdef CCUBES_TESTING
-        case TEST_PI_GENERATOR:
-            if (!strcmp(value, "auto")) o->test_pi_generator = PI_GENERATOR_AUTO;
-            else if (!strcmp(value, "projection")) o->test_pi_generator = PI_GENERATOR_PROJECTION;
-            else if (!strcmp(value, "mmcs")) o->test_pi_generator = PI_GENERATOR_MMCS;
-            else if (!strcmp(value, "complete-mmcs")) o->test_pi_generator = PI_GENERATOR_COMPLETE_MMCS;
-            else return false;
+        case PROGRESSIVE_COVER: o->progressive_cover = true; return true;
+        case ROUTE:
+            if (strcmp(value, "auto") && strcmp(value, "ordinary") && strcmp(value, "e0") && strcmp(value, "ipc")) return false;
+            o->route = !strcmp(value, "ordinary") ? "e0" : value;
             return true;
-        case TEST_PROJECTION_RWLS: o->test_projection_rwls = true; return true;
-#endif
+        case LITERAL_POLISH:
+            o->literal_polish_explicit = true;
+            return parse_integer(value, &o->literal_polish) && o->literal_polish <= 3;
     }
     return false;
 }
 
 int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
-    *o = (CliOptions){.bits_per_word = 64, .weights = 1};
+    *o = (CliOptions){.bits_per_word = 64, .weights = 1, .literal_polish = 1};
+    ccubes_options_reset();
     bool positional_only = false;
     bool inspect_level_set = false;
     for (int i = 1; i < argc; ++i) {
@@ -165,6 +167,9 @@ int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
             continue;
         }
 
+        int extra = ccubes_options_parse(argc, argv, &i, err);
+        if (extra < 0) return -1;
+        if (extra > 0) continue;
         const Option *option = NULL;
         char *value = NULL;
         bool legacy = arg[1] != '-';
@@ -209,7 +214,6 @@ int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
         }
         if (option->id == HELP) return 1;
         if (legacy) o->legacy_options = true;
-
         /* Decode the old combined -lSEC=FILE, -iLEVEL=FILE, -dbgLEVEL=FILE
          * syntax into the same fields. Never write NULs into argv. */
         char number[64];

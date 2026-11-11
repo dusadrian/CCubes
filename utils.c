@@ -12,6 +12,7 @@
 #include "prime_check.h"
 #include "lock_stats.h"
 #include <assert.h>
+#include <errno.h>
 #include <float.h>
 #include <math.h>
 
@@ -145,6 +146,19 @@ void destroy_output_locks(ccubes_mutex *locks, int noutputs) {
     free(locks);
 }
 
+bool parse_int_strict(const char *text, int *value) {
+    if (!text || !*text || !value) return false;
+
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') return false;
+    if (parsed < INT_MIN || parsed > INT_MAX) return false;
+
+    *value = (int)parsed;
+    return true;
+}
+
 void print_hybrid_stats(int output_index) {
     DBG_INFO_BLOCK {
         const LagrangianStats *stats = lagrangian_last_stats();
@@ -175,7 +189,15 @@ void print_hybrid_stats(int output_index) {
             "bestZLB=%.6f lastZLB=%.6f iterations=%d stop=%s%s "
             "warm_start_requested=%d warm_start_accepted=%d "
             "effort=%d certification_requested=%d iteration_limit=%d "
-            "portfolio_limit=%d polish_nodes=%ld presolve_cols_removed=%d\n",
+            "portfolio_limit=%d polish_nodes=%ld presolve_cols_removed=%d "
+            "requested_iteration_limit=%d multiplier_schedule=%s "
+            "multiplier_convergence=%s reset=%s floor=%s "
+            "continuous_improvements=%d last_continuous_improvement=%d "
+            "requested_step=%.9g/%.9g/%.9g requested_stabilization=%.9g "
+            "requested_deflection=%.9g "
+            "step=%.9g/%.9g/%.9g contract=%.9g contractions=%d "
+            "stabilization=%.9g deflection=%.9g "
+            "restarts=%d\n",
             stats->best_zlb,
             stats->last_zlb,
             stats->iterations,
@@ -188,7 +210,33 @@ void print_hybrid_stats(int output_index) {
             stats->iteration_limit,
             stats->portfolio_limit,
             stats->polish_node_limit,
-            stats->presolve_cols_removed
+            stats->presolve_cols_removed,
+            stats->requested_iteration_limit,
+            lagrangian_multiplier_schedule_name(
+                stats->multiplier_schedule
+            ),
+            lagrangian_multiplier_convergence_name(
+                stats->multiplier_convergence
+            ),
+            stats->reset_on_continuous_improvement
+                ? "continuous"
+                : "integer",
+            stats->stop_at_step_floor ? "stop" : "continue",
+            stats->continuous_improvements,
+            stats->last_continuous_improvement_iteration,
+            stats->requested_initial_step_coef,
+            stats->requested_step_min,
+            stats->requested_step_contract,
+            stats->requested_stabilization_beta,
+            stats->requested_deflection_alpha,
+            stats->initial_step_coef,
+            stats->step_coef,
+            stats->step_min,
+            stats->step_contract,
+            stats->step_contractions,
+            stats->stabilization_beta,
+            stats->deflection_alpha,
+            stats->restarts
         );
     }
 }
@@ -962,15 +1010,20 @@ int finalize_pi_level(
     int implicant_words,
     int level_start,
     bool deterministic_order,
-    bool preserve_shared_geometries
+    bool preserve_shared_geometries,
+    bool retain_all_prime_geometries
 ) {
     if (deterministic_order) {
         return canonicalize_pi_order(
             PInfo,
             implicant_words,
             level_start,
-            preserve_shared_geometries
+            preserve_shared_geometries,
+            retain_all_prime_geometries
         );
+    }
+    if (retain_all_prime_geometries) {
+        return rebuild_pi_buckets(PInfo, level_start);
     }
     if (!prune_duplicate_coverage_in_level(
         PInfo,
@@ -987,7 +1040,8 @@ int canonicalize_pi_order(
     PIstorage *pi,
     int implicant_words,
     int level_start,
-    bool preserve_shared_geometries
+    bool preserve_shared_geometries,
+    bool retain_all_prime_geometries
 ) {
     if (!pi || pi->foundPI <= 0 || pi->ON_minterms <= 0) return 1;
 
@@ -998,6 +1052,7 @@ int canonicalize_pi_order(
     if (n <= 1) {
         if (
             n == 1 &&
+            !retain_all_prime_geometries &&
             !prune_duplicate_coverage_in_level(
                 pi,
                 implicant_words,
@@ -1105,6 +1160,10 @@ int canonicalize_pi_order(
     free(tmp_implicants_val);
     free(tmp_shared);
     free(tmp_covsum);
+
+    if (retain_all_prime_geometries) {
+        return rebuild_pi_buckets(pi, level_start);
+    }
 
     if (!prune_duplicate_coverage_in_level(
         pi,
@@ -2293,13 +2352,14 @@ static int checkpoint_uncovered_rows(const PIstorage *pi) {
     return uncovered;
 }
 
-void print_info(const char *INFO_PATH, const int info_level) {
+int print_info(const char *INFO_PATH, const int info_level) {
     PIstorage *pi_tmp = NULL;
     int ni=0, no=0, bpw=0, vbw=0, ipw=0, ck=0, ml=0, wp=0, st=0, pm=0;
     int *stopc_tmp = NULL; int *nofvals_tmp = NULL;
     char *src_saved=NULL; char *dst_saved=NULL;
     double elapsed_total = 0.0, elapsed_scp = 0.0;
-    uint64_t resume_task = 0ull;
+    uint64_t resume_task = 0;
+    uint32_t version = 0;
 
     if (load_checkpoint(
             INFO_PATH,
@@ -2320,16 +2380,18 @@ void print_info(const char *INFO_PATH, const int info_level) {
             &dst_saved,
             &elapsed_total,
             &elapsed_scp,
-            &resume_task
+            &resume_task,
+            &version
     ) != 0) {
         fprintf(stderr, "Error: failed to load checkpoint from %s\n", INFO_PATH);
-        return;
+        return 1;
     }
 
     // printf("Checkpoint: %s\n", INFO_PATH);
     printf("Source: %s\n", src_saved ? src_saved : "-");
     printf("Destination: %s\n", dst_saved ? dst_saved : "-");
     printf("Inputs: %d, Outputs: %d\n", ni, no);
+    printf("Checkpoint version: %u\n", (unsigned)version);
     // printf("Bits per word: %d, value bit width: %d, implicant words: %d\n", bpw, vbw, ipw);
     printf("Level k reached: %d\n", ck);
     const char *stopping_policy = certified_model_supported(pi_tmp, ni, no)
@@ -2343,12 +2405,8 @@ void print_info(const char *INFO_PATH, const int info_level) {
     if (ck > 0 && maxt > 0) {
         double pct = (double)resume_task * 100.0 / (double)maxt;
         if (pct > 100.0) pct = 100.0;
-        printf(
-            "Progress at k: resume_task=%llu / %llu (%.2f%%)\n",
-            (unsigned long long)resume_task,
-            (unsigned long long)maxt,
-            pct
-        );
+        printf("Progress at k: resume_task=%llu / %llu (%.2f%%)\n",
+               (unsigned long long)resume_task, (unsigned long long)maxt, pct);
     }
 
     printf("Total time spent: %.3fs (%.3fs SCP)\n", elapsed_total, elapsed_scp);
@@ -2379,9 +2437,8 @@ void print_info(const char *INFO_PATH, const int info_level) {
     if (nofvals_tmp) free(nofvals_tmp);
     if (stopc_tmp) free(stopc_tmp);
 
-    // Use cleanup to free PInfo; provide a dummy buffer holder
-    ThreadBuffer **dummy = (ThreadBuffer**)calloc(1, sizeof(ThreadBuffer*));
-    cleanup(pi_tmp, dummy);
+    cleanup(pi_tmp, NULL);
+    return 0;
 }
 
 static bool candidate_matches_wildcard_off(
@@ -2444,7 +2501,8 @@ int process_task(
     PICoverageIndex *coverage_indices,
     int *max_shared,
     int increase,
-    int *multiplier
+    int *multiplier,
+    bool retain_all_prime_geometries
 ) {
     int tempk[k];
     uint64_t combination = task;
@@ -2646,11 +2704,6 @@ int process_task(
                 configuration_words * 2u * sizeof(uint64_t)
             );
         }
-#ifdef CCUBES_TESTING
-        ts->scalar_config_scratch_bytes = scalar_exact
-            ? (scalar_dense ? dense_bytes : sparse_bytes)
-            : 0u;
-#endif
 
         int max_candidates = configuration_count < ON_minterms
             ? configuration_count
@@ -2704,9 +2757,6 @@ int process_task(
 
         if (scalar_exact) {
             for (int r = 0; r < OFF_minterms; ++r) {
-#ifdef CCUBES_TESTING
-                ts->scalar_off_rows_projected++;
-#endif
                 int configuration = 0;
                 if (!compact_projected_configuration(
                     &PInfo[o].OFF_set[(size_t)r * (size_t)ninputs],
@@ -2782,9 +2832,6 @@ int process_task(
                 int acc = 0;
                 bool has_dc = false;
 
-#ifdef CCUBES_TESTING
-                ts->scalar_off_rows_projected++;
-#endif
                 for (int c = 0; c < k; c++) {
                     int value =
                         PInfo[o].OFF_set[
@@ -2912,9 +2959,6 @@ int process_task(
                 if (duplicate) continue;
             }
 
-#ifdef CCUBES_TESTING
-            ts->validation_attempts++;
-#endif
 
             // check if the row is different from any OFF-set row
             bool valid_row = true;
@@ -3169,15 +3213,20 @@ int process_task(
                 // the output this PI belongs to
                 int o = output_map[u * noutputs + s];
                 bool shareable = shared_count[u] > 1;
-                bool shareable_prime = !shareable || projected_cube_is_prime(
-                    &PInfo[o],
-                    ninputs,
-                    tempk,
-                    k,
-                    &buffer[tid][o].value_bits[(size_t)f * (size_t)implicant_words],
-                    word_index,
-                    bit_index
-                );
+                bool shareable_prime = true;
+                if (shareable || retain_all_prime_geometries) {
+                    shareable_prime = projected_cube_is_prime(
+                        &PInfo[o],
+                        ninputs,
+                        tempk,
+                        k,
+                        &buffer[tid][o].value_bits[
+                            (size_t)f * (size_t)implicant_words
+                        ],
+                        word_index,
+                        bit_index
+                    );
+                }
 
                 int ON_minterms = PInfo[o].ON_minterms;
                 int pichart_words = PInfo[o].pichart_words;
@@ -3207,6 +3256,7 @@ int process_task(
                  */
                 if (
                     !shareable &&
+                    !retain_all_prime_geometries &&
                     !redundant &&
                     coverage_index
                 ) {

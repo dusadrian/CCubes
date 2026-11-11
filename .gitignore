@@ -21,8 +21,12 @@
 # Keep the examples directory and all its contents
 !examples/
 !examples/**
-!tests/
-!tests/**
+
+!scripts/
+!scripts/pla_helpers.py
+!scripts/joint_cover.py
+!scripts/recombine_shared_cover.py
+!scripts/run_ipc_shared_cover.py
 
 temp/
 proofs/

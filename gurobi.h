@@ -9,6 +9,7 @@
 #include "pichart_view.h"
 #ifdef HAVE_GUROBI
     #include "gurobi_c.h"
+    int gurobi_start_environment(GRBenv **env);
 #endif
 
 bool gurobi_license_is_valid(void);

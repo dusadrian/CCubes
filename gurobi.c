@@ -8,8 +8,24 @@
 
 #include "gurobi.h"
 #include "cover_validation.h"
+#include "debug.h"
 
 #ifdef HAVE_GUROBI
+
+/* Every Gurobi solve uses the same run log as the native backends. */
+int gurobi_start_environment(GRBenv **env) {
+    int error = GRBemptyenv(env);
+    if (error) return error;
+    error = GRBsetintparam(*env, GRB_INT_PAR_LOGTOCONSOLE, 0);
+    if (error) return error;
+    error = GRBsetintparam(*env, GRB_INT_PAR_OUTPUTFLAG, run_log_path ? 1 : 0);
+    if (error) return error;
+    if (run_log_path) {
+        error = GRBsetstrparam(*env, GRB_STR_PAR_LOGFILE, run_log_path);
+        if (error) return error;
+    }
+    return GRBstartenv(*env);
+}
 
 bool gurobi_license_is_valid(void) {
     GRBenv *env = NULL;
@@ -88,25 +104,7 @@ void gurobi_multiobjective(
         goto QUIT;
     }
 
-    /* redirect stdout/stderr to suppress license banner */
-    FILE *nullout = fopen("/dev/null", "w");
-    int saved_stdout = dup(fileno(stdout));
-    int saved_stderr = dup(fileno(stderr));
-    dup2(fileno(nullout), fileno(stdout));
-    dup2(fileno(nullout), fileno(stderr));
-
-    error = GRBloadenv(&env, "/dev/null");
-    if (error) goto QUIT;
-
-    fflush(stdout); fflush(stderr);
-    dup2(saved_stdout, fileno(stdout));
-    dup2(saved_stderr, fileno(stderr));
-    close(saved_stdout);
-    close(saved_stderr);
-    fclose(nullout);
-
-    /* silence solver logs */
-    error = GRBsetintparam(env, "OutputFlag", 0);
+    error = gurobi_start_environment(&env);
     if (error) goto QUIT;
 
     /* new model with foundPI variables */
@@ -286,38 +284,7 @@ void gurobi_solution_pool(
     //     printf("\n");
     // }
 
-    /* Initialize Gurobi environment; silence license banner and log to /dev/null */
-    {
-        FILE *nullout = fopen("/dev/null", "w");
-        int saved_stdout = -1, saved_stderr = -1;
-        if (nullout) {
-            saved_stdout = dup(fileno(stdout));
-            saved_stderr = dup(fileno(stderr));
-            dup2(fileno(nullout), fileno(stdout));
-            dup2(fileno(nullout), fileno(stderr));
-        }
-
-        error = GRBloadenv(&env, "/dev/null");
-
-        if (nullout) {
-            fflush(stdout);
-            fflush(stderr);
-            if (saved_stdout != -1) {
-                dup2(saved_stdout, fileno(stdout));
-                close(saved_stdout);
-            }
-            if (saved_stderr != -1) {
-                dup2(saved_stderr, fileno(stderr));
-                close(saved_stderr);
-            }
-            fclose(nullout);
-        }
-
-        if (error) goto QUIT;
-    }
-
-    /* silence solver logs */
-    error = GRBsetintparam(env, "OutputFlag", 0);
+    error = gurobi_start_environment(&env);
     if (error) goto QUIT;
 
     /* new model with foundPI variables */

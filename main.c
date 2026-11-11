@@ -12,19 +12,23 @@
 #include <stdbool.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <errno.h>
+#include <math.h>
 #include "main.h"
 #include "cli.h"
+#include "runtime_options.h"
 #include "certified_stop.h"
 #include "checkpoint.h"
+#include "file_replace.h"
 #include "lock_stats.h"
 #include "ccubes_threads.h"
 #include "pool_selection.h"
 #include "plateau_probe.h"
 #include "bounded_mmcs.h"
-#include "cover_validation.h"
-#ifdef CCUBES_TESTING
-#include "projection_rwls.h"
-#endif
+#include "progressive_cover.h"
+#include "progressive_column_pool.h"
+#include "progressive_input.h"
+#include "progressive_rwls.h"
 
 #define CCUBES_AUTO_MMCS_MIN_PROJECTION_TASKS UINT64_C(8192)
 #define CCUBES_AUTO_MMCS_MIN_NODE_BUDGET UINT64_C(8192)
@@ -36,130 +40,209 @@
 #define CCUBES_AUTO_MMCS_MAX_NODE_LIMIT UINT64_C(100000000)
 #define CCUBES_AUTO_MMCS_MAX_TRIAL_THREADS 4
 
-#ifdef CCUBES_TESTING
-static const char *projection_rwls_status_name(
-    ProjectionRWLSStatus status
+#define CCUBES_INITIAL_PI_MEMORY_BYTES UINT64_C(268435456)
+#define CCUBES_INITIAL_PI_CAPACITY_MIN 64
+#define CCUBES_INITIAL_PI_CAPACITY_MAX 8192
+#define CCUBES_PI_CAPACITY_GROWTH 1024
+
+static int ordinary_initial_pi_capacity(
+    const PIstorage *outputs,
+    int noutputs,
+    int implicant_words,
+    uint64_t *estimated_bytes,
+    int *active_outputs,
+    int *constant_zero_outputs,
+    int *constant_one_outputs
 ) {
-    switch (status) {
-        case PROJECTION_RWLS_OK: return "ok";
-        case PROJECTION_RWLS_INVALID: return "invalid";
-        case PROJECTION_RWLS_OUT_OF_MEMORY: return "out-of-memory";
-        case PROJECTION_RWLS_MEMORY_LIMIT: return "memory-limit";
+    uint64_t bytes_per_slot = 0;
+    int active = 0;
+    int constant_zero = 0;
+    int constant_one = 0;
+    for (int output = 0; output < noutputs; ++output) {
+        const PIstorage *pi = &outputs[output];
+        if (pi->ON_minterms <= 0) {
+            constant_zero++;
+            continue;
+        }
+        if (pi->OFF_minterms <= 0) {
+            constant_one++;
+            continue;
+        }
+        active++;
+        uint64_t column_bytes =
+            (uint64_t)pi->pichart_words * sizeof(uint64_t) +
+            (uint64_t)implicant_words * 2u * sizeof(uint64_t) +
+            3u * sizeof(int);
+        if (UINT64_MAX - bytes_per_slot < column_bytes) {
+            bytes_per_slot = UINT64_MAX;
+            break;
+        }
+        bytes_per_slot += column_bytes;
     }
-    return "unknown";
+
+    uint64_t capacity = bytes_per_slot > 0
+        ? CCUBES_INITIAL_PI_MEMORY_BYTES / bytes_per_slot
+        : CCUBES_INITIAL_PI_CAPACITY_MIN;
+    if (capacity < CCUBES_INITIAL_PI_CAPACITY_MIN) {
+        capacity = CCUBES_INITIAL_PI_CAPACITY_MIN;
+    }
+    if (capacity > CCUBES_INITIAL_PI_CAPACITY_MAX) {
+        capacity = CCUBES_INITIAL_PI_CAPACITY_MAX;
+    }
+    if (estimated_bytes) {
+        *estimated_bytes = bytes_per_slot == UINT64_MAX
+            ? UINT64_MAX
+            : bytes_per_slot * capacity;
+    }
+    if (active_outputs) *active_outputs = active;
+    if (constant_zero_outputs) *constant_zero_outputs = constant_zero;
+    if (constant_one_outputs) *constant_one_outputs = constant_one;
+    return (int)capacity;
 }
 
-/*
- * Experimental fixed-chart finisher. Keep it separate from prime generation:
- * it may select only columns already present at this projection boundary.
- * Four logical families make the searched work independent of --threads; physical
- * workers change elapsed time, not the deterministic family prefix.
- */
-static bool try_projection_rwls(
-    const PIChartView *chart,
-    int level,
-    int output,
-    int threads,
-    bool certified_mode,
-    bool boundary_exact,
-    int *solution,
-    int *cardinality
+static long long written_pla_product_count(const char *path) {
+    if (!path) return -1;
+    FILE *file = fopen(path, "r");
+    if (!file) return -1;
+    char line[256];
+    long long products = -1;
+    while (fgets(line, sizeof(line), file)) {
+        if (sscanf(line, ".p %lld", &products) == 1) break;
+    }
+    fclose(file);
+    return products;
+}
+
+typedef struct {
+    const char *output_path;
+} ProgressiveIncumbentFileContext;
+
+static bool persist_progressive_incumbent(
+    int ninputs,
+    int cardinality,
+    const int *solution,
+    int selected_horizon,
+    int generation,
+    void *data
 ) {
-    if (!projection_rwls_should_run(
-        true,
-        certified_mode,
-        boundary_exact,
-        true,
-        cardinality ? *cardinality : -1
-    )) {
-        const char *reason = certified_mode
-            ? "certified-mode"
-            : (
-                boundary_exact
-                    ? "boundary-exact"
-                    : "cardinality-floor"
-            );
-        fprintf(
-            stderr,
-            "CCUBES_PROJECTION_RWLS level=%d output=%d "
-            "status=skipped reason=%s\n",
-            level,
-            output + 1,
-            reason
-        );
+    ProgressiveIncumbentFileContext *context =
+        (ProgressiveIncumbentFileContext *)data;
+    if (
+        !context ||
+        !context->output_path ||
+        ninputs <= 0 ||
+        cardinality <= 0 ||
+        !solution ||
+        generation <= 0
+    ) {
         return false;
     }
 
-    const int incumbent_cardinality = *cardinality;
-    ProjectionRWLSOptions options;
-    projection_rwls_options_default(&options);
-    options.requested_threads = threads;
-    options.logical_family_count = 4;
-    options.seed =
-        ((uint64_t)(unsigned int)level << 32) ^
-        (uint64_t)(unsigned int)(output + 1);
-
-    int *candidate = NULL;
-    int candidate_cardinality = -1;
-    ProjectionRWLSStats stats;
-    const ProjectionRWLSStatus status = projection_rwls_improve(
-        chart,
-        incumbent_cardinality,
-        solution,
-        &options,
-        &candidate,
-        &candidate_cardinality,
-        &stats
+    size_t path_length = strlen(context->output_path);
+    char *temporary_path = (char *)malloc(path_length + 16u);
+    char *metadata_path = (char *)malloc(path_length + 16u);
+    char *temporary_metadata_path = (char *)malloc(path_length + 32u);
+    if (!temporary_path || !metadata_path || !temporary_metadata_path) {
+        free(temporary_path);
+        free(metadata_path);
+        free(temporary_metadata_path);
+        return false;
+    }
+    snprintf(
+        temporary_path,
+        path_length + 16u,
+        "%s.inc.tmp",
+        context->output_path
     );
-    const bool candidate_valid =
-        status == PROJECTION_RWLS_OK &&
-        cover_is_feasible(
-            chart,
-            candidate,
-            candidate_cardinality
-        );
-    const bool improved =
-        candidate_valid &&
-        candidate_cardinality < incumbent_cardinality;
+    snprintf(
+        metadata_path,
+        path_length + 16u,
+        "%s.meta",
+        context->output_path
+    );
+    snprintf(
+        temporary_metadata_path,
+        path_length + 32u,
+        "%s.inc.tmp",
+        metadata_path
+    );
 
-    if (improved) {
-        memcpy(
-            solution,
-            candidate,
-            (size_t)candidate_cardinality * sizeof(int)
-        );
-        *cardinality = candidate_cardinality;
+    if (!run_log_check_path(context->output_path) ||
+        !run_log_check_path(temporary_path) ||
+        !run_log_check_path(metadata_path) ||
+        !run_log_check_path(temporary_metadata_path)) {
+        free(temporary_path);
+        free(metadata_path);
+        free(temporary_metadata_path);
+        return false;
     }
 
-    fprintf(
-        stderr,
-        "CCUBES_PROJECTION_RWLS level=%d output=%d status=%s "
-        "cover=%d->%d targets=%d/%d families=%d threads=%d "
-        "iterations=%llu memory=%llu seconds=%.6f\n",
-        level,
-        output + 1,
-        status == PROJECTION_RWLS_OK
-            ? (
-                !candidate_valid
-                    ? "invalid-result"
-                    : (improved ? "improved" : "unchanged")
-            )
-            : projection_rwls_status_name(status),
-        incumbent_cardinality,
-        improved ? candidate_cardinality : incumbent_cardinality,
-        stats.targets_improved,
-        stats.targets_attempted,
-        stats.logical_family_states,
-        stats.threads_used,
-        (unsigned long long)stats.iterations,
-        (unsigned long long)stats.allocated_bytes,
-        (double)stats.elapsed_nanoseconds / 1e9
-    );
-    free(candidate);
-    return improved;
-}
+    bool ok = false;
+    FILE *pla = fopen(temporary_path, "w");
+    if (!pla) goto DONE;
+    if (
+        fprintf(
+            pla,
+            ".i %d\n.o 1\n.p %d\n",
+            ninputs,
+            cardinality
+        ) < 0
+    ) {
+        fclose(pla);
+        goto DONE;
+    }
+    for (int cube = 0; cube < cardinality; ++cube) {
+        for (int input = 0; input < ninputs; ++input) {
+            int value = solution[
+                (size_t)input * (size_t)cardinality + (size_t)cube
+            ];
+            char symbol = value == 0 ? '-' : (value == 1 ? '0' : '1');
+            if (fputc(symbol, pla) == EOF) {
+                fclose(pla);
+                goto DONE;
+            }
+        }
+        if (fputs(" 1\n", pla) == EOF) {
+            fclose(pla);
+            goto DONE;
+        }
+    }
+    bool pla_write_failed = fputs(".e\n", pla) == EOF;
+    if (fclose(pla) != 0) pla_write_failed = true;
+    if (pla_write_failed) goto DONE;
 
-#endif /* CCUBES_TESTING */
+    FILE *metadata = fopen(temporary_metadata_path, "w");
+    if (!metadata) goto DONE;
+    bool metadata_write_failed = fprintf(
+        metadata,
+        "status=validated-incumbent\n"
+        "generation=%d\n"
+        "cardinality=%d\n"
+        "selected_horizon=%d\n",
+        generation,
+        cardinality,
+        selected_horizon
+    ) < 0;
+    if (fclose(metadata) != 0) metadata_write_failed = true;
+    if (metadata_write_failed) goto DONE;
+    if (
+        !ccubes_replace_file(temporary_path, context->output_path) ||
+        !ccubes_replace_file(temporary_metadata_path, metadata_path)
+    ) {
+        goto DONE;
+    }
+    ok = true;
+
+DONE:
+    if (!ok) {
+        remove(temporary_path);
+        remove(temporary_metadata_path);
+    }
+    free(temporary_path);
+    free(metadata_path);
+    free(temporary_metadata_path);
+    return ok;
+}
 
 /*
  * Keep the ordinary sharing-aware incumbent in a boundary pool.  Pool
@@ -263,11 +346,15 @@ typedef struct {
     int *max_shared;
     int increase;
     int *multiplier;
+    bool retain_all_prime_geometries;
+    double time_limit_sec;
     double checkpoint_deadline_sec;
     struct timespec start_time;
+    uint64_t first_task;
     atomic_bool *time_up;
-    uint64_t *worker_next_tasks;
+    atomic_bool *first_task_done;
     atomic_bool *failed;
+    uint64_t *worker_next_tasks;
 } PIWorkerContext;
 
 typedef struct {
@@ -298,27 +385,37 @@ static void pi_search_range_worker(
 ) {
     (void)worker_count;
     PIWorkerContext *ctx = (PIWorkerContext *)data;
+    uint64_t task = start;
 
-    ctx->worker_next_tasks[worker_id] = start;
-
-    for (uint64_t task = start; task < end; task += stride) {
+    while (task < end) {
         if (atomic_load_explicit(ctx->time_up, memory_order_acquire)) {
             break;
         }
 
-        if (ctx->checkpoint_deadline_sec > 0.0 && (task & 0x3FFull) == 0) {
+        /*
+         * A support task can be expensive on wide multi-output data, and a
+         * low-k level may contain fewer than the former 1024-task polling
+         * interval. Check before every checkpointable projection task; the
+         * remaining overrun is bounded only by the duration of one in-flight
+         * support task once workers have reached a safe checkpoint frontier.
+         * A periodic save waits for the first pending task to finish so
+         * very short intervals cannot repeatedly save without progress.
+         */
+        if (ctx->checkpoint_deadline_sec > 0.0) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             double elapsed =
                 (now.tv_sec - ctx->start_time.tv_sec) +
                 (now.tv_nsec - ctx->start_time.tv_nsec) / 1e9;
 
-            if (elapsed >= ctx->checkpoint_deadline_sec) {
-                atomic_store_explicit(
-                    ctx->time_up,
-                    true,
-                    memory_order_release
-                );
+            if (
+                elapsed >= ctx->checkpoint_deadline_sec &&
+                (
+                    (ctx->time_limit_sec > 0.0 && elapsed >= ctx->time_limit_sec) ||
+                    atomic_load_explicit(ctx->first_task_done, memory_order_acquire)
+                )
+            ) {
+                atomic_store_explicit(ctx->time_up, true, memory_order_release);
                 break;
             }
         }
@@ -340,7 +437,8 @@ static void pi_search_range_worker(
             ctx->coverage_indices,
             ctx->max_shared,
             ctx->increase,
-            ctx->multiplier
+            ctx->multiplier,
+            ctx->retain_all_prime_geometries
         );
 
         if (error) {
@@ -350,13 +448,17 @@ static void pi_search_range_worker(
                 (unsigned long long)task,
                 ctx->k
             );
-            atomic_store_explicit(ctx->time_up, true, memory_order_release);
             atomic_store_explicit(ctx->failed, true, memory_order_release);
+            atomic_store_explicit(ctx->time_up, true, memory_order_release);
             break;
         }
 
-        ctx->worker_next_tasks[worker_id] = task + stride;
+        if (ctx->checkpoint_deadline_sec > 0.0 && task == ctx->first_task) {
+            atomic_store_explicit(ctx->first_task_done, true, memory_order_release);
+        }
+        task = end - task <= stride ? end : task + stride;
     }
+    ctx->worker_next_tasks[worker_id] = task;
 }
 
 static void mmcs_search_range_worker(
@@ -480,24 +582,184 @@ static bool mmcs_branching_plausible(int b, int k, uint64_t budget) {
     return true;
 }
 
+/*
+ * Automatic routing between the ordinary CCubes pipeline and native
+ * progressive IPC.
+ *
+ * `docs/state-overview.md` §2.1 measures the ordinary path faster at 20, 30
+ * and 40 inputs on the frozen random ten-output corpus, and native IPC faster,
+ * far smaller in memory, and lower in cardinality at 50 inputs. Nothing was
+ * measured between those strata, and §8.3 records any claim that the 50-input
+ * crossover is universal as a stop-list entry. The router therefore changes
+ * behaviour only where a measurement supports the change, retains the
+ * established default everywhere else, and reports every decision together
+ * with the features it was made from.
+ *
+ * An explicit user request always wins: `--progressive-cover`, `--route=`, or
+ * any option the progressive path does not accept suppresses the automatic
+ * choice, and the suppression is named in the telemetry line.
+ */
+typedef enum {
+    CCUBES_ROUTE_AUTO = 0,
+    CCUBES_ROUTE_ORDINARY,
+    CCUBES_ROUTE_PROGRESSIVE
+} CCubesRouteMode;
+
+/*
+ * Measured. At 50 inputs IPC wins wall time (128.370 s against 155.312 s),
+ * memory (21.23 MiB against a 1.79 GiB median), and merged product rows (502
+ * against 532); the 100-input Fišer family is IPC-only in production.
+ */
+#define CCUBES_ROUTE_MIN_INPUTS 50
+
+/*
+ * Not a measured crossover. Every output of the random corpus carries at most
+ * 76 ON minterms, so this guard never fires there, and the Fišer outputs that
+ * do exceed it (2,768 to 18,094 ON rows) are already routed by input width.
+ * It guards a shape the corpus does not contain — few inputs, many care rows —
+ * against the ordinary path's projection workload, and it can only route
+ * toward IPC, never away from it.
+ */
+#define CCUBES_ROUTE_MIN_ON_MINTERMS 10000
+
+#define CCUBES_ROUTE_CALIBRATION "random-20-50-inputs+fiser-100"
+
+typedef struct {
+    int inputs;
+    int outputs;
+    int max_on_minterms;
+    long long total_on_minterms;
+} CCubesRouteFeatures;
+
+static bool parse_route_mode(const char *text, CCubesRouteMode *mode) {
+    if (!text || !*text || !mode) return false;
+    if (strcmp(text, "auto") == 0) {
+        *mode = CCUBES_ROUTE_AUTO;
+        return true;
+    }
+    if (strcmp(text, "e0") == 0) {
+        *mode = CCUBES_ROUTE_ORDINARY;
+        return true;
+    }
+    if (strcmp(text, "ipc") == 0) {
+        *mode = CCUBES_ROUTE_PROGRESSIVE;
+        return true;
+    }
+    return false;
+}
+
+static void route_collect_features(
+    const PIstorage *PInfo,
+    int ninputs,
+    int noutputs,
+    CCubesRouteFeatures *features
+) {
+    features->inputs = ninputs;
+    features->outputs = noutputs;
+    features->max_on_minterms = 0;
+    features->total_on_minterms = 0;
+    if (!PInfo) return;
+    for (int o = 0; o < noutputs; ++o) {
+        int on_minterms = PInfo[o].ON_minterms;
+        if (on_minterms > features->max_on_minterms) {
+            features->max_on_minterms = on_minterms;
+        }
+        features->total_on_minterms += (long long)on_minterms;
+    }
+}
+
+/*
+ * The decision is total: every file reaches exactly one branch. ON minterms
+ * are counted per output and reduced by maximum, because the path is chosen
+ * once for the whole run and the hardest output drives its cost.
+ */
+static bool route_auto_selects_progressive(
+    const CCubesRouteFeatures *features,
+    const char **reason
+) {
+    if (features->inputs >= CCUBES_ROUTE_MIN_INPUTS) {
+        *reason = "inputs-at-or-above-crossover";
+        return true;
+    }
+    if (features->max_on_minterms >= CCUBES_ROUTE_MIN_ON_MINTERMS) {
+        *reason = "on-minterms-above-projection-guard";
+        return true;
+    }
+    /*
+     * 41 to 49 inputs was never measured. Keeping the established default
+     * there means the router cannot regress an unmeasured region, and the
+     * distinct reason makes those runs identifiable in logs when the region
+     * is eventually calibrated.
+     */
+    *reason = features->inputs > 40
+        ? "inputs-below-crossover-unmeasured"
+        : "inputs-below-crossover";
+    return false;
+}
+
+static void route_report(
+    const char *decision,
+    const char *source,
+    const char *reason,
+    const CCubesRouteFeatures *features
+) {
+    fprintf(
+        stderr,
+        "CCUBES_ROUTE decision=%s source=%s reason=%s inputs=%d outputs=%d "
+        "max_on_minterms=%d total_on_minterms=%lld min_inputs=%d "
+        "min_on_minterms=%d calibration=%s\n",
+        decision,
+        source,
+        reason,
+        features->inputs,
+        features->outputs,
+        features->max_on_minterms,
+        features->total_on_minterms,
+        CCUBES_ROUTE_MIN_INPUTS,
+        CCUBES_ROUTE_MIN_ON_MINTERMS,
+        CCUBES_ROUTE_CALIBRATION
+    );
+}
+
+/* Keep logging independent of route/solver selection. On resume, wait for
+ * saved source/destination paths before checking for accidental file aliases. */
+static bool initialize_run_logging(const CliOptions *options, const char *source, const char *destination) {
+    if (options->log_file) {
+        char *ordinary_output = source ? prefix_basename(source, "ccubes_") : NULL;
+        char *ipc_output = source ? prefix_basename(source, "progressive_") : NULL;
+        char *checkpoint = source ? prefix_basename(source, "chk_") : NULL;
+        const char *paths[] = {
+            source, destination, options->resume, options->inspect,
+            options->checkpoint, options->debug_file, ordinary_output, ipc_output, checkpoint,
+            ccubes_option(OPTION_PROGRESSIVE_COLUMN_POOL_IN),
+            ccubes_option(OPTION_PROGRESSIVE_COLUMN_POOL_OUT)
+        };
+        bool ok = run_log_init(options->log_file, paths, sizeof(paths) / sizeof(paths[0]));
+        free(ordinary_output); free(ipc_output); free(checkpoint);
+        if (!ok) return false;
+    }
+    if (options->debug || options->log_file) {
+        int level = options->log_file && !options->debug_level_explicit
+            ? DBG_INFO : options->debug_level;
+        debug_init(options->debug_file, level);
+    }
+    return true;
+}
+
 int main(int argc, char *argv[]) {
 
     if (argc < 2) {
-        cli_help(stdout);
+        cli_help(stderr);
         return 1;
     }
 
     CliOptions options;
     int parse_result = cli_parse(argc, argv, &options, stderr);
-    if (parse_result > 0) {
-        cli_help(stdout);
-        return 0;
-    }
+    if (parse_result > 0) { cli_help(stdout); return 0; }
     if (parse_result < 0) return 1;
-    if (options.legacy_options) {
-        fprintf(stderr, "Warning: short options are deprecated; use the long options in --help.\n");
-    }
-    if (options.debug) debug_init(options.debug_file, options.debug_level);
+    if ((!options.resume || !options.log_file || options.inspect) &&
+        !initialize_run_logging(&options, options.source, options.destination)) return 1;
+    if (options.legacy_options) fprintf(stderr, "Warning: short options are deprecated; see --help for long names.\n");
 
     bool gurobi_ok = false;
 
@@ -510,7 +772,7 @@ int main(int argc, char *argv[]) {
     int search_level = 1;
     const int STOP_AFTER_EQUALITY = 1;
     int BITS_PER_WORD = options.bits_per_word;
-    int THREADS = options.threads; // 0 selects available cores
+    int THREADS = options.threads;
     bool THREADS_FORCED = THREADS > 0;
     int WEIGHT_PIC = options.weights;
     int SCP_TYPE = options.solver;
@@ -523,12 +785,14 @@ int main(int argc, char *argv[]) {
      * the common pruning/finalization pass.
      */
     bool DETERMINISTIC_PI_ORDER = options.deterministic;
-    PIGeneratorMode PI_GENERATOR_MODE = PI_GENERATOR_AUTO;
-#ifdef CCUBES_TESTING
-    PI_GENERATOR_MODE = options.test_pi_generator;
-#endif
-    bool CERTIFIED_MODE = options.certify;
+    const bool CERTIFIED_MODE = options.certify;
     bool REPORT_BLOCKING_DIAGNOSTIC = options.blocking_diagnostic;
+    bool PROGRESSIVE_COVER = options.progressive_cover;
+    CCubesRouteMode ROUTE_MODE = CCUBES_ROUTE_ORDINARY;
+    bool ROUTE_MODE_FROM_FLAG = options.route != NULL;
+    if (options.route) parse_route_mode(options.route, &ROUTE_MODE);
+    int PROGRESSIVE_LITERAL_POLISH_MODE = options.literal_polish;
+    bool PROGRESSIVE_LITERAL_POLISH_MODE_EXPLICIT = options.literal_polish_explicit;
     char *SRC_FILE = options.source;
     char *DST_FILE = options.destination;
     // resume timing bases
@@ -538,33 +802,28 @@ int main(int argc, char *argv[]) {
     // checkpoint/time limit
     double TIME_LIMIT_SEC = options.time_limit;
     double CHECKPOINT_INTERVAL_SEC = options.checkpoint_every;
+    bool checkpointing = TIME_LIMIT_SEC > 0.0 || CHECKPOINT_INTERVAL_SEC > 0.0;
     char *CHK_SAVE_PATH = options.checkpoint;
     char *RESUME_PATH = options.resume;
     char *INFO_PATH = options.inspect;
-    int RESUME_K = -1;
-    // resume progress for current k
-    uint64_t RESUME_TASK = 0ull;
-    bool HAS_RESUME_TASK = false;
+    uint64_t resume_task = 0;
 
     int info_level = options.inspect_level;
 
-    /*
-     * Certified mode has one production proof: complete transactional prime
-     * enumeration followed by an exact solve of the complete chart.  The
-     * former support-horizon certificate is intentionally no longer
-     * selectable.
-     */
-    if (CERTIFIED_MODE) {
-        if (PI_GENERATOR_MODE == PI_GENERATOR_AUTO) {
-            PI_GENERATOR_MODE = PI_GENERATOR_COMPLETE_MMCS;
-        } else if (PI_GENERATOR_MODE != PI_GENERATOR_COMPLETE_MMCS) {
+    const char *route_source = ROUTE_MODE_FROM_FLAG ? "flag" : "default";
+    if (PROGRESSIVE_COVER) {
+        if (ROUTE_MODE_FROM_FLAG && ROUTE_MODE == CCUBES_ROUTE_ORDINARY) {
             fprintf(
                 stderr,
-                "Error: --certify uses complete-prime certification and cannot be "
-                "combined with projection or bounded-level MMCS.\n"
+                "Error: --progressive-cover requests the progressive path "
+                "and --route=e0 forbids it.\n"
             );
             return 1;
         }
+        ROUTE_MODE = CCUBES_ROUTE_PROGRESSIVE;
+        if (!ROUTE_MODE_FROM_FLAG) route_source = "flag";
+    } else if (ROUTE_MODE == CCUBES_ROUTE_PROGRESSIVE) {
+        PROGRESSIVE_COVER = true;
     }
 
     #ifdef HAVE_GUROBI
@@ -573,11 +832,17 @@ int main(int argc, char *argv[]) {
         }
     #endif
 
+    /*
+     * Routing eligibility must read the solver the user asked for, not the one
+     * the fallback below leaves behind: a `-s1` run whose license is missing
+     * has already been redirected once and must not be redirected again.
+     */
+    const bool route_gurobi_solver_requested = SCP_TYPE == 1;
 
     if (SCP_TYPE == 1) {
         if (!gurobi_ok) {
             SCP_TYPE = 0;
-            printf("Gurobi not available, falling back to the bundled hybrid solver.\n");
+            fprintf(stderr, "Gurobi not available, falling back to the bundled hybrid solver.\n");
         }
     }
 
@@ -587,8 +852,9 @@ int main(int argc, char *argv[]) {
 
     // Inspect checkpoint and exit
     if (INFO_PATH) {
-        print_info(INFO_PATH, info_level);
-        return 0;
+        int result = print_info(INFO_PATH, info_level);
+        debug_close();
+        return result;
     }
 
     if (!SRC_FILE && !RESUME_PATH) {
@@ -597,39 +863,77 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (
-        (
-            PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
-            PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS
-        ) &&
-        RESUME_PATH
-    ) {
+    if (CERTIFIED_MODE && RESUME_PATH) {
         fprintf(
             stderr,
-            "Error: the experimental MMCS generator does not yet support checkpoint resume.\n"
+            "Error: complete-prime certification does not support checkpoint resume.\n"
+        );
+        return 1;
+    }
+
+    if (PROGRESSIVE_COVER && (RESUME_PATH || checkpointing)) {
+        fprintf(
+            stderr,
+            "Error: --progressive-cover does not yet support checkpoint "
+            "resume, time-limit checkpoints or periodic checkpoints.\n"
         );
         return 1;
     }
 
     if (
+        PROGRESSIVE_COVER &&
         (
-            PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
-            PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS
-        ) &&
-        (TIME_LIMIT_SEC > 0.0 || CHECKPOINT_INTERVAL_SEC > 0.0)
+            CERTIFIED_MODE ||
+            REPORT_BLOCKING_DIAGNOSTIC ||
+            POOL_MAX > 1 ||
+            WEIGHT_PIC != 1 ||
+            SCP_TYPE != 0 ||
+            HYBRID_EFFORT_LEVEL != 0
+        )
     ) {
         fprintf(
             stderr,
-            "Error: the experimental MMCS generator does not yet support "
+            "Error: the progressive path currently uses the unit-cost pricing "
+            "path; do not combine --progressive-cover or --route=ipc with "
+            "certification, blocking diagnostics, pooling, or nondefault ordinary solver settings.\n"
+        );
+        return 1;
+    }
+
+    /*
+     * Automatic routing may only fire on an invocation the progressive path
+     * would have accepted anyway. The conditions below mirror, one for one,
+     * every rule that rejects an explicit progressive request above, so the
+     * router can never carry a run past a check that an explicit request
+     * would have failed. Each is also a user request in its own right, which
+     * is why the reason is reported rather than silently absorbed.
+     */
+    const char *route_block_reason = NULL;
+    if (RESUME_PATH) {
+        route_block_reason = "checkpoint-resume";
+    } else if (TIME_LIMIT_SEC > 0.0) {
+        route_block_reason = "time-limit-checkpoint";
+    } else if (CHECKPOINT_INTERVAL_SEC > 0.0) {
+        route_block_reason = "periodic-checkpoint";
+    } else if (CERTIFIED_MODE) {
+        route_block_reason = "certified-mode";
+    } else if (HYBRID_EFFORT_LEVEL != 0) {
+        route_block_reason = "hybrid-effort-level";
+    } else if (REPORT_BLOCKING_DIAGNOSTIC) {
+        route_block_reason = "blocking-diagnostic";
+    } else if (POOL_MAX > 1) {
+        route_block_reason = "cover-pooling";
+    } else if (WEIGHT_PIC != 1) {
+        route_block_reason = "prime-implicant-weighting";
+    } else if (route_gurobi_solver_requested) {
+        route_block_reason = "gurobi-solver";
+    }
+
+    if (CERTIFIED_MODE && checkpointing) {
+        fprintf(
+            stderr,
+            "Error: complete-prime certification does not support "
             "time-limit or periodic checkpoints.\n"
-        );
-        return 1;
-    }
-
-    if (PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS && !CERTIFIED_MODE) {
-        fprintf(
-            stderr,
-            "Error: complete MMCS is a global certification mode and requires --certify.\n"
         );
         return 1;
     }
@@ -663,7 +967,6 @@ int main(int argc, char *argv[]) {
         char *chk_src_path = NULL;
         char *chk_dst_path = NULL;
         double chk_elapsed_total = 0.0, chk_elapsed_scp = 0.0;
-        uint64_t chk_resume_task = 0ull;
 
         if (
             load_checkpoint(
@@ -674,7 +977,7 @@ int main(int argc, char *argv[]) {
                 &chk_bits,
                 &chk_value_bit_width,
                 &chk_implicant_words,
-                &RESUME_K,
+                &search_level,
                 &chk_stop_counter,
                 &chk_MAX_LEVELS,
                 &chk_WEIGHT_PIC,
@@ -685,7 +988,8 @@ int main(int argc, char *argv[]) {
                 &chk_dst_path,
                 &chk_elapsed_total,
                 &chk_elapsed_scp,
-                &chk_resume_task
+                &resume_task,
+                NULL
             ) != 0
         ) {
             fprintf(stderr, "Error: failed to load checkpoint from %s\n", RESUME_PATH);
@@ -705,6 +1009,13 @@ int main(int argc, char *argv[]) {
             if (chk_dst_path) free(chk_dst_path);
         }
 
+        if (options.log_file && !initialize_run_logging(&options, SRC_FILE, DST_FILE)) {
+            free(nofvalues);
+            free(chk_stop_counter);
+            cleanup(PInfo, NULL);
+            return 1;
+        }
+
         (void)chk_MAX_LEVELS;
         WEIGHT_PIC = chk_WEIGHT_PIC;
         SCP_TYPE = chk_SCP_TYPE;
@@ -715,12 +1026,6 @@ int main(int argc, char *argv[]) {
         // Resume timing bases
         BASE_ELAPSED = chk_elapsed_total;
         BASE_SCP = chk_elapsed_scp;
-
-        // Resume the interrupted generation level recorded in the checkpoint.
-        search_level = RESUME_K;
-        // Carry forward the earliest task that must be run at this level.
-        RESUME_TASK = chk_resume_task;
-        HAS_RESUME_TASK = true;
 
         // Loaded widths are kept for later use
 	    // value_bit_width and implicant_words are set after computing max_value in non-resume mode
@@ -750,7 +1055,7 @@ int main(int argc, char *argv[]) {
         );
 
         if (PInfo == NULL || ninputs <= 0 || noutputs <= 0) {
-            printf("Error: Invalid .pla file or no inputs/outputs found.\n");
+            fprintf(stderr, "Error: Invalid .pla file or no inputs/outputs found.\n");
             return 1;
         }
 
@@ -787,11 +1092,65 @@ int main(int argc, char *argv[]) {
         !fast_hybrid_heuristic &&
         !CERTIFIED_MODE;
 
-    if (!heuristic_pattern_supported) {
+    /*
+     * The routing decision. This is the earliest point at which the file's
+     * features are known and the latest at which the path can still change:
+     * `PROGRESSIVE_COVER` is first consumed immediately below. The telemetry
+     * line is unconditional so that every run records which path it took, on
+     * what evidence, and under which thresholds — a routed run must remain
+     * reproducible from its own log.
+     */
+    CCubesRouteFeatures route_features;
+    route_collect_features(PInfo, ninputs, noutputs, &route_features);
+    if (ROUTE_MODE != CCUBES_ROUTE_AUTO) {
+        route_report(
+            PROGRESSIVE_COVER ? "ipc" : "e0",
+            route_source,
+            ROUTE_MODE_FROM_FLAG || PROGRESSIVE_COVER ? "requested" : "ordinary-default",
+            &route_features
+        );
+    } else if (route_block_reason) {
+        route_report("e0", "ineligible", route_block_reason, &route_features);
+    } else if (!adaptive_stopping_supported) {
+        /*
+         * Every progressive measurement in `docs/` was taken on nonconflicting,
+         * fully specified binary point rows. Anything else keeps the ordinary
+         * path, which accepts pattern rows.
+         */
+        route_report(
+            "e0",
+            "ineligible",
+            "model-not-fully-specified-binary-point",
+            &route_features
+        );
+    } else {
+        const char *route_reason = NULL;
+        const bool route_progressive = route_auto_selects_progressive(
+            &route_features,
+            &route_reason
+        );
+        if (route_progressive) PROGRESSIVE_COVER = true;
+        route_report(
+            route_progressive ? "ipc" : "e0",
+            "auto",
+            route_reason,
+            &route_features
+        );
+    }
+
+    if (!PROGRESSIVE_COVER && (ccubes_options_require_ipc() ||
+        PROGRESSIVE_LITERAL_POLISH_MODE_EXPLICIT)) {
+        fprintf(stderr, "Error: IPC settings require the IPC route; use --route ipc.\n");
+        free(nofvalues);
+        free(chk_stop_counter);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+
+    if (!heuristic_pattern_supported && !PROGRESSIVE_COVER) {
         fprintf(
             stderr,
-            "Error: CCubes requires binary point or pattern rows with nonempty ON and OFF sets "
-            "for every output.\n"
+            "Error: CCubes requires binary point or pattern rows.\n"
         );
         free(chk_stop_counter);
         cleanup(PInfo, NULL);
@@ -802,44 +1161,817 @@ int main(int argc, char *argv[]) {
         fprintf(
             stderr,
             "Error: --certify certified stopping requires nonconflicting, fully "
-            "specified binary point rows with nonempty ON and OFF sets.\n"
+            "specified binary point rows.\n"
         );
         free(chk_stop_counter);
         cleanup(PInfo, NULL);
         return 1;
     }
 
-    if (
-        (
-            PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
-            PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS
-        ) &&
-        !adaptive_stopping_supported
-    ) {
+    if (PROGRESSIVE_COVER) {
+        int progressive_max_horizon = ninputs;
+        /*
+         * One unchanged extension is too weak: a cover can remain flat for
+         * one support level and improve at the next. Two is still explicitly
+         * heuristic.
+         */
+        int progressive_stable_horizons = 2;
+        int progressive_memory_mb = 0;
+        int progressive_profile = 0;
+        int progressive_seed_greedy = 1;
+        int progressive_seed_memory_percent = 10;
+
+        ProgressiveCoverMasterBackend progressive_master_backend = PROGRESSIVE_MASTER_NATIVE;
+        int progressive_native_effort = 0;
+
+        int progressive_native_repair_attempts = 16;
+        bool progressive_native_repair = true;
+        double progressive_native_repair_penalty = 1.0;
+        double progressive_native_repair_time_share = 0.05;
+        double progressive_native_feasibility_jump_seconds =
+            1.0;
+        bool progressive_native_feasibility_jump_work_budget =
+            true;
+        int progressive_native_reduce_expand =
+            1;
+        int progressive_native_reduce_expand_variants = 8;
+        int progressive_native_reduce_expand_start_round = 8;
+        int progressive_native_reduce_expand_interval = 4;
+        int progressive_native_private_micro =
+            1;
+
+        int progressive_greedy_anchor_percent = 10;
+        int progressive_greedy_forced_prefix_depth = -1;
+        int progressive_greedy_candidate_budget = 16384;
+        int progressive_greedy_max_support = 0;
+        int progressive_greedy_scout_anchor_rounds = 0;
+        int progressive_greedy_multi_start = 1;
+        double progressive_greedy_depth2_min_relative_room = 0.24;
+        int progressive_greedy_mip_interval = 8;
+        double progressive_greedy_mip_seconds = 5.0;
+        double progressive_greedy_final_mip_seconds = 60.0;
+        int progressive_greedy_final_mip_focus = 0;
+        double progressive_greedy_final_mip_best_obj_stop = -1.0;
+        int progressive_mmcs_cover_bound = 1;
+        int progressive_mmcs_edge_cache = 1;
+        int progressive_root_gate = 1;
+
+        double progressive_time_limit_seconds = 0.0;
+        double progressive_global_bound_seconds = 0.0;
+        int progressive_global_bound_active_rows = 512;
+        int progressive_global_bound_rounds = 5;
+
+        /* Public arguments are validated by the CLI before any files open.
+         * Algorithm tuning follows the established production policy above. */
+        const char *value = ccubes_option(OPTION_PROGRESSIVE_MEMORY_MB);
+        if (value) progressive_memory_mb = atoi(value);
+        value = ccubes_option(OPTION_PROGRESSIVE_PROFILE);
+        if (value) progressive_profile = atoi(value);
+        value = ccubes_option(OPTION_PROGRESSIVE_NATIVE_EFFORT);
+        if (value) progressive_native_effort = atoi(value);
+        value = ccubes_option(OPTION_PROGRESSIVE_TIME_LIMIT_SECONDS);
+        if (value) progressive_time_limit_seconds = strtod(value, NULL);
+        value = ccubes_option(OPTION_PROGRESSIVE_GLOBAL_BOUND_SECONDS);
+        if (value) progressive_global_bound_seconds = strtod(value, NULL);
+        const char *column_pool_input_path =
+            ccubes_option(OPTION_PROGRESSIVE_COLUMN_POOL_IN);
+        const char *column_pool_output_path =
+            ccubes_option(OPTION_PROGRESSIVE_COLUMN_POOL_OUT);
+        if ((column_pool_input_path || column_pool_output_path) &&
+            noutputs != 1) {
+            fprintf(stderr, "Error: IPC pool files require a single output.\n");
+            free(nofvalues);
+            free(chk_stop_counter);
+            cleanup(PInfo, NULL);
+            return 1;
+        }
+        const int requested_threads_raw = THREADS_FORCED ? THREADS : 0;
+        int available_threads = ccubes_default_thread_count();
+        if (THREADS_FORCED) {
+            if (THREADS < 1) THREADS = 1;
+            if (THREADS > available_threads) THREADS = available_threads;
+        } else {
+            THREADS = available_threads;
+        }
+        THREADS = ccubes_effective_thread_count(THREADS);
+        ccubes_set_thread_count(THREADS);
+
+        for (int output = 0; output < noutputs; ++output) {
+            PInfo[output].cov_bits = 64;
+            PInfo[output].pichart_words =
+                (
+                    PInfo[output].ON_minterms +
+                    PInfo[output].cov_bits - 1
+                ) / PInfo[output].cov_bits;
+        }
+        if (!DST_FILE) {
+            DST_FILE = prefix_basename(SRC_FILE, "progressive_");
+        }
+
+        if (!DST_FILE) {
+            fprintf(
+                stderr,
+                "Error: failed to determine destination .pla filename.\n"
+            );
+            free(nofvalues);
+            free(chk_stop_counter);
+            cleanup(PInfo, NULL);
+            debug_close();
+            return 1;
+        }
+
+        ProgressiveCoverOptions progressive_options;
+        progressive_cover_options_default(
+            &progressive_options,
+            ninputs,
+            progressive_max_horizon,
+            progressive_stable_horizons
+        );
+        progressive_options.requested_threads = THREADS;
+        if (progressive_memory_mb > 0) {
+            progressive_options.memory_budget_bytes =
+                (uint64_t)progressive_memory_mb * UINT64_C(1048576);
+        }
+        progressive_options.profile_pricing = progressive_profile == 1;
+        progressive_options.greedy_seed = progressive_seed_greedy == 1;
+
+        progressive_options.master_backend =
+            progressive_master_backend;
+        progressive_options.native_effort_level =
+            progressive_native_effort;
+
+        progressive_options.native_repair_attempt_limit =
+            progressive_native_repair_attempts;
+        progressive_options.native_repair_pricing =
+            progressive_native_repair;
+        progressive_options.native_repair_penalty =
+            progressive_native_repair_penalty;
+        progressive_options.native_repair_time_share =
+            progressive_native_repair_time_share;
+        progressive_options.native_feasibility_jump_seconds =
+            progressive_native_feasibility_jump_seconds;
+        progressive_options.native_feasibility_jump_work_budget =
+            progressive_native_feasibility_jump_work_budget;
+        progressive_options.native_reduce_expand =
+            progressive_native_reduce_expand == 1;
+        progressive_options.native_reduce_expand_variants =
+            progressive_native_reduce_expand_variants;
+        progressive_options.native_reduce_expand_start_round =
+            progressive_native_reduce_expand_start_round;
+        progressive_options.native_reduce_expand_interval =
+            progressive_native_reduce_expand_interval;
+        progressive_options.native_private_micro =
+            progressive_native_private_micro == 1;
+
+        progressive_options.greedy_anchor_percent =
+            (unsigned int)progressive_greedy_anchor_percent;
+        progressive_options.greedy_forced_prefix_depth =
+            progressive_greedy_forced_prefix_depth;
+        progressive_options.greedy_candidate_budget =
+            progressive_greedy_candidate_budget;
+        progressive_options.greedy_max_support =
+            progressive_greedy_max_support;
+        progressive_options.greedy_scout_anchor_rounds =
+            progressive_greedy_scout_anchor_rounds;
+        progressive_options.greedy_multi_start =
+            progressive_greedy_multi_start == 1;
+        progressive_options.greedy_multistart_depth2_min_relative_room =
+            progressive_greedy_depth2_min_relative_room;
+        progressive_options.greedy_mip_interval =
+            progressive_greedy_mip_interval;
+        progressive_options.greedy_mip_time_limit_seconds =
+            progressive_greedy_mip_seconds;
+        progressive_options.greedy_final_mip_time_limit_seconds =
+            progressive_greedy_final_mip_seconds;
+        progressive_options.greedy_final_mip_focus =
+            progressive_greedy_final_mip_focus;
+        progressive_options.greedy_final_mip_best_obj_stop =
+            progressive_greedy_final_mip_best_obj_stop;
+        progressive_options.disable_mmcs_cover_bound =
+            progressive_mmcs_cover_bound == 0;
+        progressive_options.cache_mmcs_edge_words =
+            progressive_mmcs_edge_cache == 1;
+        progressive_options.enable_root_gate =
+            progressive_root_gate == 1;
+
+        progressive_options.seed_memory_percent =
+            (unsigned int)progressive_seed_memory_percent;
+        progressive_options.time_limit_seconds =
+            progressive_time_limit_seconds;
+        progressive_options.global_bound_time_limit_seconds =
+            progressive_global_bound_seconds;
+        progressive_options.global_bound_active_rows =
+            progressive_global_bound_active_rows;
+        progressive_options.global_bound_rounds =
+            progressive_global_bound_rounds;
+        progressive_options.literal_polish_mode =
+            PROGRESSIVE_LITERAL_POLISH_MODE;
+        progressive_options.literal_polish_mode_explicit =
+            PROGRESSIVE_LITERAL_POLISH_MODE_EXPLICIT;
+
+        progressive_options.column_pool_input_path =
+            column_pool_input_path;
+        progressive_options.column_pool_output_path =
+            column_pool_output_path;
+
+        ProgressiveIncumbentFileContext incumbent_file_context = {
+            .output_path = DST_FILE
+        };
+        if (noutputs == 1) {
+            progressive_options.incumbent_callback =
+                persist_progressive_incumbent;
+            progressive_options.incumbent_callback_data =
+                &incumbent_file_context;
+        }
+        char progressive_prefix_depth_label[16];
+        if (progressive_options.greedy_forced_prefix_depth < 0) {
+            strcpy(progressive_prefix_depth_label, "auto");
+        } else {
+            snprintf(
+                progressive_prefix_depth_label,
+                sizeof(progressive_prefix_depth_label),
+                "%d",
+                progressive_options.greedy_forced_prefix_depth
+            );
+        }
+
         fprintf(
             stderr,
-            "Error: the experimental MMCS generator requires fully specified "
-            "binary point rows with nonempty ON and OFF sets.\n"
+            (
+                    progressive_options.greedy_max_support > 0
+                        ? "Notice: using IPC width-bounded greedy pricing; "
+                          "nonconstant outputs are minimized independently and "
+                          "pricing closure is unknown.\n"
+                        : "Notice: using IPC greedy pricing; "
+                          "nonconstant outputs are minimized independently and "
+                          "pricing closure is unknown.\n"
+                )
         );
+        fprintf(
+                stderr,
+                "CCUBES_PROGRESSIVE_START max_horizon=%d stable_horizons=%d outputs=%d requested_threads=%d "
+                "requested_threads_raw=%d available_threads=%d configured_threads=%d backend=%s master=%s "
+                "native_effort=%d repair_attempts=%d repair_pricing=%s repair_penalty=%.3f "
+                "repair_time_share=%.3f feasibility_jump_mode=%s feasibility_jump_enabled=%s "
+                "feasibility_jump_wall_seconds=%.3f rwls_logical_families=%d reduce_expand=%s "
+                "reduce_expand_variants=%d reduce_expand_start_round=%d reduce_expand_interval=%d "
+                "private_micro=%s unlimited_tail=%s memory_budget=%llu batch_share=%u worker_share=%u "
+                "seed_share=%u seed_mode=%s seed_greedy=%s support_bound=%s pricing_mode=%s "
+                "greedy_anchor_percent=%u greedy_prefix_depth=%s greedy_candidate_budget=%d "
+                "greedy_max_support=%d greedy_scout_anchor_rounds=%d greedy_multi_start=%s "
+                "greedy_depth2_min_relative_room=%.3f greedy_mip_interval=%d greedy_mip_seconds=%.3f "
+                "greedy_final_mip_seconds=%.3f greedy_final_mip_focus=%d "
+                "greedy_final_mip_best_obj_stop=%.3f root_gate=%s mmcs_backend=%s mmcs_cover_bound=%s "
+                "mmcs_edge_cache=%s profile=%s time_limit_seconds=%.6f global_bound_seconds=%.6f "
+                "global_bound_active_rows=%d global_bound_rounds=%d column_pool_in=%s column_pool_out=%s "
+                "log_file=%s persistence=%s\n",
+                progressive_max_horizon,
+                progressive_stable_horizons,
+                noutputs,
+                THREADS,
+                requested_threads_raw,
+                available_threads,
+                THREADS,
+                ccubes_thread_backend(),
+                progressive_options.master_backend ==
+                    PROGRESSIVE_MASTER_NATIVE
+                ? "native"
+                : "gurobi",
+                progressive_options.native_effort_level,
+                progressive_options.native_repair_attempt_limit,
+                progressive_options.native_repair_pricing
+                ? "on"
+                : "off",
+                progressive_options.native_repair_penalty,
+                progressive_options.native_repair_time_share,
+                progressive_options.native_feasibility_jump_work_budget
+                ? "work"
+                : "wall",
+                progressive_options.native_feasibility_jump_seconds > 0.0
+                ? "yes"
+                : "no",
+                progressive_options.native_feasibility_jump_work_budget
+                ? 0.0
+                : progressive_options.native_feasibility_jump_seconds,
+                progressive_options.native_feasibility_jump_logical_families,
+                progressive_options.native_reduce_expand ? "on" : "off",
+                progressive_options.native_reduce_expand_variants,
+                progressive_options.native_reduce_expand_start_round,
+                progressive_options.native_reduce_expand_interval,
+                progressive_options.native_private_micro ? "on" : "off",
+                progressive_options.unlimited_tail_growth ? "growth" : "plateau",
+                (unsigned long long)progressive_options.memory_budget_bytes,
+                progressive_options.batch_memory_percent,
+                progressive_options.worker_memory_percent,
+                progressive_options.seed_memory_percent,
+                "master",
+                progressive_options.greedy_seed ? "on" : "off",
+                (
+                    "diagnostic"
+                ),
+                "greedy",
+                progressive_options.greedy_anchor_percent,
+                progressive_prefix_depth_label,
+                progressive_options.greedy_candidate_budget,
+                progressive_options.greedy_max_support,
+                progressive_options.greedy_scout_anchor_rounds,
+                progressive_options.greedy_multi_start ? "on" : "off",
+                progressive_options.
+                greedy_multistart_depth2_min_relative_room,
+                progressive_options.greedy_mip_interval,
+                progressive_options.greedy_mip_time_limit_seconds,
+                progressive_options.greedy_final_mip_time_limit_seconds,
+                progressive_options.greedy_final_mip_focus,
+                progressive_options.greedy_final_mip_best_obj_stop,
+                progressive_options.enable_root_gate ? "on" : "off",
+                "prepared",
+                progressive_options.disable_mmcs_cover_bound
+                ? "off"
+                : "on",
+                progressive_options.cache_mmcs_edge_words
+                ? "on"
+                : "off",
+                progressive_options.profile_pricing ? "on" : "off",
+                progressive_options.time_limit_seconds,
+                progressive_options.global_bound_time_limit_seconds,
+                progressive_options.global_bound_active_rows,
+                progressive_options.global_bound_rounds,
+                progressive_options.column_pool_input_path
+                ? progressive_options.column_pool_input_path
+                : "none",
+                progressive_options.column_pool_output_path
+                ? progressive_options.column_pool_output_path
+                : "none",
+                run_log_path
+                ? run_log_path
+                : "none",
+                noutputs == 1 ? "atomic-per-incumbent" : "final-only"
+            );
+
+        ProgressiveCoverResult *progressive_results =
+            (ProgressiveCoverResult *)calloc(
+                (size_t)noutputs,
+                sizeof(ProgressiveCoverResult)
+            );
+        if (!progressive_results) {
+            fprintf(stderr, "Error: progressive result allocation failed.\n");
+            free(nofvalues);
+            free(chk_stop_counter);
+            cleanup(PInfo, NULL);
+            debug_close();
+            return 1;
+        }
+        ProgressiveCoverStatus progressive_status =
+            progressive_cover_run_multi(
+            PInfo,
+            ninputs,
+            noutputs,
+            &progressive_options,
+            progressive_results
+        );
+        bool progressive_usable =
+            progressive_status == PROGRESSIVE_COVER_OK;
+        if (progressive_status == PROGRESSIVE_COVER_RESOURCE_LIMIT) {
+            progressive_usable = true;
+            for (int output = 0; output < noutputs; ++output) {
+                if (!progressive_results[output].incumbent_valid) {
+                    progressive_usable = false;
+                    break;
+                }
+            }
+        }
+        if (!progressive_usable) {
+            fprintf(
+                stderr,
+                "CCUBES_PROGRESSIVE_RESULT status=%s\n",
+                progressive_cover_status_name(progressive_status)
+            );
+            free(progressive_results);
+            free(nofvalues);
+            free(chk_stop_counter);
+            cleanup(PInfo, NULL);
+            debug_close();
+            return 1;
+        }
+
+        long long total_connections = 0;
+        double progressive_search_seconds = 0.0;
+        for (int output = 0; output < noutputs; ++output) {
+            ProgressiveCoverResult *progressive_result =
+                &progressive_results[output];
+            PInfo[output].solmin = progressive_result->cardinality;
+            PInfo[output].solution = progressive_result->solution;
+            progressive_result->solution = NULL;
+            total_connections += progressive_result->cardinality;
+            progressive_search_seconds +=
+                progressive_result->elapsed_seconds;
+            fprintf(
+                stderr,
+                "CCUBES_PROGRESSIVE_OUTPUT output=%d status=%s cover=%d selected_horizon=%d "
+                "final_horizon=%d stop=%s stability_start=%d stability_deferred=%d rows_on=%d/%d "
+                "rows_off=%d/%d duplicates_on=%d duplicates_off=%d seed_cover=%d seed_literals=%d "
+                "seed_greedy=%d seed_fallback=%d seed_complete=%s seed_master=%s seed_support=%d/%.1f/%d "
+                "seed_seconds=%.6f seed_bytes=%llu support_bound=%d bound_anchors=%d/%.1f/%d "
+                "bound_skipped=%d bound_skip_applied=%s bound_seconds=%.6f bound_bytes=%llu pricing_mode=%s "
+                "partial_anchor_limit=%d greedy_anchor_limit=%d greedy_prefix_depth=%d "
+                "greedy_candidate_budget=%d greedy_max_support=%d greedy_multistart=%d/%d "
+                "greedy_secondary=%d greedy_multistart_seconds=%.6f greedy_rounds=%d greedy_mip_interval=%d "
+                "greedy_mip_seconds=%.3f greedy_final_mip_seconds=%.3f greedy_mip_calls=%d/%d "
+                "greedy_mip_skipped=%d native_repair=%d/%d repair_skipped_optimal=%d repair_sideways=%d "
+                "repair_rejected=%d repair_no_improvement=%d/%d repair_destroyed=%llu "
+                "repair_uncovered=%llu/%d repair_residual_columns=%llu/%d repair_lagrangian_complete=%d/%d "
+                "repair_lagrangian_columns=%llu repair_fallbacks=%d repair_fallback_columns=%llu "
+                "repair_pruned=%llu repair_seconds=%.6f/%.6f repair_budget_seconds=%.6f "
+                "repair_budget_skips=%d repair_deadline_stops=%d dual_calls=%d dual_seconds=%.6f "
+                "time_grace_seconds=%.3f time_extensions=%d time_extension_seconds=%.6f "
+                "time_descending_at_base=%s time_base_cover=%d greedy_support=%d/%.1f/%d "
+                "greedy_anchors=%llu greedy_constructed=%llu greedy_improving=%llu greedy_duplicates=%llu "
+                "greedy_literal_evaluations=%llu greedy_seconds=%.6f batch_capacity=%d batch_bytes=%llu "
+                "pricing_threads=%d worker_bytes=%llu peak_incidence=%llu columns=%d rounds=%d "
+                "oracle_calls=%d oracle_nodes=%llu lp=%.9f lp_scope=%s mip_bound=%.6f mip_gap=%.6f "
+                "pool_loaded=%d pool_saved=%d pool_load_seconds=%.6f pool_save_seconds=%.6f "
+                "restricted_master_optimal=%s incumbent=%s incumbent_generation=%d pricing_closed=%s "
+                "closed_horizon=%d search_seconds=%.6f\n",
+                output + 1,
+                progressive_result->resource_limited
+                    ? "resource-limit"
+                    : "ok",
+                progressive_result->cardinality,
+                progressive_result->selected_horizon,
+                progressive_result->final_horizon,
+                progressive_cover_stop_reason_name(
+                    progressive_result->stop_reason
+                ),
+                progressive_result->stability_start_horizon,
+                progressive_result->stability_deferred_horizons,
+                progressive_result->on_rows_unique,
+                progressive_result->on_rows_original,
+                progressive_result->off_rows_unique,
+                progressive_result->off_rows_original,
+                progressive_result->on_duplicates,
+                progressive_result->off_duplicates,
+                progressive_result->seed_cardinality,
+                progressive_result->seed_literal_count,
+                progressive_result->seed_greedy_cubes,
+                progressive_result->seed_fallback_cubes,
+                progressive_result->seed_greedy_complete ? "yes" : "no",
+                progressive_result->seed_master_inserted ? "yes" : "no",
+                progressive_result->seed_support_minimum,
+                progressive_result->seed_support_median,
+                progressive_result->seed_support_maximum,
+                (double)progressive_result->seed_elapsed_nanoseconds / 1e9,
+                (unsigned long long)
+                    progressive_result->seed_allocated_bytes,
+                progressive_result->support_lower_bound,
+                progressive_result->support_bound_anchor_minimum,
+                progressive_result->support_bound_anchor_median,
+                progressive_result->support_bound_anchor_maximum,
+                progressive_result->horizons_skipped,
+                progressive_result->support_bound_skip_applied
+                    ? "yes"
+                    : "no",
+                (double)
+                    progressive_result->support_bound_elapsed_nanoseconds /
+                    1e9,
+                (unsigned long long)
+                    progressive_result->support_bound_allocated_bytes,
+                "greedy",
+                progressive_result->partial_anchor_limit,
+                progressive_result->greedy_anchor_limit,
+                progressive_result->greedy_forced_prefix_depth,
+                progressive_result->greedy_candidate_budget,
+                progressive_options.greedy_max_support,
+                progressive_result->greedy_multistart_improvements,
+                progressive_result->greedy_multistart_attempts,
+                progressive_result->greedy_secondary_cardinality,
+                (double)
+                    progressive_result->
+                        greedy_multistart_elapsed_nanoseconds /
+                    1e9,
+                progressive_result->greedy_rounds,
+                progressive_options.greedy_mip_interval,
+                progressive_result->greedy_mip_time_limit_seconds,
+                progressive_result->greedy_final_mip_time_limit_seconds,
+                progressive_result->greedy_intermediate_mip_calls,
+                progressive_result->greedy_final_mip_calls,
+                progressive_result->greedy_mip_rounds_skipped,
+                progressive_result->native_repair_improvements,
+                progressive_result->native_repair_attempts,
+                progressive_result->native_repair_skipped_optimal,
+                progressive_result->native_repair_sideways_moves,
+                progressive_result->native_repair_rejections,
+                progressive_result->
+                    native_repair_attempts_since_improvement,
+                progressive_result->
+                    native_repair_max_attempts_without_improvement,
+                (unsigned long long)
+                    progressive_result->native_repair_destroyed_columns,
+                (unsigned long long)
+                    progressive_result->native_repair_uncovered_rows,
+                progressive_result->native_repair_max_uncovered_rows,
+                (unsigned long long)
+                    progressive_result->native_repair_residual_columns,
+                progressive_result->
+                    native_repair_max_residual_columns,
+                progressive_result->
+                    native_repair_lagrangian_completions,
+                progressive_result->
+                    native_repair_lagrangian_attempts,
+                (unsigned long long)
+                    progressive_result->native_repair_lagrangian_columns,
+                progressive_result->native_repair_greedy_fallbacks,
+                (unsigned long long)
+                    progressive_result->native_repair_greedy_columns,
+                (unsigned long long)
+                    progressive_result->native_repair_redundant_removed,
+                (double)
+                    progressive_result->
+                        native_repair_prepare_nanoseconds /
+                    1e9,
+                (double)
+                    progressive_result->
+                        native_repair_solve_nanoseconds /
+                    1e9,
+                (double)
+                    progressive_result->
+                        native_repair_budget_nanoseconds /
+                    1e9,
+                progressive_result->native_repair_budget_skips,
+                progressive_result->native_repair_deadline_stops,
+                progressive_result->native_dual_calls,
+                (double)progressive_result->native_dual_nanoseconds / 1e9,
+                progressive_result->native_soft_target_grace_seconds,
+                progressive_result->native_soft_target_extensions,
+                (double)
+                    progressive_result->
+                        native_soft_target_extension_nanoseconds /
+                    1e9,
+                progressive_result->native_soft_target_descending_at_base
+                    ? "yes"
+                    : "no",
+                progressive_result->native_soft_target_base_cardinality,
+                progressive_result->greedy_support_minimum,
+                progressive_result->greedy_support_mean,
+                progressive_result->greedy_support_maximum,
+                (unsigned long long)
+                    progressive_result->greedy_anchors_attempted,
+                (unsigned long long)
+                    progressive_result->greedy_candidates_constructed,
+                (unsigned long long)
+                    progressive_result->greedy_improving_candidates,
+                (unsigned long long)
+                    progressive_result->greedy_duplicate_candidates,
+                (unsigned long long)
+                    progressive_result->greedy_literal_evaluations,
+                (double)
+                    progressive_result->greedy_elapsed_nanoseconds /
+                    1e9,
+                progressive_result->batch_capacity,
+                (unsigned long long)
+                    progressive_result->batch_allocated_bytes,
+                progressive_result->pricing_threads,
+                (unsigned long long)
+                    progressive_result->estimated_bytes_per_worker,
+                (unsigned long long)
+                    progressive_result->peak_incidence_entries,
+                progressive_result->retained_columns,
+                progressive_result->pricing_rounds,
+                progressive_result->oracle_calls,
+                (unsigned long long)
+                    progressive_result->oracle_search_nodes,
+                progressive_result->lp_objective,
+                progressive_result->pricing_closed
+                    ? "global"
+                    : "restricted_master",
+                progressive_result->integer_best_bound,
+                progressive_result->integer_mip_gap,
+                progressive_result->column_pool_loaded_columns,
+                progressive_result->column_pool_saved_columns,
+                (double)
+                    progressive_result->column_pool_load_nanoseconds /
+                    1e9,
+                (double)
+                    progressive_result->column_pool_save_nanoseconds /
+                    1e9,
+                progressive_result->restricted_master_optimal
+                    ? "yes"
+                    : "no",
+                progressive_cover_incumbent_source_name(
+                    progressive_result->incumbent_source
+                ),
+                progressive_result->incumbent_generation,
+                progressive_result->pricing_closed ? "yes" : "no",
+                progressive_result->pricing_closed_horizon,
+                progressive_result->elapsed_seconds
+            );
+            fprintf(
+                stderr,
+                "CCUBES_PROGRESSIVE_WORK output=%d "
+                "work_thread_backend=%s work_threads_forced=%s "
+                "work_threads_requested_raw=%d "
+                "work_threads_available=%d work_threads_configured=%d "
+                "work_threads_pricing=%d work_threads_rwls=%d "
+                "work_pricing_rounds=%d "
+                "work_column_growth_rounds=%d "
+                "work_pricing_oracle_calls=%d "
+                "work_pricing_oracle_nodes=%llu "
+                "work_pricing_anchors=%llu "
+                "work_pricing_candidates=%llu "
+                "work_pricing_improving=%llu "
+                "work_pricing_literal_evaluations=%llu "
+                "work_retained_columns=%llu "
+                "work_dual_calls=%d work_dual_iterations=%llu "
+                "work_rwls_runs=%d work_rwls_families=%llu "
+                "work_rwls_logical_states=%d "
+                "work_rwls_steps=%llu work_rwls_add_moves=%llu "
+                "work_rwls_remove_moves=%llu "
+                "work_rwls_fixed_steps=%llu work_rwls_soft_steps=%llu "
+                "work_rwls_epochs=%llu "
+                "work_rwls_productive_epoch_extensions=%llu "
+                "work_rwls_budget_mode=%s "
+                "work_rwls_shared_cache=%llu "
+                "work_rwls_cache_source=%s "
+                "work_rwls_packed_threshold=%llu "
+                "work_rwls_dense_incidence_invocations=%d "
+                "work_rwls_packed_incidence_invocations=%d "
+                "work_phase_checkpoints=%d "
+                "work_phase_promotions=%d "
+                "work_phase_grace_promotions=%d "
+                "work_phase_budget_promotions=%d "
+                "work_phase_growth_promotions=%d "
+                "work_phase_pool_checkpoints=%d "
+                "work_phase_stopped=%s "
+                "work_reduce_expand_passes=%d "
+                "work_reduce_expand_variants=%d "
+                "work_reduce_expand_inserted=%d "
+                "work_repair_attempts=%d work_repair_improvements=%d "
+                "work_repair_destroyed=%llu "
+                "work_repair_uncovered=%llu "
+                "work_repair_residual_columns=%llu "
+                "work_repair_prepare_seconds=%.6f "
+                "work_repair_solve_seconds=%.6f "
+                "work_repair_budget_seconds=%.6f "
+                "work_repair_budget_skips=%d "
+                "work_repair_deadline_stops=%d\n",
+                output + 1,
+                ccubes_thread_backend(),
+                THREADS_FORCED ? "yes" : "no",
+                requested_threads_raw,
+                available_threads,
+                THREADS,
+                progressive_result->pricing_threads,
+                progressive_result->native_feasibility_jump_threads_used,
+                progressive_result->greedy_rounds,
+                progressive_result->pricing_rounds,
+                progressive_result->oracle_calls,
+                (unsigned long long)
+                    progressive_result->oracle_search_nodes,
+                (unsigned long long)
+                    progressive_result->greedy_anchors_attempted,
+                (unsigned long long)
+                    progressive_result->greedy_candidates_constructed,
+                (unsigned long long)
+                    progressive_result->greedy_improving_candidates,
+                (unsigned long long)
+                    progressive_result->greedy_literal_evaluations,
+                (unsigned long long)
+                    progressive_result->work_retained_columns,
+                progressive_result->native_dual_calls,
+                (unsigned long long)
+                    progressive_result->native_dual_iterations,
+                progressive_result->native_feasibility_jump_runs,
+                (unsigned long long)
+                    progressive_result->
+                        native_feasibility_jump_restart_families,
+                progressive_result->
+                    native_feasibility_jump_logical_family_states,
+                (unsigned long long)
+                    progressive_result->native_feasibility_jump_iterations,
+                (unsigned long long)
+                    progressive_result->native_feasibility_jump_add_moves,
+                (unsigned long long)
+                    progressive_result->native_feasibility_jump_remove_moves,
+                (unsigned long long)
+                    progressive_result->
+                        native_feasibility_jump_fixed_iterations,
+                (unsigned long long)
+                    progressive_result->
+                        native_feasibility_jump_soft_iterations,
+                (unsigned long long)
+                    progressive_result->native_feasibility_jump_work_epochs,
+                (unsigned long long)
+                    progressive_result->
+                        native_feasibility_jump_productive_epoch_extensions,
+                progressive_options.native_feasibility_jump_work_budget
+                    ? "work"
+                    : "wall",
+                (unsigned long long)
+                    progressive_result->
+                        native_feasibility_jump_shared_cache_bytes,
+                progressive_rwls_shared_cache_source_name(
+                    (ProgressiveRWLSSharedCacheSource)
+                        progressive_result->
+                            native_feasibility_jump_shared_cache_source
+                ),
+                (unsigned long long)
+                    progressive_result->
+                        native_feasibility_jump_packed_threshold_bytes,
+                progressive_result->
+                    native_feasibility_jump_dense_incidence_invocations,
+                progressive_result->
+                    native_feasibility_jump_packed_incidence_invocations,
+                progressive_result->native_adaptive_phase_checkpoints,
+                progressive_result->native_adaptive_phase_promotions,
+                progressive_result->native_adaptive_phase_grace_promotions,
+                progressive_result->native_adaptive_phase_budget_promotions,
+                progressive_result->native_adaptive_phase_growth_promotions,
+                progressive_result->native_adaptive_phase_pool_checkpoints,
+                progressive_result->native_adaptive_phase_stopped
+                    ? "yes"
+                    : "no",
+                progressive_result->native_reduce_expand_passes,
+                progressive_result->native_reduce_expand_variants,
+                progressive_result->native_reduce_expand_inserted_columns,
+                progressive_result->native_repair_attempts,
+                progressive_result->native_repair_improvements,
+                (unsigned long long)
+                    progressive_result->native_repair_destroyed_columns,
+                (unsigned long long)
+                    progressive_result->native_repair_uncovered_rows,
+                (unsigned long long)
+                    progressive_result->native_repair_residual_columns,
+                (double)
+                    progressive_result->native_repair_prepare_nanoseconds /
+                    1e9,
+                (double)
+                    progressive_result->native_repair_solve_nanoseconds /
+                    1e9,
+                (double)
+                    progressive_result->native_repair_budget_nanoseconds /
+                    1e9,
+                progressive_result->native_repair_budget_skips,
+                progressive_result->native_repair_deadline_stops
+            );
+
+        }
+        if (!run_log_check_path(DST_FILE)) {
+            free(progressive_results);
+            free(nofvalues);
+            free(chk_stop_counter);
+            cleanup(PInfo, NULL);
+            debug_close();
+            return 1;
+        }
+        write_pla_file(DST_FILE, PInfo);
+        long long merged_products = written_pla_product_count(DST_FILE);
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        execution_time =
+            (end.tv_sec - start.tv_sec) +
+            (end.tv_nsec - start.tv_nsec) / 1e9;
+        fprintf(
+            stderr,
+            "CCUBES_PROGRESSIVE_RESULT status=%s outputs=%d "
+            "products=%lld connections=%lld search_seconds=%.6f "
+            "output=%s\n",
+            progressive_cover_status_name(progressive_status),
+            noutputs,
+            merged_products,
+            total_connections,
+            progressive_search_seconds,
+            DST_FILE
+        );
+        fprintf(
+            stderr,
+            "Execution completed in %.3f seconds\n",
+            execution_time
+        );
+        fprintf(
+            stderr,
+            "CCUBES_TIMING_TOTAL pi_generation=0.000000 "
+            "scp=%.6f other=%.6f total=%.6f\n",
+            progressive_search_seconds,
+            execution_time - progressive_search_seconds,
+            execution_time
+        );
+
+        for (int output = 0; output < noutputs; ++output) {
+            progressive_cover_result_destroy(&progressive_results[output]);
+        }
+        free(progressive_results);
+        free(nofvalues);
         free(chk_stop_counter);
         cleanup(PInfo, NULL);
-        return 1;
+        debug_close();
+        return 0;
     }
 
     /*
-     * The PLA reader stores the same input row independently in each
-     * output-specific ON/OFF partition. Build one immutable row table before
-     * starting workers so each support can be projected once across outputs.
-     * Checkpoints deliberately omit this derived layout, so resume rebuilds it
-     * here from the restored ON/OFF sets as well.
+     * Build OFF compatibility masks before the shared projection layout. The
+     * layout can then omit OFF rows for masked outputs: those rows are tested
+     * by bitset intersection and never need a mixed-radix projection code.
+     * Checkpoints omit both derived structures, so resume rebuilds them here.
      */
-    if (!prepare_shared_projection_rows(PInfo, ninputs, noutputs)) {
-        fprintf(stderr, "Error: shared projection-layout allocation failed.\n");
-        free(chk_stop_counter);
-        cleanup(PInfo, NULL);
-        return 1;
-    }
-
     if (!prepare_off_compat_masks(
         PInfo,
         ninputs,
@@ -852,14 +1984,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /*
+     * The PLA reader stores the same ON row independently in multiple output
+     * partitions. Build one immutable ON-row table before starting workers so
+     * each required row can be projected once across outputs. Scalar OFF rows
+     * intentionally remain lazy inside process_task.
+     */
+    if (!prepare_shared_projection_rows(PInfo, ninputs, noutputs)) {
+        fprintf(stderr, "Error: shared projection-layout allocation failed.\n");
+        free(chk_stop_counter);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+
     DBG_INFO_BLOCK {
         size_t projection_memberships = 0u;
         int masked_outputs = 0;
         size_t off_mask_bytes = 0u;
         for (int output = 0; output < noutputs; ++output) {
-            projection_memberships +=
-                (size_t)PInfo[output].ON_minterms +
-                (size_t)PInfo[output].OFF_minterms;
+            projection_memberships += (size_t)PInfo[output].ON_minterms;
             if (PInfo[output].off_compat_masks) {
                 masked_outputs++;
                 off_mask_bytes +=
@@ -878,7 +2021,7 @@ int main(int argc, char *argv[]) {
         );
         fprintf(
             debug_out,
-            "Wildcard OFF masks: %d DC-bearing outputs, %zu bytes\n",
+            "OFF compatibility masks: %d outputs, %zu bytes\n",
             masked_outputs,
             off_mask_bytes
         );
@@ -895,18 +2038,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (PI_GENERATOR_MODE == PI_GENERATOR_MMCS) {
-        fprintf(
-            stderr,
-            "Notice: forcing experimental bounded MMCS-style PI generation.\n"
-        );
-    } else if (PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS) {
-        fprintf(
-            stderr,
-            "Notice: --certify uses complete-prime MMCS certification.\n"
-        );
-    } else if (PI_GENERATOR_MODE == PI_GENERATOR_PROJECTION) {
-        fprintf(stderr, "Notice: forcing projection PI generation.\n");
+    if (CERTIFIED_MODE) {
+        fprintf(stderr, "Notice: --certify uses complete-prime MMCS certification.\n");
     }
 
     if (!adaptive_stopping_supported) {
@@ -953,9 +2086,33 @@ int main(int argc, char *argv[]) {
         PInfo[o].cov_bits = COV_BITS_PER_WORD;
     }
 
-
-
-    int increase = 100000; // how much to increase the size of the arrays when needed
+    uint64_t initial_pi_bytes = 0;
+    int active_output_count = 0;
+    int constant_zero_count = 0;
+    int constant_one_count = 0;
+    const int initial_pi_capacity = ordinary_initial_pi_capacity(
+        PInfo,
+        noutputs,
+        implicant_words,
+        &initial_pi_bytes,
+        &active_output_count,
+        &constant_zero_count,
+        &constant_one_count
+    );
+    const int increase = CCUBES_PI_CAPACITY_GROWTH;
+    fprintf(
+        stderr,
+        "CCUBES_PI_CAPACITY initial=%d growth=%d "
+        "estimated_initial_bytes=%llu budget_bytes=%llu "
+        "active_outputs=%d constant_zero=%d constant_one=%d\n",
+        initial_pi_capacity,
+        increase,
+        (unsigned long long)initial_pi_bytes,
+        (unsigned long long)CCUBES_INITIAL_PI_MEMORY_BYTES,
+        active_output_count,
+        constant_zero_count,
+        constant_one_count
+    );
 
     // many PIs will have the same coverage, but they don't necessarily cover the same minterms
     // to employ row dominance when solving the coverage matrix, we need to compare the coverage of
@@ -974,7 +2131,7 @@ int main(int argc, char *argv[]) {
     THREADS = ccubes_effective_thread_count(THREADS);
     ccubes_set_thread_count(THREADS);
 
-    /* Explicit opt-in profiling of the PI-insertion locks. */
+    /* opt-in (--lock-stats) profiling of the PI-insertion locks */
     if (!lock_stats_init(options.lock_stats, THREADS, noutputs)) {
         fprintf(stderr, "Error: lock statistics allocation failed\n");
         return 1;
@@ -1000,12 +2157,27 @@ int main(int argc, char *argv[]) {
 
         // the original ON-set was transposed to a column-major matrix
         int ON_minterms = PInfo[o].ON_minterms;
+        const bool constant_zero = ON_minterms <= 0;
+        const bool constant_one =
+            ON_minterms > 0 && PInfo[o].OFF_minterms <= 0;
+        const bool constant_output = constant_zero || constant_one;
 
-        // preallocating for a moderate number; grows dynamically as needed
+        /*
+         * Retained PI arrays grow transactionally.  A fixed 500,000-column
+         * reservation per output made the virtual chart scale with
+         * outputs * ON rows before one PI had been found.  Share one bounded
+         * initial memory envelope across active outputs instead; constants
+         * need at most one synthetic all-dash column.
+         */
         if (!RESUME_PATH) {
-            PInfo[o].estimPI = 500000;
+            PInfo[o].estimPI = constant_output
+                ? 1
+                : initial_pi_capacity;
         } else {
-            if (PInfo[o].estimPI < PInfo[o].foundPI) PInfo[o].estimPI = PInfo[o].foundPI; // minimal capacity
+            if (PInfo[o].estimPI < PInfo[o].foundPI) {
+                PInfo[o].estimPI = PInfo[o].foundPI;
+            }
+            if (PInfo[o].estimPI < 1) PInfo[o].estimPI = 1;
         }
 
         // allocate only if not already present (resume)
@@ -1018,9 +2190,20 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (!PInfo[o].last_index) PInfo[o].last_index = (int *) calloc(ON_minterms, sizeof(int));
-        if (!PInfo[o].k_last_index) PInfo[o].k_last_index = (int *) calloc(ON_minterms, sizeof(int));
-        if (!PInfo[o].last_index || !PInfo[o].k_last_index) {
+        if (ON_minterms > 0 && !PInfo[o].last_index) {
+            PInfo[o].last_index = (int *)calloc(
+                (size_t)ON_minterms, sizeof(int)
+            );
+        }
+        if (ON_minterms > 0 && !PInfo[o].k_last_index) {
+            PInfo[o].k_last_index = (int *)calloc(
+                (size_t)ON_minterms, sizeof(int)
+            );
+        }
+        if (
+            ON_minterms > 0 &&
+            (!PInfo[o].last_index || !PInfo[o].k_last_index)
+        ) {
             fprintf(stderr, "Error: Memory allocation failed for index arrays\n");
             cleanup(PInfo, buffer);
             return 1;
@@ -1028,8 +2211,12 @@ int main(int argc, char *argv[]) {
 
         PInfo[o].pichart_words = (ON_minterms + COV_BITS_PER_WORD - 1) / COV_BITS_PER_WORD; // Words needed per coverage matrix columns
         PInfo[o].cov_bits = COV_BITS_PER_WORD;
-        if (!PInfo[o].pichart_pos) {
-            PInfo[o].pichart_pos = (uint64_t *) calloc(PInfo[o].estimPI * PInfo[o].pichart_words, sizeof(uint64_t));
+        if (PInfo[o].pichart_words > 0 && !PInfo[o].pichart_pos) {
+            PInfo[o].pichart_pos = (uint64_t *)calloc(
+                (size_t)PInfo[o].estimPI *
+                    (size_t)PInfo[o].pichart_words,
+                sizeof(uint64_t)
+            );
             if (!PInfo[o].pichart_pos) {
                 fprintf(stderr, "Error: Memory allocation failed for pichart_pos\n");
                 cleanup(PInfo, buffer);
@@ -1037,16 +2224,34 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (!PInfo[o].implicants_pos) PInfo[o].implicants_pos = (uint64_t *) calloc(PInfo[o].estimPI * implicant_words, sizeof(uint64_t));
-        if (!PInfo[o].implicants_val) PInfo[o].implicants_val = (uint64_t *) calloc(PInfo[o].estimPI * implicant_words, sizeof(uint64_t));
+        if (!PInfo[o].implicants_pos) {
+            PInfo[o].implicants_pos = (uint64_t *)calloc(
+                (size_t)PInfo[o].estimPI * (size_t)implicant_words,
+                sizeof(uint64_t)
+            );
+        }
+        if (!PInfo[o].implicants_val) {
+            PInfo[o].implicants_val = (uint64_t *)calloc(
+                (size_t)PInfo[o].estimPI * (size_t)implicant_words,
+                sizeof(uint64_t)
+            );
+        }
         if (!PInfo[o].implicants_pos || !PInfo[o].implicants_val) {
             fprintf(stderr, "Error: Memory allocation failed for implicants arrays\n");
             cleanup(PInfo, buffer);
             return 1;
         }
 
-        if (!PInfo[o].shared) PInfo[o].shared = (int *) calloc(PInfo[o].estimPI, sizeof(int));
-        if (!PInfo[o].covsum) PInfo[o].covsum = (int *) calloc(PInfo[o].estimPI, sizeof(int));
+        if (!PInfo[o].shared) {
+            PInfo[o].shared = (int *)calloc(
+                (size_t)PInfo[o].estimPI, sizeof(int)
+            );
+        }
+        if (!PInfo[o].covsum) {
+            PInfo[o].covsum = (int *)calloc(
+                (size_t)PInfo[o].estimPI, sizeof(int)
+            );
+        }
         if (!PInfo[o].shared || !PInfo[o].covsum) {
             fprintf(stderr, "Error: Memory allocation failed for shared/covsum arrays\n");
             cleanup(PInfo, buffer);
@@ -1054,32 +2259,56 @@ int main(int argc, char *argv[]) {
         }
 
         if (!RESUME_PATH) {
-            PInfo[o].foundPI = 0;
-            PInfo[o].solmin = 0;
+            PInfo[o].foundPI = constant_one ? 1 : 0;
+            PInfo[o].solmin = constant_one ? 1 : 0;
         }
 
         // the previous (level k - 1), minimum number of PIs to solve the coverage matrix
         if (!RESUME_PATH) {
-            PInfo[o].prevsolmin = ON_minterms + 1; // Initialization
+            PInfo[o].prevsolmin = constant_one
+                ? 1
+                : (constant_zero ? 0 : ON_minterms + 1);
         }
 
         // the positions of the PIs solving the coverage matrix
         // this vector can never be lengthier than the number of ON minterms (ON_minterms)
-        if (!PInfo[o].previndices) PInfo[o].previndices = (int *) calloc(ON_minterms, sizeof(int));
-        if (!PInfo[o].indices)     PInfo[o].indices     = (int *) calloc(ON_minterms, sizeof(int));
-        if (!PInfo[o].previndices || !PInfo[o].indices) {
+        if (ON_minterms > 0 && !PInfo[o].previndices) {
+            PInfo[o].previndices = (int *)calloc(
+                (size_t)ON_minterms, sizeof(int)
+            );
+        }
+        if (ON_minterms > 0 && !PInfo[o].indices) {
+            PInfo[o].indices = (int *)calloc(
+                (size_t)ON_minterms, sizeof(int)
+            );
+        }
+        if (
+            ON_minterms > 0 &&
+            (!PInfo[o].previndices || !PInfo[o].indices)
+        ) {
             fprintf(stderr, "Error: Memory allocation failed for indices arrays\n");
             cleanup(PInfo, buffer);
             return 1;
         }
 
         if (!RESUME_PATH) {
-            PInfo[o].ON_set_covered = false;
+            PInfo[o].ON_set_covered = constant_output;
         }
 
-        if (!PInfo[o].cov_word_index)   PInfo[o].cov_word_index   = (int *) calloc(ON_minterms, sizeof(int));
-        if (!PInfo[o].shifted_cov_mask) PInfo[o].shifted_cov_mask = (uint64_t *) calloc(ON_minterms, sizeof(uint64_t));
-        if (!PInfo[o].cov_word_index || !PInfo[o].shifted_cov_mask) {
+        if (ON_minterms > 0 && !PInfo[o].cov_word_index) {
+            PInfo[o].cov_word_index = (int *)calloc(
+                (size_t)ON_minterms, sizeof(int)
+            );
+        }
+        if (ON_minterms > 0 && !PInfo[o].shifted_cov_mask) {
+            PInfo[o].shifted_cov_mask = (uint64_t *)calloc(
+                (size_t)ON_minterms, sizeof(uint64_t)
+            );
+        }
+        if (
+            ON_minterms > 0 &&
+            (!PInfo[o].cov_word_index || !PInfo[o].shifted_cov_mask)
+        ) {
             fprintf(stderr, "Error: Memory allocation failed for coverage arrays\n");
             cleanup(PInfo, buffer);
             return 1;
@@ -1088,6 +2317,18 @@ int main(int argc, char *argv[]) {
         for (int r = 0; r < ON_minterms; r++) {
             PInfo[o].cov_word_index[r] = r / COV_BITS_PER_WORD;
             PInfo[o].shifted_cov_mask[r] = (1ULL << (r % COV_BITS_PER_WORD));
+        }
+        if (!RESUME_PATH && constant_one) {
+            for (int word = 0; word < PInfo[o].pichart_words; ++word) {
+                int remaining = ON_minterms - word * COV_BITS_PER_WORD;
+                PInfo[o].pichart_pos[word] = remaining >= 64
+                    ? UINT64_MAX
+                    : (UINT64_C(1) << remaining) - 1u;
+            }
+            PInfo[o].covsum[0] = ON_minterms;
+            PInfo[o].covered[0] = ON_minterms;
+            PInfo[o].indices[0] = 0;
+            PInfo[o].previndices[0] = 0;
         }
 
         // If resuming, restore stop counter from checkpoint
@@ -1118,10 +2359,13 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
+        if (!RESUME_PATH && constant_one && ninputs > 0) {
+            PInfo[o].nofpi[0] = 1;
+        }
 
         // Preserve stop status when resuming; otherwise initialize it.
         if (!RESUME_PATH) {
-            PInfo[o].stop_search = ON_minterms == 0; // if there are no ON-set minterms, then stop searching for PIs
+            PInfo[o].stop_search = constant_output;
         }
 
         PInfo[o].solution = NULL;
@@ -1133,6 +2377,19 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Error: Memory allocation failed for pool_solutions\n");
                 cleanup(PInfo, buffer);
                 return 1;
+            }
+            if (constant_one) {
+                PInfo[o].pool_solutions[0] = (int *)malloc(sizeof(int));
+                if (!PInfo[o].pool_solutions[0]) {
+                    fprintf(
+                        stderr,
+                        "Error: constant-one pool allocation failed\n"
+                    );
+                    cleanup(PInfo, buffer);
+                    return 1;
+                }
+                PInfo[o].pool_solutions[0][0] = 0;
+                PInfo[o].pool_count = 1;
             }
         }
     }
@@ -1175,7 +2432,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-
     DBG_INFO_BLOCK {
         fprintf(debug_out, "Bits per word: %d\n", BITS_PER_WORD);
         fprintf(debug_out, "Implicant words: %d\n", implicant_words);
@@ -1187,7 +2443,6 @@ int main(int argc, char *argv[]) {
         fprintf(debug_out, "deterministic PI order: %s\n", DETERMINISTIC_PI_ORDER ? "yes" : "no");
     }
 
-
     int bit_index[ninputs];  //
     int word_index[ninputs]; //   for the implicants matrix
     uint64_t shifted_mask[ninputs];
@@ -1198,7 +2453,9 @@ int main(int argc, char *argv[]) {
     }
 
     double scp_time = 0.0, k_scp_time = 0.0, pi_generation_time = 0.0;
+    double k_pi_generation_time = 0.0;
     double next_periodic_checkpoint_sec = CHECKPOINT_INTERVAL_SEC;
+    bool continuing_level = false;
     double certification_enumeration_wall_time = 0.0;
     double certification_enumeration_worker_time = 0.0;
     double certification_chart_solve_time = 0.0;
@@ -1210,7 +2467,7 @@ int main(int argc, char *argv[]) {
      * worth attempting if the hardest output is plausible.
      */
     int mmcs_branching = 1;
-    if (PI_GENERATOR_MODE == PI_GENERATOR_AUTO && adaptive_stopping_supported) {
+    if (!CERTIFIED_MODE && adaptive_stopping_supported) {
         for (int o = 0; o < noutputs; ++o) {
             int b = min_blocker_edge(&PInfo[o], ninputs);
             if (b > mmcs_branching) mmcs_branching = b;
@@ -1225,12 +2482,18 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    int output_completed_level[noutputs];
+    for (int o = 0; o < noutputs; ++o) {
+        output_completed_level[o] = search_level - 1;
+    }
+
     int k;
     for (k = search_level; k <= ninputs; k++) {
-        const bool complete_mmcs_chart =
-            PI_GENERATOR_MODE == PI_GENERATOR_COMPLETE_MMCS;
+        const bool complete_mmcs_chart = CERTIFIED_MODE;
         int level_start[noutputs];
+        bool level_active[noutputs];
         for (int o = 0; o < noutputs; ++o) {
+            level_active[o] = !PInfo[o].stop_search;
             int start_pi = (k > 1 && PInfo[o].nofpi) ? PInfo[o].nofpi[k - 2] : 0;
             if (start_pi < 0 || start_pi > PInfo[o].foundPI) {
                 start_pi = PInfo[o].foundPI;
@@ -1238,24 +2501,23 @@ int main(int argc, char *argv[]) {
             level_start[o] = start_pi;
         }
 
-        k_scp_time = 0.0; // reset time for this level
-        clock_gettime(CLOCK_MONOTONIC, &startk);
+        if (!continuing_level) {
+            k_scp_time = 0.0;
+            k_pi_generation_time = 0.0;
+            clock_gettime(CLOCK_MONOTONIC, &startk);
+        }
 
         uint64_t projection_tasks = nchoosek(ninputs, k);
         bool automatic_mmcs_trial =
-            PI_GENERATOR_MODE == PI_GENERATOR_AUTO &&
+            !complete_mmcs_chart &&
             adaptive_stopping_supported &&
             !RESUME_PATH &&
-            TIME_LIMIT_SEC <= 0.0 &&
-            CHECKPOINT_INTERVAL_SEC <= 0.0 &&
+            !checkpointing &&
             (
                 projection_tasks == 0 ||
                 projection_tasks > CCUBES_AUTO_MMCS_MIN_PROJECTION_TASKS
             );
-        bool attempt_mmcs =
-            PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
-            complete_mmcs_chart ||
-            automatic_mmcs_trial;
+        bool attempt_mmcs = complete_mmcs_chart || automatic_mmcs_trial;
         /*
          * Break-even trial budget.  A search node costs about
          * O(ninputs * edge_count) and a projection task about
@@ -1292,9 +2554,7 @@ int main(int argc, char *argv[]) {
              */
             if (!mmcs_branching_plausible(mmcs_branching, k, budget)) {
                 automatic_mmcs_trial = false;
-                attempt_mmcs =
-                    PI_GENERATOR_MODE == PI_GENERATOR_MMCS ||
-                    complete_mmcs_chart;
+                attempt_mmcs = complete_mmcs_chart;
             } else {
                 automatic_mmcs_node_limit = budget;
             }
@@ -1310,29 +2570,24 @@ int main(int argc, char *argv[]) {
             : projection_tasks;
         double checkpoint_deadline_sec = TIME_LIMIT_SEC;
         if (
-            CHECKPOINT_INTERVAL_SEC > 0.0 &&
-            (
-                checkpoint_deadline_sec <= 0.0 ||
-                next_periodic_checkpoint_sec < checkpoint_deadline_sec
-            )
+            next_periodic_checkpoint_sec > 0.0 &&
+            (checkpoint_deadline_sec <= 0.0 ||
+             next_periodic_checkpoint_sec < checkpoint_deadline_sec)
         ) {
             checkpoint_deadline_sec = next_periodic_checkpoint_sec;
         }
         PICoverageIndex *coverage_indices = NULL;
         atomic_bool time_up;
         atomic_init(&time_up, false);
+        atomic_bool first_task_done;
+        atomic_init(&first_task_done, false);
         atomic_bool generation_failed;
         atomic_init(&generation_failed, false);
         uint64_t worker_next_tasks[THREADS];
         for (int t = 0; t < THREADS; ++t) {
             worker_next_tasks[t] = UINT64_MAX;
         }
-        uint64_t start_task = 0ull;
-
-        if (HAS_RESUME_TASK && RESUME_K == k) {
-            start_task = RESUME_TASK;
-            if (start_task > maxtasks) start_task = maxtasks; // safety
-        }
+        uint64_t start_task = resume_task <= maxtasks ? resume_task : maxtasks;
 
         if (!attempt_mmcs && maxtasks == 0) {
             // overflow, too many tasks
@@ -1495,11 +2750,16 @@ int main(int argc, char *argv[]) {
                 .max_shared = &max_shared,
                 .increase = increase,
                 .multiplier = &multiplier,
+                .retain_all_prime_geometries =
+                    false,
+                .time_limit_sec = TIME_LIMIT_SEC,
                 .checkpoint_deadline_sec = checkpoint_deadline_sec,
                 .start_time = start,
+                .first_task = start_task,
                 .time_up = &time_up,
-                .worker_next_tasks = worker_next_tasks,
-                .failed = &generation_failed
+                .first_task_done = &first_task_done,
+                .failed = &generation_failed,
+                .worker_next_tasks = worker_next_tasks
             };
             if (!ccubes_parallel_for(
                 start_task,
@@ -1521,15 +2781,18 @@ int main(int argc, char *argv[]) {
             destroy_pi_coverage_indices(coverage_indices, noutputs);
             destroy_output_locks(output_locks, noutputs);
             cleanup(PInfo, buffer);
+            debug_close();
             return 1;
         }
 
-        // Periodic or time-limit checkpoint after all workers are quiescent.
+        // The first unfinished task of any worker is the safe resume point.
         bool level_time_up = atomic_load_explicit(&time_up, memory_order_acquire);
-        uint64_t resume_task_value = maxtasks;
-        for (int t = 0; t < THREADS; ++t) {
-            if (worker_next_tasks[t] < resume_task_value) {
-                resume_task_value = worker_next_tasks[t];
+        resume_task = maxtasks;
+        if (level_time_up) {
+            for (int t = 0; t < THREADS; ++t) {
+                if (worker_next_tasks[t] < resume_task) {
+                    resume_task = worker_next_tasks[t];
+                }
             }
         }
         DBG_INFO_BLOCK {
@@ -1580,11 +2843,9 @@ int main(int argc, char *argv[]) {
                     k,
                     automatic_mmcs_trial
                         ? "mmcs-node-limit"
-                        : PI_GENERATOR_MODE == PI_GENERATOR_PROJECTION
-                            ? "forced"
-                            : adaptive_stopping_supported
-                                ? "small-support-level"
-                                : "unsupported-model",
+                        : adaptive_stopping_supported
+                            ? "small-support-level"
+                            : "unsupported-model",
                     (unsigned long long)mmcs_trial_nodes,
                     (unsigned long long)projection_tasks
                 );
@@ -1593,6 +2854,7 @@ int main(int argc, char *argv[]) {
         destroy_pi_coverage_indices(coverage_indices, noutputs);
 
         for (int o = 0; o < noutputs; ++o) {
+            if (!level_active[o]) continue;
             if (complete_mmcs_chart) {
                 /*
                  * Keep every complete-chart geometry. Cross-level coverage
@@ -1607,7 +2869,8 @@ int main(int argc, char *argv[]) {
                 implicant_words,
                 level_start[o],
                 DETERMINISTIC_PI_ORDER,
-                POOL_MAX > 1 || WEIGHT_PIC == 2
+                POOL_MAX > 1 || WEIGHT_PIC == 2,
+                false
             )) {
                 fprintf(
                     stderr,
@@ -1620,10 +2883,11 @@ int main(int argc, char *argv[]) {
             }
         }
         clock_gettime(CLOCK_MONOTONIC, &endpi);
-        double k_pi_generation_time =
+        double generation_slice_seconds =
             (endpi.tv_sec - startpi.tv_sec) +
             (endpi.tv_nsec - startpi.tv_nsec) / 1e9;
-        pi_generation_time += k_pi_generation_time;
+        k_pi_generation_time += generation_slice_seconds;
+        pi_generation_time += generation_slice_seconds;
 
         if (complete_mmcs_chart) {
             certification_enumeration_wall_time += k_pi_generation_time;
@@ -1657,14 +2921,6 @@ int main(int argc, char *argv[]) {
         }
 
         if (level_time_up) {
-            struct timespec checkpoint_start;
-            clock_gettime(CLOCK_MONOTONIC, &checkpoint_start);
-            double run_elapsed =
-                (checkpoint_start.tv_sec - start.tv_sec) +
-                (checkpoint_start.tv_nsec - start.tv_nsec) / 1e9;
-            double checkpoint_elapsed_total = BASE_ELAPSED + run_elapsed;
-            bool time_limit_reached =
-                TIME_LIMIT_SEC > 0.0 && run_elapsed >= TIME_LIMIT_SEC;
             if (!CHK_SAVE_PATH) {
                 if (RESUME_PATH) {
                     CHK_SAVE_PATH = RESUME_PATH; // overwrite the same checkpoint when resuming
@@ -1682,6 +2938,19 @@ int main(int argc, char *argv[]) {
                 tmp_dst_alloc = prefix_basename(SRC_FILE, "ccubes_");
                 dst_to_save = tmp_dst_alloc; // may be NULL on OOM
             }
+            if (!CHK_SAVE_PATH || !run_log_check_path(CHK_SAVE_PATH)) {
+                if (!CHK_SAVE_PATH) fprintf(stderr, "Error: failed to allocate checkpoint path.\n");
+                free(tmp_dst_alloc);
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                debug_close();
+                return 1;
+            }
+            struct timespec checkpoint_start;
+            clock_gettime(CLOCK_MONOTONIC, &checkpoint_start);
+            double checkpoint_elapsed =
+                (checkpoint_start.tv_sec - start.tv_sec) +
+                (checkpoint_start.tv_nsec - start.tv_nsec) / 1e9;
             if (
                 save_checkpoint(
                     CHK_SAVE_PATH,
@@ -1699,72 +2968,54 @@ int main(int argc, char *argv[]) {
                     POOL_MAX,
                     SRC_FILE,
                     dst_to_save,
-                    checkpoint_elapsed_total,
+                    BASE_ELAPSED + checkpoint_elapsed,
                     BASE_SCP + scp_time,
-                    resume_task_value
-                ) == 0
+                    resume_task
+                ) != 0
             ) {
-                double pct = maxtasks > 0
-                    ? (double)resume_task_value * 100.0 / (double)maxtasks
-                    : 100.0;
-
-                if (time_limit_reached) {
-                    fprintf(
-                        stderr,
-                        "Time limit reached. Checkpoint saved at %.2f%% "
-                        "of level k=%d.\n",
-                        pct,
-                        k
-                    );
-                } else {
-                    fprintf(
-                        stderr,
-                        "Periodic checkpoint saved at %.2f%% of level "
-                        "k=%d; continuing.\n",
-                        pct,
-                        k
-                    );
-                }
-            } else {
-                fprintf(
-                    stderr,
-                    "%s checkpoint failed: unable to save %s.\n",
-                    time_limit_reached ? "Time-limit" : "Periodic",
-                    CHK_SAVE_PATH
-                );
-                if (tmp_dst_alloc) free(tmp_dst_alloc);
+                fprintf(stderr, "Error: failed to save checkpoint to %s.\n", CHK_SAVE_PATH);
+                free(tmp_dst_alloc);
                 destroy_output_locks(output_locks, noutputs);
                 cleanup(PInfo, buffer);
+                debug_close();
                 return 1;
             }
-            if (tmp_dst_alloc) free(tmp_dst_alloc);
+            free(tmp_dst_alloc);
 
-            if (!time_limit_reached) {
-                struct timespec checkpoint_end;
-                clock_gettime(CLOCK_MONOTONIC, &checkpoint_end);
-                double elapsed_after_save =
-                    (checkpoint_end.tv_sec - start.tv_sec) +
-                    (checkpoint_end.tv_nsec - start.tv_nsec) / 1e9;
-                do {
-                    next_periodic_checkpoint_sec +=
-                        CHECKPOINT_INTERVAL_SEC;
-                } while (
-                    next_periodic_checkpoint_sec <= elapsed_after_save
+            struct timespec checkpoint_end;
+            clock_gettime(CLOCK_MONOTONIC, &checkpoint_end);
+            double elapsed_after_save =
+                (checkpoint_end.tv_sec - start.tv_sec) +
+                (checkpoint_end.tv_nsec - start.tv_nsec) / 1e9;
+            double pct = (double)resume_task * 100.0 / (double)maxtasks;
+            if (TIME_LIMIT_SEC > 0.0 && elapsed_after_save >= TIME_LIMIT_SEC) {
+                fprintf(
+                    stderr,
+                    "Time limit reached. Checkpoint saved at %.2f%% of level k=%d.\n",
+                    pct, k
                 );
-
-                RESUME_K = k;
-                RESUME_TASK = resume_task_value;
-                HAS_RESUME_TASK = true;
-                --k;
-                continue;
+                destroy_output_locks(output_locks, noutputs);
+                cleanup(PInfo, buffer);
+                debug_close();
+                return 0;
             }
 
-            destroy_output_locks(output_locks, noutputs);
-            cleanup(PInfo, buffer);
-            return 0;
+            fprintf(
+                stderr,
+                "Periodic checkpoint saved at %.2f%% of level k=%d; continuing.\n",
+                pct, k
+            );
+            next_periodic_checkpoint_sec = elapsed_after_save + CHECKPOINT_INTERVAL_SEC;
+            continuing_level = true;
+            --k;
+            continue;
         }
 
-        HAS_RESUME_TASK = false;
+        continuing_level = false;
+        resume_task = 0;
+        for (int o = 0; o < noutputs; ++o) {
+            if (level_active[o]) output_completed_level[o] = k;
+        }
 
         // solve the PI charts per output
         if (POOL_MAX == 1) {
@@ -1879,26 +3130,6 @@ int main(int argc, char *argv[]) {
                         *prevsolmin <= ON_minterms &&
                         *solmin >= *prevsolmin &&
                         stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
-#ifdef CCUBES_TESTING
-                    if (options.test_projection_rwls && probe_due && SCP_TYPE == 0) {
-                        (void)try_projection_rwls(
-                            &chart,
-                            k,
-                            o,
-                            THREADS,
-                            CERTIFIED_MODE,
-                            boundary_exact,
-                            indices,
-                            solmin
-                        );
-                        probe_due =
-                            *solmin > 0 &&
-                            *prevsolmin > 1 &&
-                            *prevsolmin <= ON_minterms &&
-                            *solmin >= *prevsolmin &&
-                            stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
-                    }
-#endif
                     if (probe_due) {
                         const int pre_probe_found = *foundPI;
                         const uint64_t pair_limit =
@@ -2166,7 +3397,6 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-
                 for (int i = 0; i < ON_minterms; i++) {
                     PInfo[o].last_index[i] = PInfo[o].k_last_index[i];
                 }
@@ -2318,27 +3548,6 @@ int main(int argc, char *argv[]) {
                         return 1;
                     }
 
-#ifdef CCUBES_TESTING
-                    const bool rwls_due =
-                        adaptive_stopping_supported &&
-                        PInfo[o].prevsolmin > 1 &&
-                        PInfo[o].prevsolmin <= ON_minterms &&
-                        *solmin >= PInfo[o].prevsolmin &&
-                        stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
-                    if (options.test_projection_rwls && rwls_due && SCP_TYPE == 0) {
-                        (void)try_projection_rwls(
-                            &chart,
-                            k,
-                            o,
-                            THREADS,
-                            CERTIFIED_MODE,
-                            pool_boundary_exact[o],
-                            indices,
-                            solmin
-                        );
-                    }
-
-#endif
 
                     int baseline_solmin = *solmin;
                     memcpy(
@@ -2647,13 +3856,11 @@ int main(int argc, char *argv[]) {
                     free(weights);
                 }
 
-
                 for (int i = 0; i < ON_minterms; i++) {
                     PInfo[o].last_index[i] = PInfo[o].k_last_index[i];
                 }
 
             } // end of outputs loop solving SCP
-
 
             /* Coordinate the per-output pools against their actual joint union. */
             int *chosen_idx = (int*)calloc((size_t)noutputs, sizeof(int));
@@ -2983,7 +4190,6 @@ int main(int argc, char *argv[]) {
 
     free(certified_states);
 
-
     for (int o = 0; o < noutputs; o++) {
         int solmin = PInfo[o].solmin > 0 ? PInfo[o].solmin : 1; // at least one solution term is needed
         PInfo[o].solution = (int *) calloc(solmin * ninputs, sizeof(int));
@@ -3000,7 +4206,6 @@ int main(int argc, char *argv[]) {
             }
         }
     }
-
 
     if (DST_FILE == NULL) {
         if (RESUME_PATH) {
@@ -3046,14 +4251,20 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (!run_log_check_path(DST_FILE)) {
+        destroy_output_locks(output_locks, noutputs);
+        cleanup(PInfo, buffer);
+        debug_close();
+        return 1;
+    }
     write_pla_file(DST_FILE, PInfo);
 
     // Free allocated memory
     destroy_output_locks(output_locks, noutputs);
     cleanup(PInfo, buffer);
+    clock_gettime(CLOCK_MONOTONIC, &end);
 
     // Calculate and log execution time (accumulated across resumes)
-    clock_gettime(CLOCK_MONOTONIC, &end);
     execution_time =
         (end.tv_sec - start.tv_sec) +
         (end.tv_nsec - start.tv_nsec) / 1e9;
