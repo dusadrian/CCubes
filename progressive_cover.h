@@ -9,6 +9,12 @@
 #ifndef PROGRESSIVE_COVER_H
 #define PROGRESSIVE_COVER_H
 
+/* Default seconds without a smaller cover after which the terminal reserve
+ * ends; 0 spends the whole reserve. */
+#ifndef CCUBES_TERMINAL_PATIENCE_DEFAULT
+#define CCUBES_TERMINAL_PATIENCE_DEFAULT 8.0
+#endif
+
 #include <stdint.h>
 
 #include "bounded_mmcs.h"
@@ -112,6 +118,12 @@ typedef struct {
     int greedy_final_mip_focus;
     double greedy_final_mip_best_obj_stop;
     double time_limit_seconds;
+    /* Final seconds of time_limit_seconds reserved for sustained local search
+     * on the final pool; 0 disables. */
+    double native_terminal_reserve_seconds;
+    /* Terminal reserve ends early after this many seconds without a smaller
+     * cover; 0 always spends the whole reserve. */
+    double native_terminal_patience_seconds;
     double global_bound_time_limit_seconds;
     int global_bound_active_rows;
     int global_bound_rounds;

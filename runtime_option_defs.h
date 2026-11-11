@@ -16,3 +16,5 @@ PUBLIC_OPTION(PROGRESSIVE_MEMORY_MB, "memory-mb", INTEGER, 1, INT_MAX, NULL, "IP
 PUBLIC_OPTION(PROGRESSIVE_NATIVE_EFFORT, "ipc-effort", INTEGER, 0, 2, NULL, "Native IPC effort: 0, 1, or 2")
 PUBLIC_OPTION(PROGRESSIVE_PROFILE, "profile-pricing", INTEGER, 0, 1, NULL, "IPC pricing telemetry: 0 or 1")
 PUBLIC_OPTION(PROGRESSIVE_TIME_LIMIT_SECONDS, "ipc-time-limit", NUMBER, 0, DBL_MAX, NULL, "Per-output soft wall target in seconds; 0 disables")
+PUBLIC_OPTION(PROGRESSIVE_TERMINAL_PATIENCE_SECONDS, "ipc-terminal-patience", NUMBER, 0, DBL_MAX, NULL, "End the terminal reserve after this many seconds without a smaller cover; 0 spends the whole reserve")
+PUBLIC_OPTION(PROGRESSIVE_TERMINAL_RESERVE_SECONDS, "ipc-terminal-reserve", NUMBER, 0, DBL_MAX, NULL, "Final seconds of --ipc-time-limit spent on sustained local search over the final pool; 0 disables")

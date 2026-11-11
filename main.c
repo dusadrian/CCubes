@@ -757,6 +757,28 @@ int main(int argc, char *argv[]) {
     int parse_result = cli_parse(argc, argv, &options, stderr);
     if (parse_result > 0) { cli_help(stdout); return 0; }
     if (parse_result < 0) return 1;
+
+    const char *ipc_time_limit = ccubes_option(OPTION_PROGRESSIVE_TIME_LIMIT_SECONDS);
+    const char *ipc_terminal_reserve = ccubes_option(OPTION_PROGRESSIVE_TERMINAL_RESERVE_SECONDS);
+    const char *ipc_terminal_patience = ccubes_option(OPTION_PROGRESSIVE_TERMINAL_PATIENCE_SECONDS);
+    const double progressive_time_limit_seconds =
+        ipc_time_limit ? strtod(ipc_time_limit, NULL) : 0.0;
+    const double progressive_terminal_reserve_seconds =
+        ipc_terminal_reserve ? strtod(ipc_terminal_reserve, NULL) : 0.0;
+    const double progressive_terminal_patience_seconds =
+        ipc_terminal_patience
+            ? strtod(ipc_terminal_patience, NULL)
+            : CCUBES_TERMINAL_PATIENCE_DEFAULT;
+    if (progressive_terminal_reserve_seconds > 0.0 &&
+        progressive_terminal_reserve_seconds >= progressive_time_limit_seconds) {
+        fprintf(
+            stderr,
+            "Error: --ipc-terminal-reserve requires --ipc-time-limit greater "
+            "than the reserve.\n"
+        );
+        return 1;
+    }
+
     if ((!options.resume || !options.log_file || options.inspect) &&
         !initialize_run_logging(&options, options.source, options.destination)) return 1;
     if (options.legacy_options) fprintf(stderr, "Warning: short options are deprecated; see --help for long names.\n");
@@ -1216,7 +1238,6 @@ int main(int argc, char *argv[]) {
         int progressive_mmcs_edge_cache = 1;
         int progressive_root_gate = 1;
 
-        double progressive_time_limit_seconds = 0.0;
         double progressive_global_bound_seconds = 0.0;
         int progressive_global_bound_active_rows = 512;
         int progressive_global_bound_rounds = 5;
@@ -1229,8 +1250,6 @@ int main(int argc, char *argv[]) {
         if (value) progressive_profile = atoi(value);
         value = ccubes_option(OPTION_PROGRESSIVE_NATIVE_EFFORT);
         if (value) progressive_native_effort = atoi(value);
-        value = ccubes_option(OPTION_PROGRESSIVE_TIME_LIMIT_SECONDS);
-        if (value) progressive_time_limit_seconds = strtod(value, NULL);
         value = ccubes_option(OPTION_PROGRESSIVE_GLOBAL_BOUND_SECONDS);
         if (value) progressive_global_bound_seconds = strtod(value, NULL);
         const char *column_pool_input_path =
@@ -1358,6 +1377,10 @@ int main(int argc, char *argv[]) {
             (unsigned int)progressive_seed_memory_percent;
         progressive_options.time_limit_seconds =
             progressive_time_limit_seconds;
+        progressive_options.native_terminal_reserve_seconds =
+            progressive_terminal_reserve_seconds;
+        progressive_options.native_terminal_patience_seconds =
+            progressive_terminal_patience_seconds;
         progressive_options.global_bound_time_limit_seconds =
             progressive_global_bound_seconds;
         progressive_options.global_bound_active_rows =

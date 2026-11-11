@@ -116,6 +116,8 @@ void progressive_cover_options_default(
         .greedy_final_mip_focus = 0,
         .greedy_final_mip_best_obj_stop = -1.0,
         .time_limit_seconds = 0.0,
+        .native_terminal_reserve_seconds = 0.0,
+        .native_terminal_patience_seconds = CCUBES_TERMINAL_PATIENCE_DEFAULT,
         .global_bound_time_limit_seconds = 0.0,
         .global_bound_active_rows = 512,
         .global_bound_rounds = 5,

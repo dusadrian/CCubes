@@ -1611,10 +1611,12 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
     uint64_t deadline,
     NativeFeasibilityJumpGate *gate,
     int **selected,
-    int *selected_cardinality
+    int *selected_cardinality,
+    bool sustained,
+    double sustained_patience_seconds
 ) {
     if (
-        options->native_feasibility_jump_seconds <= 0.0 ||
+        (options->native_feasibility_jump_seconds <= 0.0 && !sustained) ||
         result->cardinality <= 1
     ) {
         return PROGRESSIVE_COVER_OK;
@@ -1648,6 +1650,7 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
         result->solution
     );
     if (
+        !sustained &&
         gate &&
         gate->has_failed_state &&
         incumbent_signature != 0 &&
@@ -1715,6 +1718,13 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
         }
         jump_options.deadline_nanoseconds = jump_deadline;
     }
+    if (sustained) {
+        jump_options.budget_mode = PROGRESSIVE_RWLS_BUDGET_WALL;
+        jump_options.deadline_nanoseconds = deadline;
+        jump_options.sustained_until_deadline = true;
+        jump_options.sustained_patience_seconds =
+            sustained_patience_seconds;
+    }
 
     int *jump_columns = NULL;
     int jump_cardinality = -1;
@@ -1730,6 +1740,29 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
             &jump_stats
         );
     free(incumbent_columns);
+    if (sustained) {
+        const char *stop = "finished";
+        if (jump_stats.patience_reached) {
+            stop = "patience";
+        } else if (jump_stats.deadline_reached) {
+            stop = "deadline";
+        }
+        fprintf(
+            stderr,
+            "CCUBES_PROGRESSIVE_NATIVE_TERMINAL_RESERVE_SEARCH "
+            "stop=%s patience_seconds=%.3f targets=%d/%d "
+            "last_improvement_seconds=%.3f seconds=%.3f\n",
+            stop,
+            sustained_patience_seconds,
+            jump_stats.targets_improved,
+            jump_stats.targets_attempted,
+            jump_stats.targets_improved > 0
+                ? (double)jump_stats
+                    .sustained_last_improvement_offset_nanoseconds / 1e9
+                : 0.0,
+            (double)jump_stats.elapsed_nanoseconds / 1e9
+        );
+    }
     result->native_feasibility_jump_runs++;
     result->native_feasibility_jump_targets_attempted +=
         jump_stats.targets_attempted;
@@ -1990,7 +2023,9 @@ static ProgressiveCoverStatus observe_native_adaptive_phase(
             overall_deadline,
             jump_gate,
             selected,
-            selected_cardinality
+            selected_cardinality,
+            false,
+            0.0
         );
         if (status != PROGRESSIVE_COVER_OK) return status;
     }
@@ -2473,6 +2508,18 @@ ProgressiveCoverStatus progressive_native_cover_run(
         options->native_repair_time_share > 1.0 ||
         !isfinite(options->native_feasibility_jump_seconds) ||
         options->native_feasibility_jump_seconds < 0.0 ||
+        !isfinite(options->native_terminal_reserve_seconds) ||
+        options->native_terminal_reserve_seconds < 0.0 ||
+        !isfinite(options->native_terminal_patience_seconds) ||
+        options->native_terminal_patience_seconds < 0.0 ||
+        (
+            options->native_terminal_reserve_seconds > 0.0 &&
+            !(
+                options->time_limit_seconds > 0.0 &&
+                options->native_terminal_reserve_seconds <
+                    options->time_limit_seconds
+            )
+        ) ||
         options->native_feasibility_jump_logical_families < 0 ||
         (
             options->native_feasibility_jump_logical_families > 0 &&
@@ -2512,9 +2559,12 @@ ProgressiveCoverStatus progressive_native_cover_run(
     uint64_t deadline = 0;
     result->native_started_nanoseconds = started;
     if (options->time_limit_seconds > 0.0) {
+        /* A terminal reserve ends ordinary search early; the reserve itself
+         * runs after the loop, from whatever point the loop stops. */
         deadline = native_deadline_after_seconds(
             started,
-            options->time_limit_seconds
+            options->time_limit_seconds -
+                options->native_terminal_reserve_seconds
         );
         const double repair_budget =
             options->time_limit_seconds *
@@ -2891,6 +2941,19 @@ ProgressiveCoverStatus progressive_native_cover_run(
             ? "work-calibrated-rolling-cardinality"
             : "hard"
     );
+    if (options->native_terminal_reserve_seconds > 0.0) {
+        fprintf(
+            stderr,
+            "CCUBES_PROGRESSIVE_NATIVE_TERMINAL_RESERVE "
+            "status=configured reserve_seconds=%.3f "
+            "ordinary_target_seconds=%.3f patience_seconds=%.3f "
+            "policy=sustained-mixed-wall\n",
+            options->native_terminal_reserve_seconds,
+            options->time_limit_seconds -
+                options->native_terminal_reserve_seconds,
+            options->native_terminal_patience_seconds
+        );
+    }
     int round = 1;
     int next_pool_snapshot = 0;
 resume_native_pricing:
@@ -3565,21 +3628,102 @@ resume_native_pricing:
         );
     }
 
+    /*
+     * Terminal reserve: once ordinary search has ended for good, spend the
+     * reserved seconds on sustained local search over the final pool. If the
+     * soft target has just been renewed, ordinary search resumes first and the
+     * reserve is considered again when it ends.
+     */
+    bool terminal_reserve =
+        options->native_terminal_reserve_seconds > 0.0 &&
+        result->cardinality > 1 &&
+        !(
+            final_deadline_renewed &&
+            !options->greedy_single_pricing_batch &&
+            !native_deadline_reached(deadline)
+        );
+    uint64_t terminal_deadline = 0;
+    const int terminal_before = result->cardinality;
+    const uint64_t terminal_started = native_monotonic_nanoseconds();
+    const int terminal_runs_before = result->native_feasibility_jump_runs;
+    const uint64_t terminal_iterations_before =
+        result->native_feasibility_jump_iterations;
+    /*
+     * Patience: end the reserve after this many seconds without a smaller
+     * cover. It never exceeds the time the ordinary search itself ran, so a
+     * run that stopped after two seconds is not followed by eight idle ones.
+     */
+    double terminal_patience = options->native_terminal_patience_seconds;
+    if (terminal_patience > 0.0) {
+        const double ordinary_seconds =
+            (double)(terminal_started - started) / 1e9;
+        if (ordinary_seconds < terminal_patience) {
+            terminal_patience = ordinary_seconds > 0.0
+                ? ordinary_seconds
+                : 1e-3;
+        }
+    }
+    if (terminal_reserve) {
+        const uint64_t span = native_deadline_after_seconds(
+            0,
+            options->native_terminal_reserve_seconds
+        );
+        terminal_deadline = UINT64_MAX - terminal_started < span
+            ? UINT64_MAX
+            : terminal_started + span;
+        if (deadline > 0 && UINT64_MAX - deadline >= span &&
+            deadline + span < terminal_deadline) {
+            terminal_deadline = deadline + span;
+        }
+        if (terminal_deadline <= terminal_started) {
+            terminal_reserve = false;
+            fprintf(
+                stderr,
+                "CCUBES_PROGRESSIVE_NATIVE_TERMINAL_RESERVE "
+                "status=skipped reason=no-time-left cover=%d\n",
+                result->cardinality
+            );
+        }
+    }
     status = apply_native_feasibility_jump(
         &master,
         &prepared,
         options,
         result,
-        progressive_native_phase_operator_deadline(
-            work_phases,
-            deadline
-        ),
+        terminal_reserve
+            ? terminal_deadline
+            : progressive_native_phase_operator_deadline(
+                work_phases,
+                deadline
+            ),
         &feasibility_jump_gate,
         &selected,
-        &selected_cardinality
+        &selected_cardinality,
+        terminal_reserve,
+        terminal_patience
     );
     if (status != PROGRESSIVE_COVER_OK) goto cleanup;
-    if (observe_native_soft_target(
+    if (terminal_reserve) {
+        const uint64_t terminal_finished = native_monotonic_nanoseconds();
+        fprintf(
+            stderr,
+            "CCUBES_PROGRESSIVE_NATIVE_TERMINAL_RESERVE "
+            "status=%s reserve_seconds=%.3f started_at=%.3f "
+            "seconds=%.3f cover=%d->%d columns=%d iterations=%llu\n",
+            result->native_feasibility_jump_runs > terminal_runs_before
+                ? "ran" : "skipped",
+            options->native_terminal_reserve_seconds,
+            (double)(terminal_started - started) / 1e9,
+            (double)(terminal_finished - terminal_started) / 1e9,
+            terminal_before,
+            result->cardinality,
+            master.count,
+            (unsigned long long)(
+                result->native_feasibility_jump_iterations -
+                terminal_iterations_before
+            )
+        );
+    } else if (observe_native_soft_target(
         &soft_target,
         result,
         &deadline,
@@ -3588,6 +3732,7 @@ resume_native_pricing:
         final_deadline_renewed = true;
     }
     if (
+        !terminal_reserve &&
         final_deadline_renewed &&
         !options->greedy_single_pricing_batch &&
         !native_deadline_reached(deadline) &&

@@ -121,6 +121,8 @@ Arguments with values accept either `--name VALUE` or `--name=VALUE`. A dash in 
 | `--ipc-effort` | `0`, `1`, `2` | Native IPC master effort; default `0`. |
 | `--profile-pricing` | `0`, `1` | IPC pricing telemetry; default off (`0`). |
 | `--ipc-time-limit` | Nonnegative seconds | Soft per-output IPC wall target; `0` disables. Finishing work can exceed the target. |
+| `--ipc-terminal-reserve` | Nonnegative seconds | Set aside part of the IPC target for sustained local search over the final pool. Default `0` disables it. A positive reserve requires a larger `--ipc-time-limit`. |
+| `--ipc-terminal-patience` | Nonnegative seconds | End the reserve early after a period without a smaller cover. The default is `8` seconds, capped at the duration of the main IPC search. Use `0` to disable early stopping for lack of progress. |
 
 The default solver remains the bundled hybrid solver, with effort 0 and complexity weights. Numeric solver values `0`/`1` and weights `0`/`1`/`2` are also accepted. `--threads 0` selects available cores, just like omitting the option. Invalid, empty, out-of-range, or partially numeric values are rejected before opening a debug log or starting minimization.
 
@@ -136,6 +138,8 @@ Short options still work as deprecated aliases during migration. The four former
 Use `--route ipc` for the native incremental prime-cover solver. It handles constant outputs directly and solves and merges supported outputs independently. With `--route auto`, eligible wide or dense inputs can select IPC. Ordinary-only requests such as checkpoints, certification, pooling, and an explicit Gurobi solver keep the ordinary route when automatic routing is selected. The `CCUBES_ROUTE` line records the choice and reason.
 
 IPC defaults to the native master at effort zero with greedy pricing, native repair, bounded recovery, and one final literal-polish pass. It runs without Gurobi. The ordinary route retains its optional Gurobi solver and falls back to the hybrid solver if Gurobi support was not built in. The IPC wall target is soft because current work and finalization may extend beyond it. On a single-output run, the solver can publish validated incumbents atomically as it progresses.
+
+For example, `--route ipc --ipc-time-limit 60 --ipc-terminal-reserve 15` gives the main IPC search a 45-second target and reserves up to 15 seconds for local search over the retained columns. The reserve can finish early after the patience interval or when the retained pool already has a proven minimum cover. The patience check runs between search rounds.
 
 Use `--pool-output` to retain a single-output IPC pool and `--pool-input` to validate and continue minimization from a compatible pool. These files have a different format from ordinary checkpoints. Restricted-master bounds and proofs apply to the retained pool. A global bound requires separate verification against the full pricing domain.
 

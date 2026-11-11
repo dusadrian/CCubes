@@ -497,7 +497,9 @@ void progressive_native_feasibility_jump_options_default(
         .deadline_nanoseconds = 0,
         .memory_budget_bytes = 0,
         .budget_mode = PROGRESSIVE_RWLS_BUDGET_WORK,
-        .worker_policy = PROGRESSIVE_RWLS_WORKER_MIXED
+        .worker_policy = PROGRESSIVE_RWLS_WORKER_MIXED,
+        .sustained_until_deadline = false,
+        .sustained_patience_seconds = 0.0
     };
 }
 
@@ -2079,9 +2081,13 @@ static bool search_target_adaptive(
 ) {
     const int target = incumbent_cardinality - 1;
     int best_failed_uncovered = workers[0].state.master->rows;
+    const bool sustained =
+        options->sustained_until_deadline &&
+        options->budget_mode == PROGRESSIVE_RWLS_BUDGET_WALL &&
+        options->deadline_nanoseconds > 0;
     for (
         int round = 0;
-        round < options->max_adaptive_rounds;
+        round < options->max_adaptive_rounds || sustained;
         ++round
     ) {
         if (
@@ -2089,6 +2095,17 @@ static bool search_target_adaptive(
             jump_deadline_reached(options->deadline_nanoseconds)
         ) {
             stats->deadline_reached = true;
+            break;
+        }
+        if (
+            sustained &&
+            options->sustained_patience_seconds > 0.0 &&
+            (double)(
+                jump_monotonic_nanoseconds() -
+                stats->sustained_last_progress_nanoseconds
+            ) >= options->sustained_patience_seconds * 1e9
+        ) {
+            stats->patience_reached = true;
             break;
         }
         for (int family = 0; family < family_count; ++family) {
@@ -2201,7 +2218,7 @@ static bool search_target_adaptive(
             best_failed_uncovered = round_best_uncovered;
         }
         if (stats->deadline_reached) break;
-        if (!recent_improvement) {
+        if (!recent_improvement && !sustained) {
             break;
         }
     }
@@ -2433,6 +2450,7 @@ progressive_native_feasibility_jump_improve(
     int best_cardinality = incumbent_cardinality;
     uint64_t work_epoch = 0;
     bool search_finished = false;
+    stats->sustained_last_progress_nanoseconds = started;
     while (best_cardinality > 1 && !search_finished) {
         const int epoch_start_improvements = stats->targets_improved;
         stats->work_epochs++;
@@ -2467,7 +2485,8 @@ progressive_native_feasibility_jump_improve(
                 !improved &&
                 options->worker_policy ==
                     PROGRESSIVE_RWLS_WORKER_MIXED &&
-                !stats->deadline_reached
+                !stats->deadline_reached &&
+                !stats->patience_reached
             ) {
                 int recovery_failed_uncovered = master->rows;
                 improved = search_target_adaptive(
@@ -2493,6 +2512,7 @@ progressive_native_feasibility_jump_improve(
                     best_failed_uncovered;
                 if (
                     !stats->deadline_reached &&
+                    !stats->patience_reached &&
                     stats->targets_improved > epoch_start_improvements
                 ) {
                     stats->productive_epoch_extensions++;
@@ -2510,6 +2530,18 @@ progressive_native_feasibility_jump_improve(
             );
             stats->targets_improved++;
             stats->final_cardinality = best_cardinality;
+            if (options->sustained_until_deadline) {
+                const uint64_t improved_at = jump_monotonic_nanoseconds();
+                stats->sustained_last_progress_nanoseconds = improved_at;
+                stats->sustained_last_improvement_offset_nanoseconds =
+                    improved_at - started;
+                fprintf(
+                    stderr,
+                    "CCUBES_RWLS_SUSTAINED_IMPROVEMENT cover=%d seconds=%.3f\n",
+                    best_cardinality,
+                    (double)(improved_at - started) / 1e9
+                );
+            }
         }
     }
     int *returned = (int *)malloc(

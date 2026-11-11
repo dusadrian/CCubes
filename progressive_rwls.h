@@ -53,6 +53,13 @@ typedef struct {
     uint64_t memory_budget_bytes;
     ProgressiveRWLSBudgetMode budget_mode;
     ProgressiveRWLSWorkerPolicy worker_policy;
+    /* Wall mode only: repeat adaptive rounds on a failed target until the
+     * deadline instead of stopping after the first failed round. */
+    bool sustained_until_deadline;
+    /* Sustained mode only: stop once this many seconds pass without a
+     * smaller cover (counted from the start or the last improvement);
+     * 0 keeps searching until the deadline. */
+    double sustained_patience_seconds;
 } ProgressiveNativeFeasibilityJumpOptions;
 
 typedef struct {
@@ -116,6 +123,11 @@ typedef struct {
     int64_t maximum_timestamp;
     uint64_t elapsed_nanoseconds;
     bool deadline_reached;
+    /* Sustained mode: time of the start or the last improvement, and
+     * whether the patience window ended the search. */
+    uint64_t sustained_last_progress_nanoseconds;
+    uint64_t sustained_last_improvement_offset_nanoseconds;
+    bool patience_reached;
     ProgressiveRWLSBudgetMode budget_mode;
 } ProgressiveNativeFeasibilityJumpStats;
 
