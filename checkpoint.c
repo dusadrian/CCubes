@@ -265,6 +265,20 @@ int load_checkpoint(
     if (ni == 0 || ni > INT_MAX || no == 0 || no > INT_MAX ||
         ck == 0 || ck > ni) goto FAIL;
 
+    if (bpw == 128u) {
+        /* Old files can safely reuse their packed PIs only if all input
+         * fields fit in the first uint64_t. Wider files may contain aliased bits. */
+        if ((uint64_t)ni * vbw > 64u) {
+            fprintf(stderr, "Error: legacy 128-bit checkpoint may contain invalid "
+                "prime implicants. Restart from the original PLA file.\n");
+            goto FAIL;
+        }
+        bpw = 64u;
+    }
+    if ((bpw != 8u && bpw != 16u && bpw != 32u && bpw != 64u) ||
+        vbw == 0 || vbw >= 64u || bpw % vbw != 0 ||
+        ipw != (ni - 1) / (bpw / vbw) + 1) goto FAIL;
+
     *ninputs = (int)ni;
     *noutputs = (int)no;
     *bits_per_word = (int)bpw;
@@ -345,7 +359,7 @@ int load_checkpoint(
         po->inputs = (int)ni;
         po->outputs = (int)no;
         {
-            int cov_bits = coverage_bits_per_word(*bits_per_word);
+            int cov_bits = *bits_per_word;
             po->pichart_words = (po->ON_minterms + cov_bits - 1) / cov_bits;
             po->cov_bits = cov_bits;
         }

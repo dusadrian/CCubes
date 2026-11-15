@@ -38,7 +38,7 @@ typedef struct {
 
 /* The public interface and help text share one registry. */
 static const Option option_table[] = {
-    {"bits-per-word", "b", true, BITS, "8, 16, 32, 64 (default), or 128"},
+    {"bits-per-word", "b", true, BITS, "8, 16, 32, or 64 (default). Legacy 128 uses 64"},
     {"threads", "t", true, THREADS, "CPU worker threads; 0 (default) uses available cores"},
     {"weights", "w", true, WEIGHTS, "none, complexity (default), or sharing"},
     {"solver", "s", true, SOLVER, "hybrid (default) or gurobi"},

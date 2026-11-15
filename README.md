@@ -51,6 +51,8 @@ For very large heuristic runs, CCubes can save its state into a binary checkpoin
 
 Checkpoint polling occurs during interruptible projection generation. A long covering solve can delay a save until generation next reaches a safe point. Checkpoints apply to ordinary runs without complete-prime certification. Version 11 saves the earliest unfinished task across workers. Versions 8 through 10 can still be resumed. The reader discards the retired continuation horizon from version 10. Version 8 replays the interrupted level from task zero while retaining its saved chart. Each save writes to an exclusive temporary file beside the target and replaces the previous checkpoint after the write succeeds.
 
+An older checkpoint saved with `--bits-per-word=128` can be loaded if its input fields fit in a single 64-bit word (up to 32 inputs when each uses two bits). For a wider legacy checkpoint, rerun from the original PLA because the saved prime implicants may be invalid.
+
 The binary checkpoint file can be inspected using the `--inspect` option with various progress information in the metadata.
 
 Compile the binary according to your system using `make`, with various options and customization indicated in the Makefile.
@@ -84,7 +86,7 @@ Arguments with values accept either `--name VALUE` or `--name=VALUE`. A dash in 
 
 | Argument | Value | Meaning |
 | --- | --- | --- |
-| `--bits-per-word` | `8`, `16`, `32`, `64`, `128` | Ordinary PI storage word width; default `64`. |
+| `--bits-per-word` | `8`, `16`, `32`, `64`, `128` | Ordinary PI packing width. The default is `64`. Legacy `128` uses `64`. |
 | `--threads` | Integer ≥ 0 | CPU worker threads; `0` (default) selects available cores. |
 | `--weights` | `none`, `complexity`, `sharing` | Ordinary cover weighting; default `complexity`. |
 | `--solver` | `hybrid`, `gurobi` | Ordinary cover solver; default `hybrid`. |

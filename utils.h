@@ -17,19 +17,6 @@
 #include "subsumption_index.h"
 #include "pichart_view.h"
 
-/*
- * Coverage bitsets (pichart_pos, and the per-thread pichart_values feeding
- * them) are stored in uint64_t words, so the number of coverage bits packed
- * per word can never exceed 64 -- shifting a uint64_t by 64 or more is
- * undefined behaviour, and on arm64 the shift count wraps modulo 64, which
- * silently aliases row r onto row r-64. The -b switch selects the *implicant*
- * packing width and is allowed to be 128, so coverage packing must be clamped
- * independently of it.
- */
-static inline int coverage_bits_per_word(int bits_per_word) {
-    return bits_per_word > 64 ? 64 : bits_per_word;
-}
-
 void error_message(const char *msg);
 
 void destroy_output_locks(

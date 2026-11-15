@@ -21,9 +21,8 @@
  * instead of one int is what keeps large charts tractable: a 25k-row chart
  * costs ~3 KB per PI packed, against ~100 KB per PI dense.
  *
- * cov_bits is the coverage packing width (always <= 64, see
- * coverage_bits_per_word in utils.h) and travels with the view so consumers
- * never need to know the -b implicant packing width.
+ * cov_bits is the coverage packing width (at most 64). It travels with the
+ * view so consumers can index the chart without reading CLI settings.
  */
 typedef struct {
     const uint64_t *bits; /* cols * words */

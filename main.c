@@ -794,7 +794,8 @@ int main(int argc, char *argv[]) {
     // defaults
     int search_level = 1;
     const int STOP_AFTER_EQUALITY = 1;
-    int BITS_PER_WORD = options.bits_per_word;
+    // The legacy 128 option uses the same uint64_t packing as 64.
+    int BITS_PER_WORD = options.bits_per_word == 128 ? 64 : options.bits_per_word;
     int THREADS = options.threads;
     bool THREADS_FORCED = THREADS > 0;
     int WEIGHT_PIC = options.weights;
@@ -2080,7 +2081,7 @@ int main(int argc, char *argv[]) {
 
     // Ensure pichart_words are aligned with the coverage packing width
     // (already set on load for resume)
-    const int COV_BITS_PER_WORD = coverage_bits_per_word(BITS_PER_WORD);
+    const int COV_BITS_PER_WORD = BITS_PER_WORD;
     PInfo[0].pichart_words = (PInfo[0].ON_minterms + COV_BITS_PER_WORD - 1) / COV_BITS_PER_WORD;
     PInfo[0].cov_bits = COV_BITS_PER_WORD;
     for (int o = 0; o < noutputs; o++) {
