@@ -13,7 +13,7 @@ The public solver uses formal command-line arguments. The table below records th
 
 CCubes reads its application settings from command-line arguments. OpenMP and Gurobi still read their own runtime settings, including the Gurobi license configuration.
 
-The ordinary executable retains the existing automatic projection/MMCS policy, certified complete-prime enumeration, hybrid effort profiles, bounded plateau probe, and automatic pool budgets. Removing an experimental override does not remove algorithms already used by the normal policy. Internal search budgets remain implementation constants; they have not been expanded into new public tuning options.
+The ordinary executable retains the existing automatic projection/MMCS policy, certified complete-prime enumeration, hybrid effort profiles, the one-cube shortcut, and automatic pool budgets. Removing an experimental override does not remove algorithms already used by the normal policy. Internal search budgets remain implementation constants; they have not been expanded into new public tuning options.
 
 ## Command-line migration
 
@@ -27,7 +27,6 @@ Long names are canonical in help, examples, and maintained integration tests. Va
 | `-s0`, `-s1` | `--solver hybrid`, `--solver gurobi` |
 | `-e0`, `-e1`, `-e2` | `--effort 0`, `--effort 1`, `--effort 2` |
 | `-d` | `--deterministic` |
-| `-g` | `--blocking-diagnostic` |
 | `-c` | `--certify` |
 | `-p` | `--pool` |
 | `-l3600=run.chk` | `--time-limit 3600 --checkpoint run.chk` |
@@ -41,7 +40,7 @@ Long names are canonical in help, examples, and maintained integration tests. Va
 
 The parser lives in `cli.c`/`cli.h`. One option registry supplies name matching, value requirements, and help descriptions. Parsing does not open files. `main.c` receives explicit settings, and the lock profiler receives an explicit Boolean. This keeps future configuration additions reviewable in one place.
 
-The writer uses checkpoint version 9. When resuming version 8, CCubes replays the interrupted generation level from task zero. Resume restores the saved word width, weights, solver, and pool settings. Supply invocation-specific controls again as needed. Ordinary runs fall back to the bundled hybrid solver when Gurobi is unavailable.
+The writer uses checkpoint version 11. The reader accepts versions 8 through 11. When resuming version 8, CCubes replays the interrupted generation level from task zero. Resume restores the saved word width, weights, solver, and pool settings. Supply invocation-specific controls again as needed. Ordinary runs fall back to the bundled hybrid solver when Gurobi is unavailable.
 
 ## IPC configuration
 

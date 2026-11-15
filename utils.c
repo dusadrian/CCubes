@@ -2394,9 +2394,9 @@ int print_info(const char *INFO_PATH, const int info_level) {
     printf("Checkpoint version: %u\n", (unsigned)version);
     // printf("Bits per word: %d, value bit width: %d, implicant words: %d\n", bpw, vbw, ipw);
     printf("Level k reached: %d\n", ck);
-    const char *stopping_policy = certified_model_supported(pi_tmp, ni, no)
-        ? "adaptive heuristic"
-        : heuristic_pattern_model_supported(pi_tmp, ni, no)
+    const char *stopping_policy =
+        certified_model_supported(pi_tmp, ni, no) ||
+        heuristic_pattern_model_supported(pi_tmp, ni, no)
             ? "heuristic plateau"
             : "unsupported";
     printf("Stopping policy: %s\n", stopping_policy);

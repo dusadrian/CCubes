@@ -84,13 +84,14 @@ endif
 # Explicit membership prevents stray experimental files entering production.
 SRC := binomial.c bounded_mmcs.c ccubes_threads.c certified_stop.c \
   checkpoint.c cover_validation.c debug.c gurobi.c \
-  lagrangian.c lock_stats.c main.c plateau_probe.c \
+  lagrangian.c lock_stats.c main.c one_cube.c \
   pool_selection.c prime_check.c \
   progressive_column_pool.c progressive_cover.c progressive_dual_calibration.c \
   progressive_global_bound.c progressive_greedy_price.c progressive_input.c progressive_literal_polish.c \
   progressive_native_cover.c progressive_native_master.c progressive_native_phase_policy.c progressive_native_reduce_expand.c \
   progressive_native_repair.c progressive_rwls.c progressive_seed.c progressive_validation.c \
-  subsumption_index.c utils.c cli.c \
+  subsumption_index.c cover_domain.c cover_encoding.c native_sat.c native_sat_verify.c \
+  ipc_weighted_cover.c ipc_weighted_verify.c systematic_certify.c utils.c cli.c \
   runtime_options.c
 OBJ  := $(SRC:.c=.o)
 DEP  := $(OBJ:.o=.d)
@@ -215,5 +216,23 @@ $(BIN): $(OBJ) .build-config
 
 clean:
 	rm -f $(OBJ) $(DEP) $(BIN) .build-config .build-config.tmp
+
+.PHONY: test test-native-sat test-ipc-weighted-cover test-systematic-cli
+test: test-native-sat test-ipc-weighted-cover test-systematic-cli
+
+test-native-sat:
+	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' 0; \
+	$(CC) -Wall -O2 -std=c11 -I. -DNSAT_TESTING tests/test_native_sat.c native_sat.c native_sat_verify.c cover_encoding.c cover_domain.c -o "$$dir/solver"; \
+	$(CC) -Wall -O2 -std=c11 -I. -DNSAT_TESTING tests/test_native_sat_verify.c native_sat_verify.c -o "$$dir/checker"; \
+	"$$dir/solver"; \
+	"$$dir/checker"
+
+test-ipc-weighted-cover:
+	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' 0; \
+	$(CC) -Wall -O2 -std=c11 -I. tests/test_ipc_weighted_cover.c ipc_weighted_cover.c ipc_weighted_verify.c -o "$$dir/cover" -lm; \
+	"$$dir/cover"
+
+test-systematic-cli: $(BIN)
+	sh tests/test_systematic_certify.sh ./$(BIN)
 
 -include $(DEP)

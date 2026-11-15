@@ -8,15 +8,9 @@ The minimization process is extremely efficient with incompletely specified func
 
 It employs a bottom-up search strategy, starting from the simplest combinations of 1 input, 2 inputs etc. and gradually increases the complexity. After each such level, it solves the minterm matrix and evaluates whether deeper prime implicants can still change the result.
 
-The default `--solver=hybrid --effort=0` profile is deliberately the fastest hybrid heuristic. Before stopping at the first unchanged cover cardinality, it runs one small bounded plateau probe; if the probe does not improve the cover, `--effort=0` stops and never triggers automatic certification. The optional `--blocking-diagnostic` diagnostic may describe the plateau, but it does not change this policy. An explicit `--certify` instead enumerates the complete prime chart and requires an exact cover of that chart.
+For binary point inputs, ordinary automatic generation starts with a one-cube shortcut. It finds the conditions shared by all ON rows, checks the resulting cube against OFF, and drops redundant literals to obtain a prime. Each output solved this way skips PI generation. Other outputs stop at the first unchanged cover cardinality. Use `--certify` for a global certificate.
 
-For fully specified binary point rows, `--effort=1`, `--effort=2`, and the Gurobi boundary profile use the same heuristic plateau policy unless `--certify` is requested. A one-term cover stops immediately because no nonempty function can use fewer terms. Before any hybrid effort profile accepts its first unchanged boundary value, CCubes performs one bounded plateau probe. It pairs private witnesses from different incumbent terms, maintains exact OFF-row blocker counts while expanding their agreement cubes, and prefers safe literal deletions that admit the most additional ON rows. Opposite deterministic tie orders provide candidate diversity. The probe adds only non-dominated prime candidates. The `--effort=0` and `--effort=1` budget examines at most 128 pairs and appends at most 32 candidates; `--effort=2` raises those caps to 1024 and 128. Candidates are retained only when re-solving the chart reduces cover cardinality; otherwise CCubes rolls them back. Probe exhaustion is not a certificate.
-
-If the probe does not improve the cover, CCubes applies the existing adaptive diagnostic. Because this warning is cover-dependent, CCubes first checks the retained equal-cardinality solution pool and substitutes a warning-free tied cover when one exists. An unresolved warning preserves the best heuristic cover; it no longer triggers the discarded support-horizon march. Run with `--certify` when a global certificate is required.
-
-The small `examples/certified_F2.pla` instance demonstrates the plateau probe under every hybrid effort profile. Its ordinary boundary cover has two terms at levels one and two. At the level-two plateau, the probe constructs the delayed prime and obtains the one-term cover without enumerating level three, including under the default `--effort=0` profile.
-
-Input-dash PLA pattern rows are accepted through a separate, explicitly announced heuristic path, with direct handling of constant outputs. That path uses the first plateau and does not claim the point-row blocking diagnostic or a global certificate; `--certify` is rejected.
+Input-dash PLA pattern rows are accepted through a separate, explicitly announced heuristic path, with direct handling of constant outputs. That path uses the first plateau. Complete-prime certification requires binary point rows.
 
 Minimum covering of the PI chart is NP-hard. The `--solver=gurobi` option delegates this boundary problem to the Gurobi optimizer. For compilation, Gurobi's path is configured in the Makefile and may need to be adjusted for the local installation and operating system. At runtime, Gurobi searches for a valid license; academic licences are available from Gurobi.
 
@@ -26,7 +20,7 @@ If no weights are applied, the combination of prime implicants that cover the ON
 
 Two weighting options are available, for instance the default `--weights=complexity` for weight based on complexity levels (prime implicants with lower number of literals will be given more weight). The option `--weights=sharing` adds additional weight if a prime implicant is shared between multiple outputs.
 
-The Boolean option `--pool` enables equal-cardinality cover pooling. The ordinary boundary solver always runs first, so pooling cannot replace its incumbent with a worse local cover. Alternative-cover discovery is deferred until the boundary remains on a plateau after the bounded plateau probe; if the probe lowers cardinality, CCubes keeps the improved ordinary incumbent and skips that pool solve. On a retained plateau, CCubes chooses a small candidate-discovery budget automatically from the observed PI-chart width: it grows logarithmically and is capped at 20 covers per output. Exact-boundary pooling collects alternative incumbents opportunistically instead of proving a complete ranking of the pool. The preferred incumbent and up to ten solver-ranked seed covers are preserved; remaining candidates are prioritized by marginal cross-output value. A cover is useful when it improves the best cube overlap available to candidate covers of another output, while near-duplicates have diminishing priority. Within the hard cap, CCubes conservatively retains any cover containing an exact cube match in another output's candidate landscape, because higher-order coordination can make such a cover useful even when its pairwise marginal score is zero. The selected discovery limit and generated/valuable/discarded counts are reported in diagnostic output, so experiments remain reproducible without asking users to guess a pool size.
+The Boolean option `--pool` enables equal-cardinality cover pooling. The ordinary boundary solver always runs first, so pooling cannot replace its incumbent with a worse local cover. Alternative-cover discovery starts when the boundary reaches a plateau. On a retained plateau, CCubes chooses a small candidate-discovery budget automatically from the observed PI-chart width: it grows logarithmically and is capped at 20 covers per output. Exact-boundary pooling collects alternative incumbents opportunistically instead of proving a complete ranking of the pool. The preferred incumbent and up to ten solver-ranked seed covers are preserved; remaining candidates are prioritized by marginal cross-output value. A cover is useful when it improves the best cube overlap available to candidate covers of another output, while near-duplicates have diminishing priority. Within the hard cap, CCubes conservatively retains any cover containing an exact cube match in another output's candidate landscape, because higher-order coordination can make such a cover useful even when its pairwise marginal score is zero. The selected discovery limit and generated/valuable/discarded counts are reported in diagnostic output, so experiments remain reproducible without asking users to guess a pool size.
 
 After all outputs have reached their stopping boundary, CCubes performs one final coordination pass over every retained final-level pool, including outputs that stopped earlier. It selects one cover per output whose union contains as few distinct cube rows as possible. Among unions with the same number of rows, it then selects the one with the fewest exact input literals; each output's cheapest-literal tied cover is preserved during pool compaction so this secondary choice is not lost before coordination. The Cartesian product is searched exactly when it contains at most two million tuples; larger products use a deterministic three-start coordinate search. This is an optional lexicographic quality objective over the available candidates, not a proof of the globally smallest shared cover outside the retained pool. With the bundled hybrid solver, “equal-cardinality” means equal to its best feasible cover and is globally optimal only when the reported lower and upper bounds meet. Activating `--pool` automatically selects `--weights=sharing`.
 
@@ -55,7 +49,7 @@ For very large heuristic runs, CCubes can save its state into a binary checkpoin
   --checkpoint-every 3600 --resume output096.chk
 ```
 
-Checkpoint polling occurs during interruptible projection generation. A long covering solve can delay a save until generation next reaches a safe point. Checkpoints apply to ordinary runs without complete-prime certification. Checkpoint version 9 stores the earliest unfinished task across workers. Resuming a version 8 file replays the interrupted level from task zero while retaining its saved chart. Each save writes to an exclusive temporary file beside the target and replaces the previous checkpoint after the write succeeds.
+Checkpoint polling occurs during interruptible projection generation. A long covering solve can delay a save until generation next reaches a safe point. Checkpoints apply to ordinary runs without complete-prime certification. Version 11 saves the earliest unfinished task across workers. Versions 8 through 10 can still be resumed. The reader discards the retired continuation horizon from version 10. Version 8 replays the interrupted level from task zero while retaining its saved chart. Each save writes to an exclusive temporary file beside the target and replaces the previous checkpoint after the write succeeds.
 
 The binary checkpoint file can be inspected using the `--inspect` option with various progress information in the metadata.
 
@@ -70,6 +64,7 @@ Use descriptive long options. Options taking values accept either `--name VALUE`
 ```sh
 ./ccubes --threads 8 --solver hybrid --effort 1 --pool source.pla result.pla
 ./ccubes --certify --deterministic source.pla result.pla
+./ccubes --certify-systematic --deterministic source.pla result.pla
 ./ccubes --route ipc --threads 8 --ipc-time-limit 180 source.pla result.pla
 ./ccubes --inspect run.chk --inspect-level 1
 ```
@@ -96,7 +91,15 @@ Arguments with values accept either `--name VALUE` or `--name=VALUE`. A dash in 
 | `--effort` | `0`, `1`, `2` | Ordinary hybrid solver effort; default `0`. |
 | `--deterministic` | — | Canonicalize ordinary PI ordering; not a guarantee of identical time-limited or IPC results. |
 | `--certify` | — | Complete-prime enumeration and exact cover for supported binary point inputs. |
-| `--blocking-diagnostic` | — | Report the ordinary adaptive blocking diagnostic at the first plateau. |
+| `--certify-systematic` | — | Certify each ordinary output with IPC global pricing, weighted integer search and SAT as needed. |
+| `--systematic-weighted-seconds` | Nonnegative seconds | Weighted search and bound checking per output. Default 10. Set to `0` to skip this stage. |
+| `--systematic-weighted-work` | Nonnegative integer | Work limit for weighted search and bound checking per output. Default `0` has no separate work limit. |
+| `--systematic-native-sat-seconds` | Nonnegative seconds | Native SAT and checking per unresolved output. Default 2. Set to `0` to skip SAT. |
+| `--systematic-certification-seconds` | Nonnegative seconds | Legacy shared budget per output, including IPC pricing. `0` allows the cardinality floor only. |
+| `--systematic-certification-work` | Nonnegative integer | Work per output across weighted integer search, SAT and checking. Default `0` is unlimited. |
+| `--systematic-descent` | `fresh`, `reuse` | Fresh SAT instances per target (default) or experimental reuse after a checked SAT cover. |
+| `--systematic-strengthening` | `none\|groups\|ordering\|combined` | Experimental native cover SAT strengthening. Default `none`. |
+| `--systematic-sat-seconds` | Nonnegative seconds | Legacy budget for weighted integer search and SAT, excluding the initial IPC pricing pass. `0` allows the initial pricing pass only. |
 | `--pool` | — | Enable bounded equal-cardinality cover pooling; implies sharing weights. |
 | `--lock-stats` | — | Report PI-insertion lock contention. |
 | `--time-limit` | Nonnegative seconds | Ordinary generation budget before checkpoint and exit; `0` disables. |
@@ -132,6 +135,28 @@ Resume retains the existing checkpoint behavior: saved word width, weights, solv
 
 Short options still work as deprecated aliases during migration. The four former `CCUBES_*` environment switches are retired. See [CONFIGURATION.md](CONFIGURATION.md) for the migration table.
 
+
+## Systematic certification
+
+`--certify-systematic` certifies the ordinary solution at its normal stopping point on binary point inputs. It first uses IPC global pricing to lower-bound the cube count for each output. If a gap remains, a bounded integer search enumerates maximal legal sets of ON rows and uses exact integer weights to exclude sets that cannot belong to a cover at the target size. An independent checker reconstructs legal cubes from the care rows and verifies any stronger lower bound before it can affect certification. Input masks, ON-row sets and OFF-row storage are sized to the instance. The stage reports `method=ipc-weighted-integer` when its checked bound closes the gap.
+
+Root pricing can continue beyond 1,024 passes while the last 256 passes have improved the fractional bound. The extension uses up to 64 million additional work units and at most a quarter of the remaining work allowance. The weighted stage checks and retains the bound from its initial weights before searching.
+
+If the checked bound is more than one cube below the incumbent, the weighted stage first tries to decide whether a cover at the lower bound exists. This search uses at most 128 million work units and at most half of any remaining work allowance. Its independent check uses the remaining stage budget. A checked refutation raises the lower bound by one. If the gap remains, the stage searches for a cover one cube smaller than the incumbent. Eligible nodes are re-priced during search. After extended root pricing, the lower-target probe uses the strengthened root weights. Search also uses fixed weights when the additional workspace would exceed the memory limit.
+
+Unresolved targets go to the built-in SAT solver. It asks for one fewer cube directly from the ON and OFF rows. Its independent in-process hint checker verifies refutations, reported as `method=native-rup`. Both search stages validate a smaller cover before using it. Each stage is subject to a 128 MiB solver memory budget. If any output remains unproved, the command exits unsuccessfully and preserves the destination. The certificate concerns scalar cube counts. The merged PLA row count is a separate objective.
+
+The default allowances are **10 seconds for weighted search and bound checking** after initial IPC pricing and **2 seconds for SAT and checking** after the weighted stage and validation of any improved cover. Each clock starts when its stage begins. SAT shares its allowance across all smaller-cover targets for that output. For example, give SAT up to five minutes on each unresolved output with `--certify-systematic --systematic-native-sat-seconds=300`. A memory or work limit can end either stage earlier.
+
+`--systematic-weighted-work` can bound the weighted stage independently. If you set a finite `--systematic-certification-work` limit, it applies to both stages and their checks. When SAT is enabled, weighted search and bound checking can use at most half of that shared work limit. The legacy time flags `--systematic-certification-seconds` and `--systematic-sat-seconds` retain their shared-clock behavior, including the one-second and 512-million-unit weighted caps. Supply either legacy time flag on its own or use the separate stage options.
+
+With `--systematic-descent=reuse`, a checked SAT cover can be followed by a tighter target in the same solver and checker. Variable IDs stay fixed and the checker adds the new bound as a permanent unit. All native attempts for an output share its work and time budget. Query records report `reused` and `formula_slots`.
+
+Experimental strengthening supports scalar queries with up to 96 ON rows and 128 OFF rows. The work and memory budgets cover input masks of any supported encoding width. `groups` adds independently checked clauses that forbid incompatible pairs and selected triples from sharing a term. `ordering` reorders the ON rows, establishes tighter slot-use implications and prioritizes row-to-slot variables. `combined` enables both. Queries beyond the row limits use the base formula and search.
+
+Certification runs independent outputs concurrently using up to `--threads`, capped at 12 active outputs. Each active output gets its own solver, checker and budget. Multi-output runs give each pricing call one thread. For a single output, IPC pricing can use the requested threads while SAT runs on one thread. `CCUBES_SYSTEMATIC_BATCH` reports the worker count and elapsed certification time.
+
+Run `make test` to check the native solver, proof checker, weighted cover search and certification CLI.
 
 ## Native IPC
 

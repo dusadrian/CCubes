@@ -18,12 +18,13 @@
 #include "cli.h"
 #include "runtime_options.h"
 #include "certified_stop.h"
+#include "systematic_certify.h"
 #include "checkpoint.h"
 #include "file_replace.h"
 #include "lock_stats.h"
 #include "ccubes_threads.h"
 #include "pool_selection.h"
-#include "plateau_probe.h"
+#include "one_cube.h"
 #include "bounded_mmcs.h"
 #include "progressive_cover.h"
 #include "progressive_column_pool.h"
@@ -808,7 +809,7 @@ int main(int argc, char *argv[]) {
      */
     bool DETERMINISTIC_PI_ORDER = options.deterministic;
     const bool CERTIFIED_MODE = options.certify;
-    bool REPORT_BLOCKING_DIAGNOSTIC = options.blocking_diagnostic;
+    const bool CERTIFY_SYSTEMATIC = options.certify_systematic;
     bool PROGRESSIVE_COVER = options.progressive_cover;
     CCubesRouteMode ROUTE_MODE = CCUBES_ROUTE_ORDINARY;
     bool ROUTE_MODE_FROM_FLAG = options.route != NULL;
@@ -846,6 +847,11 @@ int main(int argc, char *argv[]) {
         if (!ROUTE_MODE_FROM_FLAG) route_source = "flag";
     } else if (ROUTE_MODE == CCUBES_ROUTE_PROGRESSIVE) {
         PROGRESSIVE_COVER = true;
+    }
+
+    if (CERTIFY_SYSTEMATIC && (CERTIFIED_MODE || PROGRESSIVE_COVER || INFO_PATH)) {
+        fprintf(stderr, "Error: --certify-systematic requires ordinary minimization and cannot be combined with --certify.\n");
+        return 1;
     }
 
     #ifdef HAVE_GUROBI
@@ -906,7 +912,6 @@ int main(int argc, char *argv[]) {
         PROGRESSIVE_COVER &&
         (
             CERTIFIED_MODE ||
-            REPORT_BLOCKING_DIAGNOSTIC ||
             POOL_MAX > 1 ||
             WEIGHT_PIC != 1 ||
             SCP_TYPE != 0 ||
@@ -939,10 +944,10 @@ int main(int argc, char *argv[]) {
         route_block_reason = "periodic-checkpoint";
     } else if (CERTIFIED_MODE) {
         route_block_reason = "certified-mode";
+    } else if (CERTIFY_SYSTEMATIC) {
+        route_block_reason = "systematic-certification";
     } else if (HYBRID_EFFORT_LEVEL != 0) {
         route_block_reason = "hybrid-effort-level";
-    } else if (REPORT_BLOCKING_DIAGNOSTIC) {
-        route_block_reason = "blocking-diagnostic";
     } else if (POOL_MAX > 1) {
         route_block_reason = "cover-pooling";
     } else if (WEIGHT_PIC != 1) {
@@ -1094,7 +1099,7 @@ int main(int argc, char *argv[]) {
     }
 
     CertifiedStopState *certified_states = NULL;
-    bool adaptive_stopping_supported = certified_model_supported(
+    bool binary_points_supported = certified_model_supported(
         PInfo,
         ninputs,
         noutputs
@@ -1104,15 +1109,6 @@ int main(int argc, char *argv[]) {
         ninputs,
         noutputs
     );
-    const bool fast_hybrid_heuristic =
-        adaptive_stopping_supported &&
-        SCP_TYPE == 0 &&
-        HYBRID_EFFORT_LEVEL == 0 &&
-        !CERTIFIED_MODE;
-    const bool adaptive_warning_enabled =
-        adaptive_stopping_supported &&
-        !fast_hybrid_heuristic &&
-        !CERTIFIED_MODE;
 
     /*
      * The routing decision. This is the earliest point at which the file's
@@ -1133,7 +1129,7 @@ int main(int argc, char *argv[]) {
         );
     } else if (route_block_reason) {
         route_report("e0", "ineligible", route_block_reason, &route_features);
-    } else if (!adaptive_stopping_supported) {
+    } else if (!binary_points_supported) {
         /*
          * Every progressive measurement in `docs/` was taken on nonconflicting,
          * fully specified binary point rows. Anything else keeps the ordinary
@@ -1179,12 +1175,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (!adaptive_stopping_supported && CERTIFIED_MODE) {
+    if (!binary_points_supported && CERTIFIED_MODE) {
         fprintf(
             stderr,
             "Error: --certify certified stopping requires nonconflicting, fully "
             "specified binary point rows.\n"
         );
+        free(chk_stop_counter);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+
+    if (!binary_points_supported && CERTIFY_SYSTEMATIC) {
+        fprintf(stderr, "Error: --certify-systematic requires nonconflicting binary point rows.\n");
         free(chk_stop_counter);
         cleanup(PInfo, NULL);
         return 1;
@@ -2050,39 +2053,15 @@ int main(int argc, char *argv[]) {
         );
     }
 
-    /*
-     * Worker-side support unranking calls nchoosek repeatedly. Build the
-     * read-only Pascal table before any PI-generation threads can start.
-     */
-    if (!nchoosek_prepare(ninputs)) {
-        fprintf(stderr, "Error: binomial lookup-table allocation failed.\n");
-        free(chk_stop_counter);
-        cleanup(PInfo, NULL);
-        return 1;
-    }
-
     if (CERTIFIED_MODE) {
         fprintf(stderr, "Notice: --certify uses complete-prime MMCS certification.\n");
     }
 
-    if (!adaptive_stopping_supported) {
+    if (!binary_points_supported) {
         fprintf(
             stderr,
             "Notice: input-dash pattern rows detected; using heuristic plateau stopping. "
-            "Adaptive pair diagnosis and certified stopping are unavailable.\n"
-        );
-        if (REPORT_BLOCKING_DIAGNOSTIC) {
-            fprintf(
-                stderr,
-                "Notice: --blocking-diagnostic is ignored because the blocking diagnostic requires point rows.\n"
-            );
-            REPORT_BLOCKING_DIAGNOSTIC = false;
-        }
-    } else if (fast_hybrid_heuristic) {
-        fprintf(
-            stderr,
-            "Notice: hybrid effort 0 uses fast heuristic plateau stopping; "
-            "automatic certification is disabled.\n"
+            "Certified stopping is unavailable.\n"
         );
     }
 
@@ -2168,12 +2147,20 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    int bit_index[ninputs];  //
+    int word_index[ninputs]; //   for the implicants matrix
+    uint64_t shifted_mask[ninputs];
+    for (int r = 0; r < ninputs; r++) {
+        bit_index[r] = (r % (BITS_PER_WORD / value_bit_width)) * value_bit_width;   // Bit position within the word
+        word_index[r] = r / (BITS_PER_WORD / value_bit_width);                      // Word index within the implicant
+        shifted_mask[r] = (VALUE_BIT_MASK << bit_index[r]);
+    }
+
+    const bool try_one_cube = !RESUME_PATH && !CERTIFIED_MODE && binary_points_supported;
+    int cube[ninputs];
     int stop_counter[noutputs];
-    BlockingStopState blocking_stop_states[noutputs];
     // Initialize per-output state (allocate only if not resuming)
     for (int o = 0; o < noutputs; o++) {
-        certified_blocking_state_init(&blocking_stop_states[o]);
-
         // --- temporary debugging code ---
         // printf("Output %d, ON_minterms: %d, OFF_minterms: %d\n", o + 1, PInfo[o].ON_minterms, PInfo[o].OFF_minterms);
         // --------------------------------
@@ -2184,16 +2171,27 @@ int main(int argc, char *argv[]) {
         const bool constant_one =
             ON_minterms > 0 && PInfo[o].OFF_minterms <= 0;
         const bool constant_output = constant_zero || constant_one;
+        int cube_width = 0;
+        if (try_one_cube && !constant_output) {
+            cube_width = find_one_cube(&PInfo[o], ninputs, cube);
+            if (cube_width < 0) {
+                fprintf(stderr, "Error: one-cube shortcut allocation failed for output %d.\n", o + 1);
+                cleanup(PInfo, buffer);
+                return 1;
+            }
+        }
+        const bool solved_output = constant_output || cube_width > 0;
+        const bool one_term = constant_one || cube_width > 0;
 
         /*
          * Retained PI arrays grow transactionally.  A fixed 500,000-column
          * reservation per output made the virtual chart scale with
          * outputs * ON rows before one PI had been found.  Share one bounded
-         * initial memory envelope across active outputs instead; constants
-         * need at most one synthetic all-dash column.
+         * initial memory envelope across active outputs. Outputs resolved at
+         * startup need space for at most one column.
          */
         if (!RESUME_PATH) {
-            PInfo[o].estimPI = constant_output
+            PInfo[o].estimPI = solved_output
                 ? 1
                 : initial_pi_capacity;
         } else {
@@ -2282,13 +2280,13 @@ int main(int argc, char *argv[]) {
         }
 
         if (!RESUME_PATH) {
-            PInfo[o].foundPI = constant_one ? 1 : 0;
-            PInfo[o].solmin = constant_one ? 1 : 0;
+            PInfo[o].foundPI = one_term ? 1 : 0;
+            PInfo[o].solmin = one_term ? 1 : 0;
         }
 
         // the previous (level k - 1), minimum number of PIs to solve the coverage matrix
         if (!RESUME_PATH) {
-            PInfo[o].prevsolmin = constant_one
+            PInfo[o].prevsolmin = one_term
                 ? 1
                 : (constant_zero ? 0 : ON_minterms + 1);
         }
@@ -2315,7 +2313,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (!RESUME_PATH) {
-            PInfo[o].ON_set_covered = constant_output;
+            PInfo[o].ON_set_covered = solved_output;
         }
 
         if (ON_minterms > 0 && !PInfo[o].cov_word_index) {
@@ -2341,12 +2339,24 @@ int main(int argc, char *argv[]) {
             PInfo[o].cov_word_index[r] = r / COV_BITS_PER_WORD;
             PInfo[o].shifted_cov_mask[r] = (1ULL << (r % COV_BITS_PER_WORD));
         }
-        if (!RESUME_PATH && constant_one) {
+        if (!RESUME_PATH && one_term) {
             for (int word = 0; word < PInfo[o].pichart_words; ++word) {
                 int remaining = ON_minterms - word * COV_BITS_PER_WORD;
                 PInfo[o].pichart_pos[word] = remaining >= 64
                     ? UINT64_MAX
                     : (UINT64_C(1) << remaining) - 1u;
+            }
+            if (cube_width > 0) {
+                for (int i = 0; i < ninputs; ++i) {
+                    if (cube[i] == 0) continue;
+                    PInfo[o].implicants_pos[word_index[i]] |= shifted_mask[i];
+                    PInfo[o].implicants_val[word_index[i]] |=
+                        (uint64_t)(cube[i] - 1) << bit_index[i];
+                }
+                DBG_INFO_BLOCK {
+                    fprintf(debug_out, "CCUBES_ONE_CUBE output=%d literals=%d\n",
+                            o + 1, cube_width);
+                }
             }
             PInfo[o].covsum[0] = ON_minterms;
             PInfo[o].covered[0] = ON_minterms;
@@ -2360,18 +2370,6 @@ int main(int argc, char *argv[]) {
         } else {
             stop_counter[o] = 0;
         }
-        if (adaptive_stopping_supported && RESUME_PATH && stop_counter[o] > 0) {
-            blocking_stop_states[o].reported = true;
-            if (!PInfo[o].stop_search) {
-                PInfo[o].stop_search = true;
-                fprintf(
-                    stderr,
-                    "Notice: output %d resumed at a stored heuristic plateau; "
-                    "use a fresh --certify run for global certification.\n",
-                    o + 1
-                );
-            }
-        }
 
         // store the number of PIs at each level of complexity k
         if (!PInfo[o].nofpi) {
@@ -2382,13 +2380,13 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
-        if (!RESUME_PATH && constant_one && ninputs > 0) {
+        if (!RESUME_PATH && one_term && ninputs > 0) {
             PInfo[o].nofpi[0] = 1;
         }
 
         // Preserve stop status when resuming; otherwise initialize it.
         if (!RESUME_PATH) {
-            PInfo[o].stop_search = constant_output;
+            PInfo[o].stop_search = solved_output;
         }
 
         PInfo[o].solution = NULL;
@@ -2401,17 +2399,17 @@ int main(int argc, char *argv[]) {
                 cleanup(PInfo, buffer);
                 return 1;
             }
-            if (constant_one) {
+            if (PInfo[o].stop_search && PInfo[o].solmin == 1) {
                 PInfo[o].pool_solutions[0] = (int *)malloc(sizeof(int));
                 if (!PInfo[o].pool_solutions[0]) {
                     fprintf(
                         stderr,
-                        "Error: constant-one pool allocation failed\n"
+                        "Error: single-cube pool allocation failed\n"
                     );
                     cleanup(PInfo, buffer);
                     return 1;
                 }
-                PInfo[o].pool_solutions[0][0] = 0;
+                PInfo[o].pool_solutions[0][0] = PInfo[o].indices[0];
                 PInfo[o].pool_count = 1;
             }
         }
@@ -2420,6 +2418,17 @@ int main(int argc, char *argv[]) {
     if (chk_stop_counter) {
         free(chk_stop_counter);
         chk_stop_counter = NULL;
+    }
+
+    bool any_output_searching = false;
+    for (int o = 0; o < noutputs; ++o) {
+        any_output_searching |= !PInfo[o].stop_search;
+    }
+    /* Worker support unranking uses this read-only table. */
+    if (any_output_searching && !nchoosek_prepare(ninputs)) {
+        fprintf(stderr, "Error: binomial lookup-table allocation failed.\n");
+        cleanup(PInfo, buffer);
+        return 1;
     }
 
     ccubes_mutex *output_locks = (ccubes_mutex *)calloc((size_t)noutputs, sizeof(ccubes_mutex));
@@ -2466,15 +2475,6 @@ int main(int argc, char *argv[]) {
         fprintf(debug_out, "deterministic PI order: %s\n", DETERMINISTIC_PI_ORDER ? "yes" : "no");
     }
 
-    int bit_index[ninputs];  //
-    int word_index[ninputs]; //   for the implicants matrix
-    uint64_t shifted_mask[ninputs];
-    for (int r = 0; r < ninputs; r++) {
-        bit_index[r] = (r % (BITS_PER_WORD / value_bit_width)) * value_bit_width;   // Bit position within the word
-        word_index[r] = r / (BITS_PER_WORD / value_bit_width);                      // Word index within the implicant
-        shifted_mask[r] = (VALUE_BIT_MASK << bit_index[r]);
-    }
-
     double scp_time = 0.0, k_scp_time = 0.0, pi_generation_time = 0.0;
     double k_pi_generation_time = 0.0;
     double next_periodic_checkpoint_sec = CHECKPOINT_INTERVAL_SEC;
@@ -2490,8 +2490,9 @@ int main(int argc, char *argv[]) {
      * worth attempting if the hardest output is plausible.
      */
     int mmcs_branching = 1;
-    if (!CERTIFIED_MODE && adaptive_stopping_supported) {
+    if (!CERTIFIED_MODE && binary_points_supported) {
         for (int o = 0; o < noutputs; ++o) {
+            if (PInfo[o].stop_search) continue;
             int b = min_blocker_edge(&PInfo[o], ninputs);
             if (b > mmcs_branching) mmcs_branching = b;
         }
@@ -2511,7 +2512,7 @@ int main(int argc, char *argv[]) {
     }
 
     int k;
-    for (k = search_level; k <= ninputs; k++) {
+    for (k = search_level; any_output_searching && k <= ninputs; k++) {
         const bool complete_mmcs_chart = CERTIFIED_MODE;
         int level_start[noutputs];
         bool level_active[noutputs];
@@ -2533,7 +2534,7 @@ int main(int argc, char *argv[]) {
         uint64_t projection_tasks = nchoosek(ninputs, k);
         bool automatic_mmcs_trial =
             !complete_mmcs_chart &&
-            adaptive_stopping_supported &&
+            binary_points_supported &&
             !RESUME_PATH &&
             !checkpointing &&
             (
@@ -2866,7 +2867,7 @@ int main(int argc, char *argv[]) {
                     k,
                     automatic_mmcs_trial
                         ? "mmcs-node-limit"
-                        : adaptive_stopping_supported
+                        : binary_points_supported
                             ? "small-support-level"
                             : "unsupported-model",
                     (unsigned long long)mmcs_trial_nodes,
@@ -3146,131 +3147,6 @@ int main(int argc, char *argv[]) {
                         );
                     }
 
-                    bool probe_due =
-                        *solmin > 0 &&
-                        adaptive_stopping_supported &&
-                        *prevsolmin > 1 &&
-                        *prevsolmin <= ON_minterms &&
-                        *solmin >= *prevsolmin &&
-                        stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
-                    if (probe_due) {
-                        const int pre_probe_found = *foundPI;
-                        const uint64_t pair_limit =
-                            HYBRID_EFFORT_LEVEL >= 2
-                                ? UINT64_C(1024)
-                                : UINT64_C(128);
-                        const int candidate_limit =
-                            HYBRID_EFFORT_LEVEL >= 2 ? 128 : 32;
-                        PlateauProbeStats probe_stats;
-
-                        if (!plateau_probe_append_candidates(
-                            &PInfo[o],
-                            ninputs,
-                            implicant_words,
-                            previndices,
-                            *prevsolmin,
-                            bit_index,
-                            word_index,
-                            shifted_mask,
-                            pair_limit,
-                            candidate_limit,
-                            &probe_stats
-                        )) {
-                            fprintf(
-                                stderr,
-                                "Error: plateau probe failed for output %d.\n",
-                                o + 1
-                            );
-                            free(weights);
-                            destroy_output_locks(output_locks, noutputs);
-                            cleanup(PInfo, buffer);
-                            return 1;
-                        }
-
-                        if (probe_stats.candidates_appended > 0) {
-                            PInfo[o].nofpi[k - 1] = *foundPI;
-                            chart = pi_chart_view(&PInfo[o]);
-                            free(weights);
-                            weights = complete_mmcs_chart
-                                ? build_complete_cover_weights(
-                                    &PInfo[o],
-                                    *foundPI,
-                                    ninputs,
-                                    implicant_words,
-                                    word_index,
-                                    shifted_mask,
-                                    WEIGHT_PIC
-                                )
-                                : build_cover_weights(
-                                    &PInfo[o],
-                                    *foundPI,
-                                    k,
-                                    WEIGHT_PIC
-                                );
-                            if (WEIGHT_PIC > 0 && !weights) {
-                                fprintf(
-                                    stderr,
-                                    "Error: Memory allocation failed for "
-                                    "plateau-probe cover weights\n"
-                                );
-                                destroy_output_locks(output_locks, noutputs);
-                                cleanup(PInfo, buffer);
-                                return 1;
-                            }
-
-                            if (SCP_TYPE == 0) {
-                                solve_scp_lagrangian(
-                                    &chart,
-                                    weights,
-                                    indices,
-                                    solmin,
-                                    HYBRID_EFFORT_LEVEL,
-                                    previndices,
-                                    *prevsolmin,
-                                    CERTIFIED_MODE
-                                );
-                                boundary_exact =
-                                    lagrangian_last_run_proved_optimal();
-                                print_hybrid_stats(o);
-                            }
-                            if (SCP_TYPE == 1) {
-                                gurobi_multiobjective(
-                                    &chart,
-                                    weights,
-                                    previndices,
-                                    *prevsolmin,
-                                    indices,
-                                    solmin
-                                );
-                                boundary_exact = true;
-                            }
-
-                            if (*solmin >= *prevsolmin) {
-                                *foundPI = pre_probe_found;
-                                PInfo[o].nofpi[k - 1] = pre_probe_found;
-                            }
-                        }
-
-                        DBG_INFO_BLOCK {
-                            fprintf(
-                                debug_out,
-                                "CCUBES_PLATEAU_PROBE level=%d output=%d "
-                                "witnesses=%d pairs=%llu compatible=%llu "
-                                "generated=%d appended=%d improved=%s\n",
-                                k,
-                                o + 1,
-                                probe_stats.private_witnesses,
-                                (unsigned long long)
-                                    probe_stats.pairs_examined,
-                                (unsigned long long)
-                                    probe_stats.compatible_pairs,
-                                probe_stats.candidates_generated,
-                                probe_stats.candidates_appended,
-                                *solmin < *prevsolmin ? "yes" : "no"
-                            );
-                        }
-                    }
-
                     if (*solmin == 0) {
                         DBG_ERROR_BLOCK {
                             fprintf(debug_out, "Error: solving the minterm coverage failed.\n");
@@ -3358,33 +3234,13 @@ int main(int argc, char *argv[]) {
                                 for (int i = 0; i < *solmin; i++) {
                                     fprintf(debug_out, " %d", indices[i] + 1);
                                 }
-                                fprintf(debug_out, "%s\n", stop_counter[o] >= STOP_AFTER_EQUALITY ? " -- stopping search" : "");
+                                fputc('\n', debug_out);
                             }
                         }
 
                         plateau_triggered = stop_counter[o] >= STOP_AFTER_EQUALITY;
                     }
 
-                    if (adaptive_stopping_supported && !certified_blocking_observe_plateau(
-                        &blocking_stop_states[o],
-                        REPORT_BLOCKING_DIAGNOSTIC,
-                        adaptive_warning_enabled,
-                        plateau_triggered,
-                        stderr,
-                        o + 1,
-                        &PInfo[o],
-                        ninputs,
-                        k,
-                        indices,
-                        *solmin,
-                        boundary_exact,
-                        false
-                    )) {
-                        fprintf(stderr, "Error: blocking diagnostic failed for output %d.\n", o + 1);
-                        destroy_output_locks(output_locks, noutputs);
-                        cleanup(PInfo, buffer);
-                        return 1;
-                    }
                     PInfo[o].stop_search = certified_stop_policy_decision(
                         certified_states ? &certified_states[o] : NULL,
                         CERTIFIED_MODE,
@@ -3572,182 +3428,6 @@ int main(int argc, char *argv[]) {
                     }
 
 
-                    int baseline_solmin = *solmin;
-                    memcpy(
-                        baseline_indices,
-                        indices,
-                        (size_t)baseline_solmin * sizeof(int)
-                    );
-                    bool baseline_exact = pool_boundary_exact[o];
-
-                    const bool probe_due =
-                        *solmin > 0 &&
-                        adaptive_stopping_supported &&
-                        PInfo[o].prevsolmin > 1 &&
-                        PInfo[o].prevsolmin <= ON_minterms &&
-                        *solmin >= PInfo[o].prevsolmin &&
-                        stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
-                    if (probe_due) {
-                        const int pre_probe_found = *foundPI;
-                        const uint64_t pair_limit =
-                            HYBRID_EFFORT_LEVEL >= 2
-                                ? UINT64_C(1024)
-                                : UINT64_C(128);
-                        const int candidate_limit =
-                            HYBRID_EFFORT_LEVEL >= 2 ? 128 : 32;
-                        PlateauProbeStats probe_stats;
-
-                        if (!plateau_probe_append_candidates(
-                            &PInfo[o],
-                            ninputs,
-                            implicant_words,
-                            PInfo[o].previndices,
-                            PInfo[o].prevsolmin,
-                            bit_index,
-                            word_index,
-                            shifted_mask,
-                            pair_limit,
-                            candidate_limit,
-                            &probe_stats
-                        )) {
-                            fprintf(
-                                stderr,
-                                "Error: plateau probe failed for output %d.\n",
-                                o + 1
-                            );
-                            free(weights);
-                            free(baseline_indices);
-                            destroy_output_locks(output_locks, noutputs);
-                            cleanup(PInfo, buffer);
-                            return 1;
-                        }
-
-                        if (probe_stats.candidates_appended > 0) {
-                            PInfo[o].nofpi[k - 1] = *foundPI;
-                            chart = pi_chart_view(&PInfo[o]);
-                            free(weights);
-                            weights = complete_mmcs_chart
-                                ? build_complete_cover_weights(
-                                    &PInfo[o],
-                                    *foundPI,
-                                    ninputs,
-                                    implicant_words,
-                                    word_index,
-                                    shifted_mask,
-                                    WEIGHT_PIC
-                                )
-                                : build_cover_weights(
-                                    &PInfo[o],
-                                    *foundPI,
-                                    k,
-                                    WEIGHT_PIC
-                                );
-                            if (WEIGHT_PIC > 0 && !weights) {
-                                fprintf(
-                                    stderr,
-                                    "Error: Memory allocation failed for "
-                                    "plateau-probe cover weights\n"
-                                );
-                                free(baseline_indices);
-                                destroy_output_locks(output_locks, noutputs);
-                                cleanup(PInfo, buffer);
-                                return 1;
-                            }
-
-                            if (SCP_TYPE == 0) {
-                                solve_scp_lagrangian(
-                                    &chart,
-                                    weights,
-                                    indices,
-                                    solmin,
-                                    HYBRID_EFFORT_LEVEL,
-                                    baseline_indices,
-                                    baseline_solmin,
-                                    CERTIFIED_MODE
-                                );
-                                pool_boundary_exact[o] =
-                                    lagrangian_last_run_proved_optimal();
-                                print_hybrid_stats(o);
-                            }
-                            if (SCP_TYPE == 1) {
-                                gurobi_multiobjective(
-                                    &chart,
-                                    weights,
-                                    baseline_indices,
-                                    baseline_solmin,
-                                    indices,
-                                    solmin
-                                );
-                                pool_boundary_exact[o] = true;
-                            }
-
-                            if (*solmin >= PInfo[o].prevsolmin) {
-                                *foundPI = pre_probe_found;
-                                PInfo[o].nofpi[k - 1] = pre_probe_found;
-                                chart = pi_chart_view(&PInfo[o]);
-                                *solmin = baseline_solmin;
-                                memcpy(
-                                    indices,
-                                    baseline_indices,
-                                    (size_t)baseline_solmin * sizeof(int)
-                                );
-                                pool_boundary_exact[o] = baseline_exact;
-                                free(weights);
-                                weights = complete_mmcs_chart
-                                    ? build_complete_cover_weights(
-                                        &PInfo[o],
-                                        *foundPI,
-                                        ninputs,
-                                        implicant_words,
-                                        word_index,
-                                        shifted_mask,
-                                        WEIGHT_PIC
-                                    )
-                                    : build_cover_weights(
-                                        &PInfo[o],
-                                        *foundPI,
-                                        k,
-                                        WEIGHT_PIC
-                                    );
-                                if (WEIGHT_PIC > 0 && !weights) {
-                                    fprintf(
-                                        stderr,
-                                        "Error: Memory allocation failed "
-                                        "while restoring pool weights\n"
-                                    );
-                                    free(baseline_indices);
-                                    destroy_output_locks(
-                                        output_locks,
-                                        noutputs
-                                    );
-                                    cleanup(PInfo, buffer);
-                                    return 1;
-                                }
-                            }
-                        }
-
-                        DBG_INFO_BLOCK {
-                            fprintf(
-                                debug_out,
-                                "CCUBES_PLATEAU_PROBE level=%d output=%d "
-                                "witnesses=%d pairs=%llu compatible=%llu "
-                                "generated=%d appended=%d improved=%s pool\n",
-                                k,
-                                o + 1,
-                                probe_stats.private_witnesses,
-                                (unsigned long long)
-                                    probe_stats.pairs_examined,
-                                (unsigned long long)
-                                    probe_stats.compatible_pairs,
-                                probe_stats.candidates_generated,
-                                probe_stats.candidates_appended,
-                                *solmin < PInfo[o].prevsolmin
-                                    ? "yes"
-                                    : "no"
-                            );
-                        }
-                    }
-
                     /*
                      * Pool discovery is useful only at a boundary which may
                      * terminate the output search. Earlier improvements need
@@ -3762,13 +3442,13 @@ int main(int argc, char *argv[]) {
                         stop_counter[o] + 1 >= STOP_AFTER_EQUALITY;
 
                     if (pool_due) {
-                        baseline_solmin = *solmin;
+                        const int baseline_solmin = *solmin;
                         memcpy(
                             baseline_indices,
                             indices,
                             (size_t)baseline_solmin * sizeof(int)
                         );
-                        baseline_exact = pool_boundary_exact[o];
+                        const bool baseline_exact = pool_boundary_exact[o];
 
                         int pool_limit =
                             automatic_pool_solution_limit(*foundPI);
@@ -3936,7 +3616,6 @@ int main(int argc, char *argv[]) {
                     }
 
                     bool plateau_triggered = false;
-                    bool inspect_equal_pool = false;
                     if (*solmin < *prevsolmin) {
                         *prevsolmin = *solmin;
                         for (int i = 0; i < *solmin; i++) {
@@ -3947,8 +3626,10 @@ int main(int argc, char *argv[]) {
 
                     } else {
                         if (*solmin == *prevsolmin) {
-                            /* Preserve the incumbent until tied covers are diagnosed. */
-                            inspect_equal_pool = true;
+                            /* Retain the coordinated tied cover. */
+                            for (int i = 0; i < *solmin; ++i) {
+                                previndices[i] = indices[i];
+                            }
                         } else {
                             /* A worse boundary incumbent cannot replace the previous one. */
                             for (int i = 0; i < *prevsolmin; i++) {
@@ -3967,35 +3648,6 @@ int main(int argc, char *argv[]) {
                         stop_counter[o]++;
 
                         plateau_triggered = stop_counter[o] >= STOP_AFTER_EQUALITY;
-                    }
-
-                    if (adaptive_stopping_supported && !certified_blocking_observe_plateau(
-                        &blocking_stop_states[o],
-                        REPORT_BLOCKING_DIAGNOSTIC,
-                        adaptive_warning_enabled,
-                        plateau_triggered,
-                        stderr,
-                        o + 1,
-                        &PInfo[o],
-                        ninputs,
-                        k,
-                        indices,
-                        *solmin,
-                        pool_boundary_exact[o],
-                        inspect_equal_pool
-                    )) {
-                        fprintf(stderr, "Error: blocking diagnostic failed for output %d.\n", o + 1);
-                        free(chosen_idx);
-                        destroy_output_locks(output_locks, noutputs);
-                        cleanup(PInfo, buffer);
-                        return 1;
-                    }
-
-                    if (inspect_equal_pool) {
-                        /* Retain the final coordinated/diagnostic-safe tied cover. */
-                        for (int i = 0; i < *solmin; ++i) {
-                            previndices[i] = indices[i];
-                        }
                     }
 
                     PInfo[o].stop_search = certified_stop_policy_decision(
@@ -4042,7 +3694,7 @@ int main(int argc, char *argv[]) {
                                 PInfo[o].stop_search
                                     ? "-- stopping search"
                                     : plateau_triggered
-                                        ? "-- plateau; continuing certification"
+                                        ? "-- plateau; continuing search"
                                         : ""
                             );
                         }
@@ -4215,7 +3867,14 @@ int main(int argc, char *argv[]) {
 
     for (int o = 0; o < noutputs; o++) {
         int solmin = PInfo[o].solmin > 0 ? PInfo[o].solmin : 1; // at least one solution term is needed
-        PInfo[o].solution = (int *) calloc(solmin * ninputs, sizeof(int));
+        PInfo[o].solution = (int *) calloc((size_t)solmin * ninputs, sizeof(int));
+        if (!PInfo[o].solution) {
+            fprintf(stderr, "Error: failed to allocate the output cover.\n");
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            debug_close();
+            return 1;
+        }
 
         for (int c = 0; c < PInfo[o].solmin; c++) {
             for (int r = 0; r < ninputs; r++) {
@@ -4227,6 +3886,19 @@ int main(int argc, char *argv[]) {
                     PInfo[o].solution[position] = value; // transposed
                 }
             }
+        }
+    }
+
+    if (CERTIFY_SYSTEMATIC) {
+        if (!systematic_certify_outputs(PInfo, ninputs, noutputs, THREADS,
+                                        &options.systematic_budget,
+                                        options.systematic_strengthening,
+                                        options.systematic_reuse)) {
+            fprintf(stderr, "Error: systematic certification did not prove every scalar output.\n");
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            debug_close();
+            return 1;
         }
     }
 

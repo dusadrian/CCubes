@@ -20,8 +20,8 @@
 #endif
 
 #define CK_MAGIC "CCCHKv1"  // 7 chars + \0
-/* v9 records the earliest unfinished task. v8 recorded a sampled task. */
-#define CK_VERSION 9u
+/* v9 records the earliest unfinished task. v10 also stores plateau continuation. */
+#define CK_VERSION 11u
 #define CK_OLDEST_SUPPORTED_VERSION 8u
 
 static int write_bytes(FILE *f, const void *buf, size_t len) {
@@ -419,6 +419,12 @@ int load_checkpoint(
         if (read_bytes(f, po->indices, onm * sizeof(int)) < 0) goto READ_FAIL;
         if (read_bytes(f, po->cov_word_index, onm * sizeof(int)) < 0) goto READ_FAIL;
         if (read_bytes(f, po->shifted_cov_mask, onm * sizeof(uint64_t)) < 0) goto READ_FAIL;
+        if (ver == 10u) {
+            /* Version 10 stored a continuation horizon after each output. */
+            int old_horizon;
+            if (read_int(f, &old_horizon) < 0 || old_horizon < -1 ||
+                old_horizon >= (int)ni) goto READ_FAIL;
+        }
     }
 
     // Build nofvalues from ON/OFF sets

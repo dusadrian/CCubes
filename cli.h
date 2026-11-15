@@ -12,6 +12,8 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "systematic_certify.h"
+
 /* Paths borrow argv storage. Parsing never modifies argv or opens files. */
 typedef struct {
     int bits_per_word;
@@ -21,7 +23,13 @@ typedef struct {
     int effort;
     bool deterministic;
     bool certify;
-    bool blocking_diagnostic;
+    bool certify_systematic;
+    SystematicBudget systematic_budget;
+    bool systematic_stage_limits_explicit;
+    bool systematic_work_explicit;
+    NsatCoverStrengthening systematic_strengthening;
+    bool systematic_strengthening_explicit;
+    bool systematic_reuse, systematic_descent_explicit;
     bool pool;
     bool lock_stats;
     double time_limit;
