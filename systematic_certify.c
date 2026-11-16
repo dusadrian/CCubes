@@ -11,7 +11,6 @@
 #include "progressive_global_bound.h"
 
 #include <inttypes.h>
-#include <math.h>
 #include <stdatomic.h>
 #include <time.h>
 
@@ -198,11 +197,7 @@ static bool ipc_integer_bound(PIstorage *pi, int inputs, int output, int *lower,
     double started = monotonic_seconds();
     double seconds = budget->weighted_seconds;
     uint64_t cap = budget->weighted_work;
-    const bool legacy_clock = shared_deadline && budget->mode != SYSTEMATIC_TOTAL_BUDGET;
-    if (legacy_clock) {
-        seconds = fmin(1.0, (*shared_deadline - started) * 0.5);
-        cap = UINT64_C(512000000);
-    } else if (shared_deadline) {
+    if (shared_deadline) {
         /* Preserve the default 10:2 split and let SAT use any unspent time. */
         seconds = (*shared_deadline - started) * (5.0 / 6.0);
     }
@@ -233,10 +228,7 @@ static bool ipc_integer_bound(PIstorage *pi, int inputs, int output, int *lower,
     } else {
         limits.poll = expired;
         limits.context = &integer_deadline;
-        if (legacy_clock)
-            result = ipc_weighted_cover_reprice(&query, initial_lower, limits, 4, 256);
-        else
-            result = ipc_weighted_cover_reprice_with_auto_check(&query, initial_lower, limits, 4, 256);
+        result = ipc_weighted_cover_reprice_with_auto_check(&query, initial_lower, limits, 4, 256);
     }
     resources->work += phase.work;
     uint64_t before_validation = resources->work;
@@ -380,17 +372,16 @@ static bool systematic_certify_cover(PIstorage *pi, int inputs, int output,
                                      int threads, const SystematicBudget *budget,
                                      NsatCoverStrengthening mode, bool reuse)
 {
-    const bool shared = budget->mode != SYSTEMATIC_STAGE_BUDGETS;
-    const bool total = budget->mode == SYSTEMATIC_TOTAL_BUDGET;
+    const bool shared = budget->shared_seconds > 0.0;
     double deadline = 0.0;
     double *pricing_deadline = NULL;
-    if (total || budget->mode == SYSTEMATIC_SHARED_BUDGET) {
+    if (shared) {
         deadline = monotonic_seconds() + budget->shared_seconds;
         pricing_deadline = &deadline;
     }
     const bool floor = pi->solmin <= 1;
     NsatBudget validation = {0};
-    if (pricing_deadline && budget->shared_seconds > 0 && (total || !floor))
+    if (shared)
         validation.limits = (NsatLimits){.poll = expired, .context = pricing_deadline};
     if (!cover_valid(pi, inputs, pi->solution, pi->solmin, &validation)) {
         fprintf(stderr, "CCUBES_SYSTEMATIC_CERTIFICATE output=%d status=%s stop_reason=%s\n",
@@ -410,16 +401,13 @@ static bool systematic_certify_cover(PIstorage *pi, int inputs, int output,
     unsigned query = 0, decisive = 0;
     int proof_target = 0;
     uint64_t proof_work = 0;
-    if (!certified && (!shared || budget->shared_seconds > 0.0)) {
-        if (budget->mode == SYSTEMATIC_POST_PRICING_BUDGET)
-            deadline = monotonic_seconds() + budget->shared_seconds;
+    if (!certified) {
         const int prior_lower = bound.lower;
         certified = ipc_integer_bound(pi, inputs, output, &bound.lower, budget,
                                       shared ? &deadline : NULL, &resources);
         if (bound.lower > prior_lower) method = "ipc-weighted-integer";
     }
-    const bool try_sat = shared ? budget->shared_seconds > 0.0 : budget->sat_seconds > 0.0;
-    if (!certified && try_sat && (!total || !expired(&deadline))) {
+    if (!certified && (shared ? !expired(&deadline) : budget->sat_seconds > 0.0)) {
         if (!shared) deadline = monotonic_seconds() + budget->sat_seconds;
         resources.stop = NSAT_STOP_NONE;
         NsatLimits limits = {.poll = expired, .context = &deadline, .shared = &resources};
@@ -453,7 +441,7 @@ static bool systematic_certify_cover(PIstorage *pi, int inputs, int output,
     }
     if (decisive) snprintf(work, sizeof(work), "%" PRIu64, proof_work);
     if (budget->work) snprintf(limit, sizeof(limit), "%" PRIu64, budget->work);
-    const char *stop = !certified && total && expired(&deadline) ? "deadline" : "na";
+    const char *stop = !certified && shared && expired(&deadline) ? "deadline" : "na";
     fprintf(stderr, "CCUBES_SYSTEMATIC_CERTIFICATE output=%d scope=scalar cover=%d "
             "status=%s method=%s schema_ver=1 target_k=%s query_id=%s work_used=%s work_limit=%s"
             " lower=%d stop_reason=%s\n",

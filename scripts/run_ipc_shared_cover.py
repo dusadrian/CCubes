@@ -58,7 +58,7 @@ def run(args: argparse.Namespace) -> dict:
             raise TimeoutError(f"no search time left for output {output + 1}")
         command = [
             str(args.binary), "--route", "ipc", "--threads", str(args.threads),
-            "--literal-polish", "0", "--ipc-time-limit", f"{child_seconds * 0.8:.9f}",
+            "--literal-polish", "0", "--ipc-time-target", f"{child_seconds * 0.8:.9f}",
             str(care), str(cover),
         ]
         timed_out = False

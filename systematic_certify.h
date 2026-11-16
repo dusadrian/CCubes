@@ -4,16 +4,8 @@
 #include "utils.h"
 #include "cover_encoding.h"
 
-typedef enum {
-    SYSTEMATIC_STAGE_BUDGETS,
-    SYSTEMATIC_SHARED_BUDGET,
-    SYSTEMATIC_POST_PRICING_BUDGET,
-    SYSTEMATIC_TOTAL_BUDGET
-} SystematicBudgetMode;
-
 typedef struct {
-    SystematicBudgetMode mode;
-    double shared_seconds;
+    double shared_seconds; /* Zero uses the individual stage clocks. */
     double weighted_seconds;
     double sat_seconds;
     double verifier_seconds;

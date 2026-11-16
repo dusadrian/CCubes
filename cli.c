@@ -19,16 +19,13 @@
 
 typedef enum {
     BITS, THREADS, WEIGHTS, SOLVER, EFFORT, DETERMINISTIC, CERTIFY,
-    CERTIFY_SYSTEMATIC, CERTIFICATION_TIME_LIMIT,
-    /* The contiguous block below stays accepted during CLI migration. */
-    SYSTEMATIC_SAT_SECONDS, SYSTEMATIC_SECONDS, SYSTEMATIC_WORK,
-    SYSTEMATIC_WEIGHTED_SECONDS, SYSTEMATIC_WEIGHTED_WORK, SYSTEMATIC_NATIVE_SAT_SECONDS,
-    SYSTEMATIC_VERIFIER_SECONDS, SYSTEMATIC_VERIFIER_WORK,
-    SYSTEMATIC_STRENGTHENING, SYSTEMATIC_DESCENT,
-    POOL, LOCK_STATS, TIME_LIMIT, CHECKPOINT_EVERY, CHECKPOINT,
-    RESUME, INSPECT, INSPECT_LEVEL, DEBUG, DEBUG_FILE, LOG_FILE, HELP,
+    POOL, LOCK_STATS, DEBUG, DEBUG_FILE, LOG_FILE, HELP,
     PROGRESSIVE_COVER, ROUTE, LITERAL_POLISH,
-
+    CHECKPOINT_AFTER, CHECKPOINT_EVERY, CHECKPOINT, RESUME, INSPECT, INSPECT_LEVEL,
+    CERTIFY_SYSTEMATIC, CERTIFICATION_TIME_LIMIT,
+    SYSTEMATIC_WEIGHTED_SECONDS, SYSTEMATIC_NATIVE_SAT_SECONDS, SYSTEMATIC_VERIFIER_SECONDS,
+    SYSTEMATIC_WORK, SYSTEMATIC_WEIGHTED_WORK, SYSTEMATIC_VERIFIER_WORK,
+    SYSTEMATIC_STRENGTHENING, SYSTEMATIC_DESCENT,
 } OptionId;
 
 typedef struct {
@@ -39,7 +36,7 @@ typedef struct {
     const char *description;
 } Option;
 
-/* Parsing and help share one registry, with migration options hidden from help. */
+/* Parsing and help share one registry. */
 static const Option option_table[] = {
     {"bits-per-word", "b", true, BITS, "8, 16, 32, or 64 (default). Legacy 128 uses 64"},
     {"threads", "t", true, THREADS, "CPU worker threads; 0 (default) uses available cores"},
@@ -48,26 +45,8 @@ static const Option option_table[] = {
     {"effort", "e", true, EFFORT, "hybrid effort: 0 (default), 1, or 2"},
     {"deterministic", "d", false, DETERMINISTIC, "canonical PI ordering"},
     {"certify", "c", false, CERTIFY, "complete-prime enumeration and exact cover (point rows only)"},
-    {"certify-systematic", NULL, false, CERTIFY_SYSTEMATIC, "certify ordinary scalar covers with IPC pricing, weighted integer search and checked native SAT"},
-    {"certification-time-limit", NULL, true, CERTIFICATION_TIME_LIMIT, "positive seconds per output for systematic certification, after minimization"},
-    {"systematic-weighted-seconds", NULL, true, SYSTEMATIC_WEIGHTED_SECONDS, "weighted search and bound checking seconds per output (default 10; 0 skips)"},
-    {"systematic-weighted-work", NULL, true, SYSTEMATIC_WEIGHTED_WORK, "weighted search and bound checking work per output (default 0: unlimited)"},
-    {"systematic-verifier-seconds", NULL, true, SYSTEMATIC_VERIFIER_SECONDS, "separate weighted bound-checking time per output (positive seconds; default 1 when enabled)"},
-    {"systematic-verifier-work", NULL, true, SYSTEMATIC_VERIFIER_WORK, "enable a separate weighted bound-checking work limit per output (0: unlimited)"},
-    {"systematic-native-sat-seconds", NULL, true, SYSTEMATIC_NATIVE_SAT_SECONDS, "native SAT and checking seconds per output (default 2; 0 skips)"},
-    {"systematic-certification-seconds", NULL, true, SYSTEMATIC_SECONDS, "legacy shared seconds per output, including IPC pricing (0: cardinality floor only)"},
-    {"systematic-certification-work", NULL, true, SYSTEMATIC_WORK, "native certification work per output, including proof checking (0: unlimited)"},
-    {"systematic-strengthening", NULL, true, SYSTEMATIC_STRENGTHENING, "experimental cover SAT strengthening: none (default), groups, ordering, or combined"},
-    {"systematic-descent", NULL, true, SYSTEMATIC_DESCENT, "target descent: fresh (default) or experimental reuse"},
-    {"systematic-sat-seconds", NULL, true, SYSTEMATIC_SAT_SECONDS, "legacy seconds per output after initial IPC pricing (0: initial pricing only)"},
     {"pool", "p", false, POOL, "automatic equal-cardinality cover pooling; implies sharing weights"},
     {"lock-stats", NULL, false, LOCK_STATS, "report PI-insertion lock contention"},
-    {"time-limit", "l", true, TIME_LIMIT, "nonnegative seconds until checkpoint and exit; 0 disables"},
-    {"checkpoint-every", NULL, true, CHECKPOINT_EVERY, "nonnegative seconds between checkpoints; 0 disables"},
-    {"checkpoint", NULL, true, CHECKPOINT, "checkpoint save path (otherwise derived from source/resume)"},
-    {"resume", "r", true, RESUME, "resume from this checkpoint file"},
-    {"inspect", "i", true, INSPECT, "inspect this checkpoint file and exit"},
-    {"inspect-level", NULL, true, INSPECT_LEVEL, "0 (default) progress, 1 full metadata"},
     {"debug", "dbg", true, DEBUG, "0 warnings, 1 info, 2 trace; logging is off unless requested"},
     {"debug-file", NULL, true, DEBUG_FILE, "write debug logging to this file (otherwise stderr)"},
     {"log-file", NULL, true, LOG_FILE, "append run diagnostics and solver logs for any backend; defaults to debug level 1"},
@@ -75,21 +54,52 @@ static const Option option_table[] = {
     {"progressive-cover", NULL, false, PROGRESSIVE_COVER, "select IPC (same as --route ipc)"},
     {"route", NULL, true, ROUTE, "ordinary (default, legacy: e0), auto, or ipc"},
     {"literal-polish", NULL, true, LITERAL_POLISH, "IPC finishing: 0 off, 1 one pass (default), 2 yield-gated, 3 four passes"},
+    {"checkpoint-after", NULL, true, CHECKPOINT_AFTER, "elapsed seconds before requesting an ordinary projection checkpoint and exit at a safe frontier. 0 disables"},
+    {"checkpoint-every", NULL, true, CHECKPOINT_EVERY, "request an ordinary projection checkpoint every N seconds and continue at each safe frontier. 0 disables"},
+    {"checkpoint", NULL, true, CHECKPOINT, "checkpoint save path (otherwise derived from source/resume)"},
+    {"resume", "r", true, RESUME, "resume from this checkpoint file"},
+    {"inspect", "i", true, INSPECT, "inspect this checkpoint file and exit"},
+    {"inspect-level", NULL, true, INSPECT_LEVEL, "0 (default) progress, 1 full metadata"},
+    {"certify-systematic", NULL, false, CERTIFY_SYSTEMATIC, "certify ordinary scalar covers with IPC pricing, weighted integer search and checked native SAT"},
+    {"certification-time-limit", NULL, true, CERTIFICATION_TIME_LIMIT, "positive seconds per output after minimization, shared by validation, pricing, search and proof checking"},
+    {"systematic-weighted-seconds", NULL, true, SYSTEMATIC_WEIGHTED_SECONDS, "weighted search and checking seconds per output (default 10; 0 skips)"},
+    {"systematic-native-sat-seconds", NULL, true, SYSTEMATIC_NATIVE_SAT_SECONDS, "SAT search and checking seconds per output (default 2; 0 skips)"},
+    {"systematic-verifier-seconds", NULL, true, SYSTEMATIC_VERIFIER_SECONDS, "positive seconds per output for separate weighted checking; pauses the weighted search clock"},
+    {"systematic-certification-work", NULL, true, SYSTEMATIC_WORK, "combined weighted and SAT work per output, including checking (0 disables the cap)"},
+    {"systematic-weighted-work", NULL, true, SYSTEMATIC_WEIGHTED_WORK, "weighted stage work per output (0 disables the cap)"},
+    {"systematic-verifier-work", NULL, true, SYSTEMATIC_VERIFIER_WORK, "separate weighted checking work per output; enables a one-second checker clock by default (0 disables the work cap)"},
+    {"systematic-strengthening", NULL, true, SYSTEMATIC_STRENGTHENING, "experimental cover SAT strengthening: none (default), groups, ordering, or combined"},
+    {"systematic-descent", NULL, true, SYSTEMATIC_DESCENT, "target descent: fresh (default) or experimental reuse"},
 };
+
+static void print_options(FILE *out, OptionId first, OptionId last) {
+    for (size_t i = 0; i < sizeof(option_table) / sizeof(option_table[0]); ++i) {
+        const Option *option = &option_table[i];
+        if (option->id < first || option->id > last) continue;
+        fprintf(out, "  --%s%s\n      %s\n", option->name,
+                option->takes_value ? " VALUE" : "", option->description);
+    }
+}
 
 void cli_help(FILE *out) {
     fprintf(out, "Usage: ccubes [options] source.pla [dest.pla]\n"
                  "       ccubes --resume FILE [options]\n"
                  "       ccubes --inspect FILE [--inspect-level 0|1]\n"
-                 "Options (values accept --name VALUE or --name=VALUE):\n");
-    for (size_t i = 0; i < sizeof(option_table) / sizeof(option_table[0]); ++i) {
-        const Option *option = &option_table[i];
-        if (option->id >= SYSTEMATIC_SAT_SECONDS && option->id <= SYSTEMATIC_DESCENT) continue;
-        fprintf(out, "  --%s%s\n      %s\n", option->name,
-                option->takes_value ? " VALUE" : "", option->description);
-    }
+                 "Options accept --name VALUE or --name=VALUE.\n\n"
+                 "Ordinary projection checkpoints:\n");
+    print_options(out, CHECKPOINT_AFTER, INSPECT_LEVEL);
+    fprintf(out, "\nSystematic certification:\n");
+    print_options(out, CERTIFY_SYSTEMATIC, CERTIFICATION_TIME_LIMIT);
     ccubes_options_help(out);
-    fprintf(out, "Use -- to end option parsing for filenames beginning with '-'.\n"
+    fprintf(out, "\nGeneral and solver options:\n");
+    print_options(out, BITS, LITERAL_POLISH);
+    fprintf(out, "\nAdvanced certification timing:\n"
+                 "  Separate stage times require --certify-systematic and cannot be combined with --certification-time-limit.\n");
+    print_options(out, SYSTEMATIC_WEIGHTED_SECONDS, SYSTEMATIC_VERIFIER_SECONDS);
+    fprintf(out, "\nAdvanced certification controls:\n"
+                 "  The combined work cap can accompany either timing mode. Weighted and verifier work caps use stage timing.\n");
+    print_options(out, SYSTEMATIC_WORK, SYSTEMATIC_VERIFIER_WORK);
+    fprintf(out, "\nUse -- to end option parsing for filenames beginning with '-'.\n"
                  "Legacy short options are deprecated; use the long names above.\n"
                  "No CCUBES_* environment settings are read.\n");
 }
@@ -139,19 +149,8 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
         case CERTIFY: o->certify = true; return true;
         case CERTIFY_SYSTEMATIC: o->certify_systematic = true; return true;
         case CERTIFICATION_TIME_LIMIT:
-        case SYSTEMATIC_SAT_SECONDS:
-        case SYSTEMATIC_SECONDS: {
-            SystematicBudgetMode mode = SYSTEMATIC_TOTAL_BUDGET;
-            if (id == SYSTEMATIC_SECONDS) mode = SYSTEMATIC_SHARED_BUDGET;
-            if (id == SYSTEMATIC_SAT_SECONDS) mode = SYSTEMATIC_POST_PRICING_BUDGET;
-            if (o->systematic_budget.mode != SYSTEMATIC_STAGE_BUDGETS &&
-                o->systematic_budget.mode != mode) {
-                return false;
-            }
-            o->systematic_budget.mode = mode;
             return parse_seconds(value, &o->systematic_budget.shared_seconds) &&
-                (mode != SYSTEMATIC_TOTAL_BUDGET || o->systematic_budget.shared_seconds > 0.0);
-        }
+                   o->systematic_budget.shared_seconds > 0.0;
         case SYSTEMATIC_WEIGHTED_SECONDS:
             o->systematic_stage_limits_explicit = true;
             return parse_seconds(value, &o->systematic_budget.weighted_seconds);
@@ -200,7 +199,7 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
             return true;
         case POOL: o->pool = true; return true;
         case LOCK_STATS: o->lock_stats = true; return true;
-        case TIME_LIMIT: return parse_seconds(value, &o->time_limit);
+        case CHECKPOINT_AFTER: return parse_seconds(value, &o->checkpoint_after);
         case CHECKPOINT_EVERY: return parse_seconds(value, &o->checkpoint_every);
         case CHECKPOINT: o->checkpoint = value; return true;
         case RESUME: o->resume = value; return true;
@@ -295,10 +294,9 @@ int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
         }
         if (option->id == HELP) return 1;
         if (legacy) o->legacy_options = true;
-        /* Decode the old combined -lSEC=FILE, -iLEVEL=FILE, -dbgLEVEL=FILE
-         * syntax into the same fields. Never write NULs into argv. */
+        /* Decode -iLEVEL=FILE and -dbgLEVEL=FILE without modifying argv. */
         char number[64];
-        if (legacy && (option->id == TIME_LIMIT || option->id == INSPECT || option->id == DEBUG)) {
+        if (legacy && (option->id == INSPECT || option->id == DEBUG)) {
             char *equals = value ? strchr(value, '=') : NULL;
             if (option->id == INSPECT && !equals) {
                 fprintf(err, "Legacy -i requires LEVEL=FILE; use --inspect FILE --inspect-level LEVEL.\n");
@@ -312,9 +310,8 @@ int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
                 }
                 memcpy(number, value, length);
                 number[length] = '\0';
-                if (!length && option->id != TIME_LIMIT) strcpy(number, "0");
-                if (option->id == TIME_LIMIT) o->checkpoint = equals + 1;
-                else if (option->id == DEBUG) o->debug_file = equals + 1;
+                if (!length) strcpy(number, "0");
+                if (option->id == DEBUG) o->debug_file = equals + 1;
                 else {
                     o->inspect = equals + 1;
                     if (!apply_option(INSPECT_LEVEL, number, o)) {
@@ -345,11 +342,11 @@ int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
         fprintf(err, "--inspect-level requires --inspect FILE.\n");
         return -1;
     }
-    if (o->checkpoint && o->time_limit == 0 && o->checkpoint_every == 0) {
-        fprintf(err, "--checkpoint requires a positive --time-limit or --checkpoint-every.\n");
+    if (o->checkpoint && o->checkpoint_after == 0 && o->checkpoint_every == 0) {
+        fprintf(err, "--checkpoint requires a positive --checkpoint-after or --checkpoint-every.\n");
         return -1;
     }
-    bool shared_budget = o->systematic_budget.mode != SYSTEMATIC_STAGE_BUDGETS;
+    bool shared_budget = o->systematic_budget.shared_seconds > 0.0;
     if ((shared_budget || o->systematic_stage_limits_explicit ||
          o->systematic_work_explicit || o->systematic_strengthening_explicit ||
          o->systematic_descent_explicit) &&
@@ -358,10 +355,7 @@ int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
         return -1;
     }
     if (shared_budget && o->systematic_stage_limits_explicit) {
-        if (o->systematic_budget.mode == SYSTEMATIC_TOTAL_BUDGET)
-            fprintf(err, "--certification-time-limit cannot be combined with individual stage limits.\n");
-        else
-            fprintf(err, "Use either a legacy shared certification time or separate stage budgets.\n");
+        fprintf(err, "--certification-time-limit cannot be combined with individual stage limits.\n");
         return -1;
     }
     if (o->pool) o->weights = 2;

@@ -348,7 +348,7 @@ typedef struct {
     int increase;
     int *multiplier;
     bool retain_all_prime_geometries;
-    double time_limit_sec;
+    double checkpoint_after_sec;
     double checkpoint_deadline_sec;
     struct timespec start_time;
     uint64_t first_task;
@@ -412,7 +412,7 @@ static void pi_search_range_worker(
             if (
                 elapsed >= ctx->checkpoint_deadline_sec &&
                 (
-                    (ctx->time_limit_sec > 0.0 && elapsed >= ctx->time_limit_sec) ||
+                    (ctx->checkpoint_after_sec > 0.0 && elapsed >= ctx->checkpoint_after_sec) ||
                     atomic_load_explicit(ctx->first_task_done, memory_order_acquire)
                 )
             ) {
@@ -759,11 +759,11 @@ int main(int argc, char *argv[]) {
     if (parse_result > 0) { cli_help(stdout); return 0; }
     if (parse_result < 0) return 1;
 
-    const char *ipc_time_limit = ccubes_option(OPTION_PROGRESSIVE_TIME_LIMIT_SECONDS);
+    const char *ipc_time_target = ccubes_option(OPTION_PROGRESSIVE_TIME_LIMIT_SECONDS);
     const char *ipc_terminal_reserve = ccubes_option(OPTION_PROGRESSIVE_TERMINAL_RESERVE_SECONDS);
     const char *ipc_terminal_patience = ccubes_option(OPTION_PROGRESSIVE_TERMINAL_PATIENCE_SECONDS);
     const double progressive_time_limit_seconds =
-        ipc_time_limit ? strtod(ipc_time_limit, NULL) : 0.0;
+        ipc_time_target ? strtod(ipc_time_target, NULL) : 0.0;
     const double progressive_terminal_reserve_seconds =
         ipc_terminal_reserve ? strtod(ipc_terminal_reserve, NULL) : 0.0;
     const double progressive_terminal_patience_seconds =
@@ -774,7 +774,7 @@ int main(int argc, char *argv[]) {
         progressive_terminal_reserve_seconds >= progressive_time_limit_seconds) {
         fprintf(
             stderr,
-            "Error: --ipc-terminal-reserve requires --ipc-time-limit greater "
+            "Error: --ipc-terminal-reserve requires --ipc-time-target greater "
             "than the reserve.\n"
         );
         return 1;
@@ -823,10 +823,10 @@ int main(int argc, char *argv[]) {
     double BASE_ELAPSED = 0.0;
     double BASE_SCP = 0.0;
 
-    // checkpoint/time limit
-    double TIME_LIMIT_SEC = options.time_limit;
+    // ordinary projection checkpoints
+    double CHECKPOINT_AFTER_SEC = options.checkpoint_after;
     double CHECKPOINT_INTERVAL_SEC = options.checkpoint_every;
-    bool checkpointing = TIME_LIMIT_SEC > 0.0 || CHECKPOINT_INTERVAL_SEC > 0.0;
+    bool checkpointing = CHECKPOINT_AFTER_SEC > 0.0 || CHECKPOINT_INTERVAL_SEC > 0.0;
     char *CHK_SAVE_PATH = options.checkpoint;
     char *RESUME_PATH = options.resume;
     char *INFO_PATH = options.inspect;
@@ -904,7 +904,7 @@ int main(int argc, char *argv[]) {
         fprintf(
             stderr,
             "Error: --progressive-cover does not yet support checkpoint "
-            "resume, time-limit checkpoints or periodic checkpoints.\n"
+            "resume, --checkpoint-after or --checkpoint-every.\n"
         );
         return 1;
     }
@@ -939,8 +939,8 @@ int main(int argc, char *argv[]) {
     const char *route_block_reason = NULL;
     if (RESUME_PATH) {
         route_block_reason = "checkpoint-resume";
-    } else if (TIME_LIMIT_SEC > 0.0) {
-        route_block_reason = "time-limit-checkpoint";
+    } else if (CHECKPOINT_AFTER_SEC > 0.0) {
+        route_block_reason = "checkpoint-after";
     } else if (CHECKPOINT_INTERVAL_SEC > 0.0) {
         route_block_reason = "periodic-checkpoint";
     } else if (CERTIFIED_MODE) {
@@ -961,7 +961,7 @@ int main(int argc, char *argv[]) {
         fprintf(
             stderr,
             "Error: complete-prime certification does not support "
-            "time-limit or periodic checkpoints.\n"
+            "--checkpoint-after or --checkpoint-every.\n"
         );
         return 1;
     }
@@ -2598,7 +2598,7 @@ int main(int argc, char *argv[]) {
         uint64_t maxtasks = attempt_mmcs
             ? (uint64_t)noutputs
             : projection_tasks;
-        double checkpoint_deadline_sec = TIME_LIMIT_SEC;
+        double checkpoint_deadline_sec = CHECKPOINT_AFTER_SEC;
         if (
             next_periodic_checkpoint_sec > 0.0 &&
             (checkpoint_deadline_sec <= 0.0 ||
@@ -2782,7 +2782,7 @@ int main(int argc, char *argv[]) {
                 .multiplier = &multiplier,
                 .retain_all_prime_geometries =
                     false,
-                .time_limit_sec = TIME_LIMIT_SEC,
+                .checkpoint_after_sec = CHECKPOINT_AFTER_SEC,
                 .checkpoint_deadline_sec = checkpoint_deadline_sec,
                 .start_time = start,
                 .first_task = start_task,
@@ -3018,10 +3018,10 @@ int main(int argc, char *argv[]) {
                 (checkpoint_end.tv_sec - start.tv_sec) +
                 (checkpoint_end.tv_nsec - start.tv_nsec) / 1e9;
             double pct = (double)resume_task * 100.0 / (double)maxtasks;
-            if (TIME_LIMIT_SEC > 0.0 && elapsed_after_save >= TIME_LIMIT_SEC) {
+            if (CHECKPOINT_AFTER_SEC > 0.0 && elapsed_after_save >= CHECKPOINT_AFTER_SEC) {
                 fprintf(
                     stderr,
-                    "Time limit reached. Checkpoint saved at %.2f%% of level k=%d.\n",
+                    "Checkpoint deadline reached. Checkpoint saved at %.2f%% of level k=%d.\n",
                     pct, k
                 );
                 destroy_output_locks(output_locks, noutputs);

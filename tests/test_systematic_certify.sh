@@ -8,8 +8,13 @@ trap 'rm -rf "$work"' EXIT
 "$bin" --help >"$work/help"
 grep -q '^  --certify-systematic$' "$work/help"
 grep -q '^  --certification-time-limit VALUE$' "$work/help"
-if grep -q '^  --systematic-' "$work/help"; then
-    echo "migration controls leaked into production help" >&2
+grep -q '^  --checkpoint-after VALUE$' "$work/help"
+grep -q '^  --ipc-time-target VALUE$' "$work/help"
+grep -q '^Advanced IPC timing:$' "$work/help"
+grep -q '^Advanced certification timing:$' "$work/help"
+grep -q '^  --systematic-verifier-seconds VALUE$' "$work/help"
+if grep -Eq '^  --(ipc-time-limit|time-limit|systematic-certification-seconds|systematic-sat-seconds) VALUE$' "$work/help"; then
+    echo "a replaced timing option appeared in production help" >&2
     exit 1
 fi
 
@@ -18,14 +23,63 @@ if "$bin" --certification-time-limit=2 "$work/unused.pla" >"$work/parse.log" 2>&
     exit 1
 fi
 grep -q 'require --certify-systematic' "$work/parse.log"
-if "$bin" --certify-systematic --certification-time-limit=2 --systematic-verifier-work=10 \
-    "$work/unused.pla" >"$work/parse.log" 2>&1; then
-    echo "conflicting stage and per-output limits were accepted" >&2
-    exit 1
-fi
-grep -q -- '--certification-time-limit cannot be combined' "$work/parse.log"
+for limit in --systematic-weighted-seconds=1 --systematic-native-sat-seconds=1 \
+             --systematic-verifier-seconds=1 --systematic-weighted-work=1000 \
+             --systematic-verifier-work=1000; do
+    for order in shared-first stage-first; do
+        if [ "$order" = shared-first ]; then
+            set -- --certification-time-limit=2 "$limit"
+        else
+            set -- "$limit" --certification-time-limit=2
+        fi
+        if "$bin" --certify-systematic "$@" "$work/unused.pla" >"$work/parse.log" 2>&1; then
+            echo "conflicting stage and per-output limits were accepted ($limit)" >&2
+            exit 1
+        fi
+        grep -q -- '--certification-time-limit cannot be combined' "$work/parse.log"
+    done
+done
 
-"$bin" --certify-systematic --systematic-sat-seconds=0 --threads=1 \
+for flag in --time-limit=2 -l2=unused.chk --ipc-time-limit=2 \
+            --systematic-certification-seconds=2 --systematic-sat-seconds=2; do
+    if "$bin" --certify-systematic "$flag" "$work/unused.pla" >"$work/parse.log" 2>&1; then
+        echo "accepted a replaced timing option ($flag)" >&2
+        exit 1
+    fi
+    grep -Fq "Unknown argument: $flag" "$work/parse.log"
+done
+
+fixture=examples/certified_F2.pla
+# The CLI passes the requested target to native IPC.
+"$bin" --route=ipc --threads=1 --ipc-time-target=0.000001 "$fixture" "$work/ipc-target.pla" >"$work/ipc-target.log" 2>&1
+grep -q 'time_limit_seconds=0.000001' "$work/ipc-target.log"
+
+# The reserve is carved out of the base target and needs a smaller value.
+"$bin" --route=ipc --threads=1 --ipc-time-target=0.02 --ipc-terminal-reserve=0.01 \
+    "$fixture" "$work/ipc-reserve.pla" >"$work/ipc-reserve.log" 2>&1
+grep -q 'status=configured reserve_seconds=0.010 ordinary_target_seconds=0.010' "$work/ipc-reserve.log"
+for target in 0 0.01; do
+    if "$bin" --route=ipc --ipc-time-target="$target" --ipc-terminal-reserve=0.01 \
+        "$fixture" "$work/ipc-invalid.pla" >"$work/ipc-invalid.log" 2>&1; then
+        echo "accepted a reserve that uses all of the IPC target" >&2
+        exit 1
+    fi
+    grep -q -- '--ipc-terminal-reserve requires --ipc-time-target greater' "$work/ipc-invalid.log"
+done
+
+# Route-specific clocks cannot be used on another route.
+for flags in '--route=ipc --checkpoint-after=1' \
+             '--route=ipc --certify-systematic --certification-time-limit=1' \
+             '--route=ordinary --ipc-time-target=1'; do
+    # Each word is a fixed option with no embedded spaces.
+    if "$bin" $flags "$fixture" "$work/ipc-invalid.pla" >"$work/ipc-invalid.log" 2>&1; then
+        echo "accepted timing options for incompatible routes ($flags)" >&2
+        exit 1
+    fi
+    test ! -e "$work/ipc-invalid.pla"
+done
+
+"$bin" --certify-systematic --certification-time-limit=2 --threads=1 \
     examples/certified_two_term.pla "$work/bound-cover.pla" >"$work/bound.log" 2>&1
 grep -q 'cover=2 status=certified method=ipc-global-bound' "$work/bound.log"
 grep -qx '\.p 2' "$work/bound-cover.pla"
@@ -49,7 +103,8 @@ cat >"$work/sat.pla" <<'PLA'
 .e
 PLA
 printf 'preserve\n' >"$work/unproved.pla"
-if "$bin" --certify-systematic --systematic-sat-seconds=0 --threads=1 --deterministic \
+if "$bin" --certify-systematic --systematic-weighted-seconds=0 \
+    --systematic-native-sat-seconds=0 --threads=1 --deterministic \
     "$work/sat.pla" "$work/unproved.pla" >"$work/unproved.log" 2>&1; then
     echo "a bound with an open gap was accepted" >&2
     exit 1
@@ -67,15 +122,27 @@ grep -q '^CCUBES_SYSTEMATIC_CERTIFICATE .*status=unproved stop_reason=deadline' 
 grep -qx preserve "$work/unproved.pla"
 
 # The minimization checkpoint fires before the certification clock starts.
-"$bin" --certify-systematic --certification-time-limit=2 --time-limit=0.000000000001 \
-    --checkpoint "$work/before-certification.chk" --threads=1 \
+"$bin" --certify-systematic --certification-time-limit=2 \
+    --checkpoint-after=0.000000000001 --checkpoint-every=0.000000000001 \
+    --checkpoint "$work/before-certification.chk" --threads=1 --deterministic \
     examples/rnd_20x10x40.pla "$work/unproved.pla" >"$work/before-certification.log" 2>&1
 test -s "$work/before-certification.chk"
+grep -q '^Checkpoint deadline reached\. Checkpoint saved' "$work/before-certification.log"
 grep -qx preserve "$work/unproved.pla"
 if grep -q '^CCUBES_SYSTEMATIC_' "$work/before-certification.log"; then
     echo "certification ran on an interrupted minimization" >&2
     exit 1
 fi
+
+# Resume completes minimization and begins a new certification clock.
+if "$bin" --resume "$work/before-certification.chk" --threads=1 --deterministic \
+    --certify-systematic --certification-time-limit=0.000000000001 \
+    >"$work/resume-deadline.log" 2>&1; then
+    echo "resumed certification succeeded after its deadline" >&2
+    exit 1
+fi
+grep -q '^CCUBES_SYSTEMATIC_CERTIFICATE .*status=unproved stop_reason=deadline' "$work/resume-deadline.log"
+grep -qx preserve "$work/unproved.pla"
 
 # Run weighted certification with SAT disabled and no external executables.
 env PATH=/nonexistent "$bin" --certify-systematic --threads=1 --deterministic \
@@ -87,12 +154,14 @@ test "$(grep -c '^CCUBES_SYSTEMATIC_SAT ' "$work/sat.log" || true)" -eq 0
 grep -qx -- '---00000 1' "$work/sat-cover.pla"
 grep -qx -- '---11--- 1' "$work/sat-cover.pla"
 
-# Both hidden verifier controls still select a separate checking budget.
-env PATH=/nonexistent "$bin" --certify-systematic --threads=1 --deterministic \
-    --systematic-verifier-seconds=2 --systematic-verifier-work=1000000 \
-    --systematic-native-sat-seconds=0 \
-    "$work/sat.pla" "$work/legacy-verifier.pla" >"$work/legacy-verifier.log" 2>&1
-cmp "$work/sat-cover.pla" "$work/legacy-verifier.pla"
+# Periodic checkpoints allow minimization and certification to finish in one run.
+"$bin" --certify-systematic --certification-time-limit=2 --threads=1 --deterministic \
+    --checkpoint-every=0.000000000001 --checkpoint "$work/periodic.chk" \
+    "$work/sat.pla" "$work/periodic-cover.pla" >"$work/periodic.log" 2>&1
+test -s "$work/periodic.chk"
+grep -q '^Periodic checkpoint saved .*; continuing\.' "$work/periodic.log"
+grep -q 'cover=2 status=certified method=ipc-global-bound' "$work/periodic.log"
+cmp "$work/sat-cover.pla" "$work/periodic-cover.pla"
 
 # If weighted search is skipped or times out, SAT can use its own full budget.
 for weighted_seconds in 0 0.000000000001; do
@@ -193,12 +262,12 @@ test "$(grep -c '^CCUBES_SYSTEMATIC_SAT ' "$work/weighted-limit.log" || true)" -
 grep -qx preserve "$work/unproved.pla"
 
 env PATH=/nonexistent "$bin" --certify-systematic --threads=1 --deterministic \
-    --systematic-certification-seconds=12 --systematic-certification-work=100000000 \
+    --certification-time-limit=12 --systematic-certification-work=100000000 \
     examples/rnd_20x10x40.pla "$work/proved.pla" >"$work/proved.log" 2>&1
 grep -Eq 'scope=scalar .*status=certified method=(ipc-weighted-integer|native-rup)' "$work/proved.log"
 test "$(grep -c 'scope=scalar .*status=certified' "$work/proved.log")" -eq 10
 env PATH=/nonexistent "$bin" --certify-systematic --threads=12 --deterministic \
-    --systematic-certification-seconds=12 --systematic-certification-work=100000000 \
+    --certification-time-limit=12 --systematic-certification-work=100000000 \
     examples/rnd_20x10x40.pla "$work/proved-parallel.pla" >"$work/proved-parallel.log" 2>&1
 grep -Eq 'CCUBES_SYSTEMATIC_BATCH outputs=10 .*workers=([1-9]|10) pricing_threads=1 failed=0' \
     "$work/proved-parallel.log"
@@ -207,6 +276,12 @@ for log in "$work/proved.log" "$work/proved-parallel.log"; do
     awk '/^CCUBES_SYSTEMATIC_CERTIFICATE / { print $2, $4 }' "$log" | sort >"$log.counts"
 done
 cmp "$work/proved.log.counts" "$work/proved-parallel.log.counts"
+"$bin" --resume "$work/before-certification.chk" --threads=1 --deterministic \
+    --certify-systematic --certification-time-limit=12 --systematic-certification-work=100000000 \
+    >"$work/resumed-proved.log" 2>&1
+test "$(grep -c 'scope=scalar .*status=certified' "$work/resumed-proved.log")" -eq 10
+cmp "$work/proved.pla" "$work/unproved.pla"
+printf 'preserve\n' >"$work/unproved.pla"
 env PATH=/nonexistent "$bin" --certify-systematic --certification-time-limit=12 \
     --threads=12 --deterministic examples/rnd_30x10x100.pla "$work/proved30.pla" >"$work/proved30.log" 2>&1
 test "$(grep -c 'scope=scalar .*status=certified' "$work/proved30.log")" -eq 10
@@ -219,6 +294,31 @@ grep -Eq '^CCUBES_SYSTEMATIC_INTEGER output=7 .*check_status=verified .*lower_ta
 grep -Eq '^CCUBES_SYSTEMATIC_INTEGER output=7 .*check_auto_base=[1-9][0-9]* .*check_auto_limit_hit=no' \
     "$work/proved30.log"
 test "$(grep -c '^CCUBES_SYSTEMATIC_SAT ' "$work/proved30.log" || true)" -eq 0
+
+# Exercise separate verifier time and work limits on an output that needs checking.
+awk 'BEGIN { print ".i 30\n.o 1\n.type fr" }
+     /^\.p / { print }
+     /^[01]/ { print $1, substr($2, 7, 1) }
+     END { print ".e" }' examples/rnd_30x10x100.pla >"$work/checker.pla"
+env PATH=/nonexistent "$bin" --certify-systematic --threads=1 --deterministic \
+    --systematic-verifier-seconds=2 --systematic-native-sat-seconds=0 \
+    "$work/checker.pla" "$work/separate-verifier.pla" >"$work/separate-verifier.log" 2>&1
+grep -q '^CCUBES_SYSTEMATIC_INTEGER .*status=certified .*cover=7 lower=7 .*check_status=verified' \
+    "$work/separate-verifier.log"
+for limit in --systematic-verifier-seconds=0.000000000001 --systematic-verifier-work=1; do
+    if "$bin" --certify-systematic --threads=1 --deterministic "$limit" \
+        --systematic-native-sat-seconds=0 "$work/checker.pla" "$work/unproved.pla" \
+        >"$work/verifier-limit.log" 2>&1; then
+        echo "certification succeeded with an exhausted checker budget ($limit)" >&2
+        exit 1
+    fi
+    case "$limit" in
+        *-seconds=*) reason=deadline ;;
+        *-work=*) reason=work-limit ;;
+    esac
+    grep -q "^CCUBES_SYSTEMATIC_INTEGER .*stop_reason=$reason .*check_status=limited" "$work/verifier-limit.log"
+    grep -qx preserve "$work/unproved.pla"
+done
 
 python3 - "$work" <<'PY'
 from pathlib import Path
@@ -255,22 +355,16 @@ grep -q 'status=unknown stop_reason=work-limit' "$work/parallel-limit.log"
 test "$(grep -c '^CCUBES_SYSTEMATIC_CERTIFICATE ' "$work/parallel-limit.log")" -eq 10
 grep -qx 'preserve parallel destination' "$work/unproved-parallel.pla"
 
-for limit in --systematic-certification-work=2 --systematic-certification-seconds=0.000000000001; do
-    if "$bin" --certify-systematic --threads=1 --deterministic "$limit" \
-        "$work/sat.pla" "$work/unproved.pla" >"$work/limit.log" 2>&1; then
-        echo "systematic certification succeeded with exhausted limit: $limit" >&2
-        exit 1
-    fi
-    grep -q 'status=unproved' "$work/limit.log"
-    grep -qx preserve "$work/unproved.pla"
-    case "$limit" in
-        *-work=*)
-            grep -q '^CCUBES_SYSTEMATIC_INTEGER .*status=unknown stop_reason=work-limit' "$work/limit.log"
-            grep -q '^CCUBES_SYSTEMATIC_SAT .*status=unknown stop_reason=work-limit' "$work/limit.log"
-            ;;
-        *-seconds=*) grep -q 'stop_reason=deadline' "$work/limit.log" ;;
-    esac
-done
+if "$bin" --certify-systematic --threads=1 --deterministic \
+    --certification-time-limit=2 --systematic-certification-work=2 \
+    "$work/sat.pla" "$work/unproved.pla" >"$work/limit.log" 2>&1; then
+    echo "systematic certification succeeded with an exhausted combined work limit" >&2
+    exit 1
+fi
+grep -q 'status=unproved' "$work/limit.log"
+grep -qx preserve "$work/unproved.pla"
+grep -q '^CCUBES_SYSTEMATIC_INTEGER .*status=unknown stop_reason=work-limit' "$work/limit.log"
+grep -q '^CCUBES_SYSTEMATIC_SAT .*status=unknown stop_reason=work-limit' "$work/limit.log"
 
 for route in ipc auto; do
     if "$bin" --certify-systematic --route="$route" --threads=1 \

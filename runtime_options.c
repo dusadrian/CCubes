@@ -96,9 +96,13 @@ int ccubes_options_parse(int argc, char *const argv[], int *index, FILE *err) {
     return 0;
 }
 void ccubes_options_help(FILE *out) {
-    fprintf(out, "IPC resource and diagnostic options:\n");
+    fprintf(out, "\nIPC search:\n");
     for (size_t i = 0; i < sizeof(definitions) / sizeof(definitions[0]); ++i) {
         const OptionDefinition *d = &definitions[i];
+        if (d->key == OPTION_PROGRESSIVE_TERMINAL_RESERVE_SECONDS)
+            fprintf(out, "\nAdvanced IPC timing:\n");
+        if (d->key == OPTION_PROGRESSIVE_MASTER)
+            fprintf(out, "\nIPC resource and diagnostic options:\n");
         fprintf(out, "  --%s VALUE\n      %s", d->name, d->help);
         if (d->choices) fprintf(out, " (%s)", d->choices);
         fputc('\n', out);

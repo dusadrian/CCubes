@@ -32,7 +32,7 @@ typedef struct {
     bool systematic_reuse, systematic_descent_explicit;
     bool pool;
     bool lock_stats;
-    double time_limit;
+    double checkpoint_after;
     double checkpoint_every;
     char *checkpoint;
     char *resume;
