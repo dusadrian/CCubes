@@ -40,6 +40,7 @@ typedef struct {
     int *hit_count;
     int *critical_count;
     int uncovered_count;
+    int uncovered_off_count;
 
     /*
      * Incremental indices.  Both hot loops used to be O(ninputs * edge_count)
@@ -57,6 +58,7 @@ typedef struct {
     int *inc_offset;    /* ninputs + 1 */
     int *inc_edges;     /* total incidence entries */
     int *cover;         /* ninputs */
+    int *off_cover;     /* uncovered OFF edges; optional for weighted pricing */
     int *allowed;       /* edge_count */
     /*
      * Selected and forbidden vertices are ignored by the max-cover bound.
@@ -74,6 +76,8 @@ typedef struct {
         int candidate,
         void *data
     );
+    bool (*prune_bound)(double bound, void *data);
+    void (*push_vertex)(int vertex, int depth, void *data);
     void *search_data;
     BoundedMMCSStats *stats;
     WeightedMMCSPriceTelemetry *telemetry;
@@ -119,6 +123,11 @@ typedef struct {
     WeightedMMCSPriceBatch *local_batch;
     WeightedMMCSPriceTelemetry *telemetry;
     bool collect_timing;
+    const WeightedMMCSPreparedRows *prepared;
+    /* All compatible rows, including zero/negative weights, for exact leaf
+     * coverage. Bounds sum only positive weights, in original row order. */
+    uint64_t *compatible;
+    double *compatible_bounds;
 } WeightedPriceContext;
 
 typedef struct {
@@ -145,6 +154,7 @@ typedef struct {
     int *inc_offset;
     int *inc_cursor;
     int *cover;
+    int *off_cover;
     int *allowed;
     uint64_t *inactive_vertices;
     int *inc_edges;
@@ -378,7 +388,8 @@ static int unique_selected_on_edge(
 
 /* an edge just became covered: it no longer contributes to any cover[] */
 static void edge_now_covered(MMCSState *state, int edge) {
-    if (state->disable_cover_bound) return;
+    const bool off = edge < state->critical_edge_count;
+    if (state->disable_cover_bound && !(off && state->off_cover)) return;
     for (int w = 0; w < state->edge_words; ++w) {
         uint64_t word = mmcs_edge_word(state, edge, w);
         if (state->inactive_vertices) {
@@ -390,14 +401,16 @@ static void edge_now_covered(MMCSState *state, int edge) {
             if (state->telemetry) {
                 state->telemetry->edge_literal_entries_visited++;
             }
-            state->cover[v]--;
+            if (!state->disable_cover_bound) state->cover[v]--;
+            if (off && state->off_cover) state->off_cover[v]--;
         }
     }
 }
 
 /* an edge just became uncovered again on backtrack */
 static void edge_now_uncovered(MMCSState *state, int edge) {
-    if (state->disable_cover_bound) return;
+    const bool off = edge < state->critical_edge_count;
+    if (state->disable_cover_bound && !(off && state->off_cover)) return;
     for (int w = 0; w < state->edge_words; ++w) {
         uint64_t word = mmcs_edge_word(state, edge, w);
         if (state->inactive_vertices) {
@@ -409,7 +422,8 @@ static void edge_now_uncovered(MMCSState *state, int edge) {
             if (state->telemetry) {
                 state->telemetry->edge_literal_entries_visited++;
             }
-            state->cover[v]++;
+            if (!state->disable_cover_bound) state->cover[v]++;
+            if (off && state->off_cover) state->off_cover[v]++;
         }
     }
 }
@@ -444,6 +458,7 @@ static bool add_vertex(
              */
             if (edge < state->critical_edge_count) {
                 state->critical_count[vertex]++;
+                state->uncovered_off_count--;
             }
         } else if (state->hit_count[edge] == 1) {
             if (edge < state->critical_edge_count) {
@@ -476,7 +491,7 @@ static void remove_vertex(
     MMCSState *state,
     int vertex
 ) {
-    int restored_cover = 0;
+    int restored_cover = 0, restored_off_cover = 0;
     MMCSIncidenceIterator iterator;
     incidence_iterator_init(&iterator, state, vertex);
     int edge = 0;
@@ -489,6 +504,8 @@ static void remove_vertex(
             if (!state->disable_cover_bound) restored_cover++;
             if (edge < state->critical_edge_count) {
                 state->critical_count[vertex]--;
+                state->uncovered_off_count++;
+                restored_off_cover++;
             }
             state->uncovered_count++;
             edge_now_uncovered(state, edge);
@@ -505,6 +522,7 @@ static void remove_vertex(
     state->selected[vertex] = 0;
     if (state->inactive_vertices) {
         state->cover[vertex] = restored_cover;
+        if (state->off_cover) state->off_cover[vertex] = restored_off_cover;
         state->inactive_vertices[vertex / 64] &=
             ~(UINT64_C(1) << (vertex % 64));
     }
@@ -530,7 +548,7 @@ static void forbid_vertex(MMCSState *state, int vertex) {
 }
 
 static void unforbid_vertex(MMCSState *state, int vertex) {
-    int restored_cover = 0;
+    int restored_cover = 0, restored_off_cover = 0;
     MMCSIncidenceIterator iterator;
     incidence_iterator_init(&iterator, state, vertex);
     int edge = 0;
@@ -539,12 +557,14 @@ static void unforbid_vertex(MMCSState *state, int vertex) {
             state->telemetry->literal_incidence_entries_visited++;
         }
         state->allowed[edge]++;
-        if (!state->disable_cover_bound && state->hit_count[edge] == 0) {
-            restored_cover++;
+        if (state->hit_count[edge] == 0) {
+            if (!state->disable_cover_bound) restored_cover++;
+            if (edge < state->critical_edge_count) restored_off_cover++;
         }
     }
     if (state->inactive_vertices) {
         state->cover[vertex] = restored_cover;
+        if (state->off_cover) state->off_cover[vertex] = restored_off_cover;
         state->inactive_vertices[vertex / 64] &=
             ~(UINT64_C(1) << (vertex % 64));
     }
@@ -621,6 +641,9 @@ static void mmcs_search(
         return;
     }
 
+    /* A further literal needs a previously uncovered OFF edge as its
+     * private witness. Ownership edges alone cannot establish primality. */
+    if (state->uncovered_off_count == 0) return;
     if (state->selected_count >= state->target_size) return;
 
     /*
@@ -661,14 +684,15 @@ static void mmcs_search(
     for (int vertex = 0; vertex < state->ninputs; ++vertex) {
         if (
             !state->forbidden[vertex] &&
+            (!state->off_cover || state->off_cover[vertex] > 0) &&
             edge_contains(state, pivot, vertex)
         ) {
             branch_vertices[branch_count++] = vertex;
         }
     }
 
-    if (state->branch_priority && branch_count > 1) {
-        double priorities[state->ninputs];
+    double priorities[state->ninputs];
+    if (state->branch_priority) {
         for (int i = 0; i < branch_count; ++i) {
             priorities[i] = state->branch_priority(
                 state->selected_vertices,
@@ -700,14 +724,24 @@ static void mmcs_search(
         }
     }
 
+    int forbidden_count = 0;
     for (
         int i = 0;
         i < branch_count && !state->failed && !state->limit_reached;
         ++i
     ) {
+        /* These sorted priorities bound every descendant of the branch.
+         * Use precisely the same tolerance and tie policy as node pruning;
+         * in particular a full witness batch must keep equal-weight ties. */
+        if (state->branch_priority && state->prune_bound &&
+            state->prune_bound(priorities[i], state->search_data)) break;
         int vertex = branch_vertices[i];
         bool minimal = add_vertex(state, vertex);
-        if (minimal) mmcs_search(state);
+        if (minimal) {
+            if (state->push_vertex)
+                state->push_vertex(vertex, state->selected_count, state->search_data);
+            mmcs_search(state);
+        }
         remove_vertex(state, vertex);
 
         /*
@@ -716,68 +750,41 @@ static void mmcs_search(
          * the branch containing its first selected pivot vertex.
          */
         forbid_vertex(state, vertex);
+        forbidden_count++;
     }
 
-    for (int i = 0; i < branch_count; ++i) {
+    for (int i = 0; i < forbidden_count; ++i) {
         unforbid_vertex(state, branch_vertices[i]);
     }
 }
 
-static bool row_matches_partial_cube(
-    const WeightedPriceContext *context,
-    int row,
-    const int *vertices,
-    int count,
-    int candidate
+/* Intersect one literal with a saved depth. Summing set bits in increasing
+ * row order preserves the scalar oracle's floating-point accumulation order. */
+static double compatible_extension(
+    const WeightedPriceContext *context, int depth, int candidate, uint64_t *dest
 ) {
-    const int *on_row = &context->pi->ON_set[
-        (size_t)row * (size_t)context->ninputs
-    ];
-    for (int i = 0; i < count; ++i) {
-        int vertex = vertices[i];
-        if (on_row[vertex] != context->anchor[vertex]) return false;
-    }
-    return candidate < 0 ||
-        on_row[candidate] == context->anchor[candidate];
-}
-
-static double compatible_positive_weight(
-    const WeightedPriceContext *context,
-    const int *vertices,
-    int count,
-    int candidate
-) {
+    const int words = context->prepared->on_column_words;
+    const uint64_t *parent = context->compatible + (size_t)depth * words;
+    const uint64_t *column = context->prepared->on_columns + (size_t)candidate * words;
+    const bool one = context->anchor[candidate] == 2;
     double bound = 0.0;
-    if (context->telemetry) {
-        context->telemetry->compatible_bound_calls++;
-    }
-    /*
-     * Canonical ownership forces every completed cube for this anchor to
-     * exclude all earlier ON rows. They can therefore never contribute to a
-     * descendant's priced weight, even if they still match the partial cube.
-     */
-    for (
-        int row = context->anchor_index;
-        row < context->pi->ON_minterms;
-        ++row
-    ) {
-        if (context->telemetry) {
-            context->telemetry->compatible_bound_rows_examined++;
-        }
-        if (
-            context->row_weights[row] > 0.0 &&
-            row_matches_partial_cube(
-                context,
-                row,
-                vertices,
-                count,
-                candidate
-            )
-        ) {
-            bound += context->row_weights[row];
+    for (int w = 0; w < words; ++w) {
+        uint64_t bits = parent[w] & (one ? column[w] : ~column[w]);
+        if (dest) dest[w] = bits;
+        while (bits) {
+            int row = w * 64 + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            if (context->telemetry) context->telemetry->compatible_bound_rows_examined++;
+            if (context->row_weights[row] > 0.0) bound += context->row_weights[row];
         }
     }
     return bound;
+}
+
+static void weighted_push_vertex(int vertex, int depth, void *data) {
+    WeightedPriceContext *context = data;
+    context->compatible_bounds[depth] = compatible_extension(context, depth - 1, vertex,
+        context->compatible + (size_t)depth * context->prepared->on_column_words);
 }
 
 static int compare_vertex_sets(
@@ -1124,9 +1131,8 @@ NEXT_MERGED_CANDIDATE:
     return true;
 }
 
-static bool weighted_price_prune(
-    const int *vertices,
-    int count,
+static bool weighted_price_prune_bound(
+    double bound,
     void *data
 ) {
     WeightedPriceContext *context = (WeightedPriceContext *)data;
@@ -1143,12 +1149,6 @@ static bool weighted_price_prune(
             prune_equal = false;
         }
     }
-    double bound = compatible_positive_weight(
-        context,
-        vertices,
-        count,
-        -1
-    );
     if (
         bound < threshold - 1e-12 ||
         (prune_equal && bound <= threshold + 1e-12)
@@ -1159,6 +1159,17 @@ static bool weighted_price_prune(
     return false;
 }
 
+static bool weighted_price_prune(
+    const int *vertices,
+    int count,
+    void *data
+) {
+    WeightedPriceContext *context = (WeightedPriceContext *)data;
+    if (!isfinite(context->best_weight)) return false;
+    if (context->telemetry) context->telemetry->compatible_bound_calls++;
+    return weighted_price_prune_bound(context->compatible_bounds[count], data);
+}
+
 static double weighted_branch_priority(
     const int *vertices,
     int count,
@@ -1167,12 +1178,8 @@ static double weighted_branch_priority(
 ) {
     const WeightedPriceContext *context =
         (const WeightedPriceContext *)data;
-    return compatible_positive_weight(
-        context,
-        vertices,
-        count,
-        candidate
-    );
+    if (context->telemetry) context->telemetry->compatible_bound_calls++;
+    return compatible_extension(context, count, candidate, NULL);
 }
 
 static bool collect_weighted_price(
@@ -1191,19 +1198,14 @@ static bool collect_weighted_price(
         coverage_words > 0 ? coverage_words : 1
     ];
     memset(coverage, 0, sizeof(coverage));
-    for (int row = 0; row < context->pi->ON_minterms; ++row) {
-        if (row_matches_partial_cube(
-            context,
-            row,
-            vertices,
-            count,
-            -1
-        )) {
+    const int words = context->prepared->on_column_words;
+    const uint64_t *compatible = context->compatible + (size_t)count * words;
+    for (int w = 0; w < words; ++w) {
+        for (uint64_t bits = compatible[w]; bits; bits &= bits - 1) {
+            int row = w * 64 + __builtin_ctzll(bits);
             weight += context->row_weights[row];
-            if (coverage_words > 0 && coverage_cov_bits > 0) {
-                coverage[row / coverage_cov_bits] |=
-                    UINT64_C(1) << (row % coverage_cov_bits);
-            }
+            if (coverage_words > 0 && coverage_cov_bits > 0)
+                coverage[row / coverage_cov_bits] |= UINT64_C(1) << (row % coverage_cov_bits);
         }
     }
 
@@ -1848,6 +1850,7 @@ static BoundedMMCSResult bounded_mmcs_generate_output_target_limited(
             .hit_count = hit_count,
             .critical_count = critical_count,
             .uncovered_count = edge_count,
+            .uncovered_off_count = pi->OFF_minterms,
             .inc_offset = inc_offset,
             .inc_edges = inc_edges,
             .cover = cover,
@@ -2108,10 +2111,13 @@ static void weighted_price_worker_destroy(
     free(worker->inc_offset);
     free(worker->inc_cursor);
     free(worker->cover);
+    free(worker->off_cover);
     free(worker->allowed);
     free(worker->inactive_vertices);
     free(worker->inc_edges);
     free(worker->best_vertices);
+    free(worker->price.compatible);
+    free(worker->price.compatible_bounds);
     free(worker->local_batch.weights);
     free(worker->local_batch.anchors);
     free(worker->local_batch.support_sizes);
@@ -2179,6 +2185,7 @@ static bool weighted_price_worker_init(
             (int *)calloc((size_t)ninputs + 1, sizeof(int));
     }
     worker->cover = (int *)calloc((size_t)ninputs, sizeof(int));
+    worker->off_cover = (int *)calloc((size_t)ninputs, sizeof(int));
     worker->allowed =
         (int *)calloc((size_t)worker->max_edges, sizeof(int));
     worker->inactive_vertices = (uint64_t *)calloc(
@@ -2223,6 +2230,7 @@ static bool weighted_price_worker_init(
         (use_materialized_backend && !worker->inc_offset) ||
         (use_materialized_backend && !worker->inc_cursor) ||
         !worker->cover ||
+        !worker->off_cover ||
         !worker->allowed ||
         !worker->inactive_vertices ||
         !worker->best_vertices ||
@@ -2254,8 +2262,20 @@ static bool weighted_price_worker_init(
             ? &worker->local_batch
             : NULL,
         .telemetry = collect_timing ? &worker->telemetry : NULL,
-        .collect_timing = collect_timing
+        .collect_timing = collect_timing,
+        .prepared = prepared
     };
+    size_t depths = (size_t)max_level + 1, words = (size_t)prepared->on_column_words;
+    if (depths > SIZE_MAX / words / sizeof(uint64_t)) {
+        weighted_price_worker_destroy(worker);
+        return false;
+    }
+    worker->price.compatible = calloc(depths * words, sizeof(uint64_t));
+    worker->price.compatible_bounds = calloc(depths, sizeof(double));
+    if (!worker->price.compatible || !worker->price.compatible_bounds) {
+        weighted_price_worker_destroy(worker);
+        return false;
+    }
     return true;
 }
 
@@ -2526,6 +2546,20 @@ static void weighted_price_anchor_search(
     WeightedMMCSPriceTelemetry *telemetry = &worker->telemetry;
     worker->price.anchor = anchor->values;
     worker->price.anchor_index = anchor->index;
+    for (int vertex = 0; vertex < worker->ninputs; ++vertex) {
+        int ones = (int)worker->prepared->off_one_counts[vertex];
+        worker->off_cover[vertex] = anchor->values[vertex] == 2
+            ? pi->OFF_minterms - ones : ones;
+    }
+    /* Ownership excludes earlier ON rows in every completed descendant. */
+    int on_words = worker->prepared->on_column_words;
+    memset(worker->price.compatible, 0, (size_t)on_words * sizeof(uint64_t));
+    double root_bound = 0.0;
+    for (int row = anchor->index; row < pi->ON_minterms; ++row) {
+        worker->price.compatible[row / 64] |= UINT64_C(1) << (row % 64);
+        if (worker->row_weights[row] > 0.0) root_bound += worker->row_weights[row];
+    }
+    worker->price.compatible_bounds[0] = root_bound;
     MMCSState state = {
         .ninputs = worker->ninputs,
         .edge_count = anchor->edge_count,
@@ -2545,15 +2579,19 @@ static void weighted_price_anchor_search(
         .hit_count = worker->hit_count,
         .critical_count = worker->critical_count,
         .uncovered_count = anchor->edge_count,
+        .uncovered_off_count = pi->OFF_minterms,
         .inc_offset = worker->inc_offset,
         .inc_edges = worker->inc_edges,
         .cover = worker->cover,
+        .off_cover = worker->disable_cover_bound ? NULL : worker->off_cover,
         .allowed = worker->allowed,
         .inactive_vertices = worker->inactive_vertices,
         .emit = collect_weighted_price,
         .emit_data = &worker->price,
         .prune = weighted_price_prune,
         .branch_priority = weighted_branch_priority,
+        .prune_bound = weighted_price_prune_bound,
+        .push_vertex = weighted_push_vertex,
         .search_data = &worker->price,
         .stats = &worker->search_stats,
         .telemetry = worker->collect_timing ? telemetry : NULL,
@@ -2671,6 +2709,7 @@ static void weighted_price_worker_range(
 static uint64_t weighted_worker_bytes_estimate(
     const PIstorage *pi,
     int ninputs,
+    int max_level,
     bool use_materialized_backend,
     bool cache_edge_words
 ) {
@@ -2700,7 +2739,7 @@ static uint64_t weighted_worker_bytes_estimate(
     uint64_t input_arrays =
         (
             (uint64_t)ninputs *
-            (use_materialized_backend ? 7u : 4u) +
+            (use_materialized_backend ? 8u : 5u) +
             (use_materialized_backend ? 2u : 0u)
         ) * sizeof(int) +
         (uint64_t)ninputs * 2u * sizeof(unsigned char) +
@@ -2711,7 +2750,12 @@ static uint64_t weighted_worker_bytes_estimate(
     ) {
         return UINT64_MAX;
     }
-    return bytes + edge_arrays + input_arrays;
+    bytes += edge_arrays + input_arrays;
+    uint64_t depths = (uint64_t)max_level + 1u;
+    uint64_t depth_bytes = ((uint64_t)pi->ON_minterms + 63u) / 64u * sizeof(uint64_t)
+        + sizeof(double);
+    if (depths > (UINT64_MAX - bytes) / depth_bytes) return UINT64_MAX;
+    return bytes + depths * depth_bytes;
 }
 
 typedef struct {
@@ -2867,6 +2911,7 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     uint64_t estimated_worker_bytes = weighted_worker_bytes_estimate(
         pi,
         ninputs,
+        max_level,
         use_materialized_backend,
         cache_edge_words && max_level > 1
     );

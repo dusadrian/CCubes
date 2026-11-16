@@ -271,6 +271,47 @@ static void reject_unproved_bounds(void)
     assert(resources.work <= resources.work_limit);
 }
 
+static void untrusted_node_weights(void)
+{
+    /* This table has a feasible two-cube cover. */
+    const int on[] = {1, 1, 1, 2, 1, 1, 2, 2, 2};
+    const int off[] = {1, 1, 2, 1, 2, 1};
+    const uint64_t root[] = {1, 1, 1};
+    uint64_t suggested[] = {100, 21, 17};
+    NsatCoverInput q = {.on = on, .off = off, .inputs = 3,
+        .positives = 3, .negatives = 2, .target = 3};
+    IpcWeightHint entries[IPC_WEIGHT_HINT_BUCKETS] = {0};
+    IpcWeightHint *entry = &entries[ipc_weight_hint_bucket(7, 2)];
+    *entry = (IpcWeightHint){.residual = 7, .slots = 2, .index = 1};
+    const IpcWeightHints hints = {.entries = entries, .weights = suggested,
+        .count = 1, .rows = 3};
+    NsatStats stats;
+    /* Loose root pricing forces a cover decision. No proposed vector
+     * can turn a feasible two-cube query into a refutation. */
+    assert(ipc_verify_weighted_hint_bound(&q, root, 3, 3, 3,
+        (NsatLimits){0}, &stats, &hints) == NSAT_ERROR);
+    assert(stats.stop == NSAT_STOP_PROOF);
+
+    suggested[0] = UINT64_MAX;
+    assert(ipc_verify_weighted_hint_bound(&q, root, 3, 3, 3,
+        (NsatLimits){0}, &stats, &hints) == NSAT_ERROR);
+    assert(stats.stop == NSAT_STOP_PROOF);
+
+    entry->index = 2;
+    assert(ipc_verify_weighted_hint_bound(&q, root, 3, 3, 3,
+        (NsatLimits){0}, &stats, &hints) == NSAT_ERROR);
+    assert(stats.stop == NSAT_STOP_PROOF);
+
+    /* A table with isolated ON points requires three cubes. */
+    const int disjoint_on[] = {1, 1, 1, 1, 2, 2, 2, 1, 2};
+    const int disjoint_off[] = {1, 1, 2, 1, 2, 1, 2, 1, 1, 2, 2, 1, 2, 2, 2};
+    q.on = disjoint_on;
+    q.off = disjoint_off;
+    q.negatives = 5;
+    assert(ipc_verify_weighted_hint_bound(&q, root, 3, 3, 3,
+        (NsatLimits){0}, &stats, &hints) == NSAT_UNSAT);
+}
+
 static void adaptive_root_pricing(void)
 {
     /* The ordinary cover has 11 cubes and initial IPC pricing proves 9.
@@ -320,6 +361,7 @@ int main(void)
     many_rows();
     lower_target_cover();
     reject_unproved_bounds();
+    untrusted_node_weights();
     adaptive_root_pricing();
     printf("IPC weighted integer cover: %zu exhaustive tables, wide covers and checked bounds\n", cases);
     return 0;

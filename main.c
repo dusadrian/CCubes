@@ -1345,6 +1345,11 @@ int main(int argc, char *argv[]) {
             progressive_native_reduce_expand_interval;
         progressive_options.native_private_micro =
             progressive_native_private_micro == 1;
+        const char *ipc_exact_pricing =
+            ccubes_option(OPTION_PROGRESSIVE_EXACT_PRICING);
+        if (ipc_exact_pricing) {
+            progressive_options.native_exact_pricing = atoi(ipc_exact_pricing) == 1;
+        }
 
         progressive_options.greedy_anchor_percent =
             (unsigned int)progressive_greedy_anchor_percent;

@@ -122,7 +122,8 @@ typedef struct {
     /*
      * Diagnostic ablation of the remaining-slot max-cover bound. Disabling
      * the bound preserves enumeration correctness, but avoids maintaining
-     * cover[v] across every edge cover/uncover transition.
+     * cover[v] and the per-vertex OFF counts across edge transitions. The
+     * constant-time all-OFF-covered test remains enabled.
      */
     bool disable_cover_bound;
     /*

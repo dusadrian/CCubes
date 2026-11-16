@@ -88,7 +88,7 @@ SRC := binomial.c bounded_mmcs.c ccubes_threads.c certified_stop.c \
   pool_selection.c prime_check.c \
   progressive_column_pool.c progressive_cover.c progressive_dual_calibration.c \
   progressive_global_bound.c progressive_greedy_price.c progressive_input.c progressive_literal_polish.c \
-  progressive_native_cover.c progressive_native_master.c progressive_native_phase_policy.c progressive_native_reduce_expand.c \
+  progressive_native_cover.c progressive_native_exact_price.c progressive_native_master.c progressive_native_phase_policy.c progressive_native_reduce_expand.c \
   progressive_native_repair.c progressive_rwls.c progressive_seed.c progressive_validation.c \
   subsumption_index.c cover_domain.c cover_encoding.c native_sat.c native_sat_verify.c \
   ipc_weighted_cover.c ipc_weighted_verify.c systematic_certify.c utils.c cli.c \
@@ -217,8 +217,8 @@ $(BIN): $(OBJ) .build-config
 clean:
 	rm -f $(OBJ) $(DEP) $(BIN) .build-config .build-config.tmp
 
-.PHONY: test test-native-sat test-ipc-weighted-cover test-systematic-cli
-test: test-native-sat test-ipc-weighted-cover test-systematic-cli
+.PHONY: test test-native-sat test-ipc-weighted-cover test-systematic-cli test-ipc-exact-pricing test-bounded-mmcs test-native-node-seed
+test: test-native-sat test-ipc-weighted-cover test-systematic-cli test-ipc-exact-pricing test-bounded-mmcs test-native-node-seed
 
 test-native-sat:
 	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' 0; \
@@ -234,5 +234,21 @@ test-ipc-weighted-cover:
 
 test-systematic-cli: $(BIN)
 	sh tests/test_systematic_certify.sh ./$(BIN)
+
+test-ipc-exact-pricing: $(BIN)
+	sh tests/test_ipc_exact_pricing.sh ./$(BIN)
+
+# Use the same thread backend as the executable for the pricing oracles.
+PRICING_TEST_FLAGS = $(filter -DHAVE_OPENMP -fopenmp -DHAVE_PTHREAD -pthread,$(CFLAGS))
+
+test-bounded-mmcs:
+	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' 0; \
+	$(CC) -Wall -O2 -std=c11 -I. $(PRICING_TEST_FLAGS) tests/test_bounded_mmcs.c bounded_mmcs.c ccubes_threads.c runtime_options.c -o "$$dir/mmcs" -lm; \
+	"$$dir/mmcs"
+
+test-native-node-seed:
+	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' 0; \
+	$(CC) -Wall -O2 -std=c11 -I. $(PRICING_TEST_FLAGS) tests/test_progressive_native_exact_price.c progressive_global_bound.c bounded_mmcs.c progressive_native_master.c progressive_validation.c lagrangian.c ccubes_threads.c cover_validation.c runtime_options.c -o "$$dir/seed" -lm; \
+	"$$dir/seed"
 
 -include $(DEP)

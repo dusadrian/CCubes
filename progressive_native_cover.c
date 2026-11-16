@@ -25,6 +25,7 @@
 #include "progressive_greedy_price.h"
 #include "progressive_literal_polish.h"
 #include "progressive_rwls.h"
+#include "progressive_native_exact_price.h"
 #include "progressive_native_master.h"
 #include "progressive_native_phase_policy.h"
 #include "progressive_native_reduce_expand.h"
@@ -34,6 +35,12 @@
 
 #define PROGRESSIVE_NATIVE_RC_TOL 1e-8
 #define PROGRESSIVE_NATIVE_LITERAL_POLISH_NODES 200000
+/* Exact pricing runs for at most this many seconds per call. Its time is
+ * added back to the search deadline, so ordinary rounds keep their budget.
+ * While the master selects cubes from the latest call, it runs every round;
+ * otherwise the gap between calls doubles up to the maximum. */
+#define NATIVE_EXACT_PRICING_CALL_SECONDS 2.0
+#define NATIVE_EXACT_PRICING_MAX_INTERVAL 64
 #define PROGRESSIVE_GLOBAL_DUAL_ITERATIONS 256
 #define PROGRESSIVE_GLOBAL_DUAL_WITNESS_BATCH 32
 #define PROGRESSIVE_GLOBAL_DUAL_MAX_CONSTRAINTS 256
@@ -2956,6 +2963,11 @@ ProgressiveCoverStatus progressive_native_cover_run(
     }
     int round = 1;
     int next_pool_snapshot = 0;
+    ProgressiveNativeExactPriceState exact_pricing = {0};
+    bool exact_pricing_enabled = options->native_exact_pricing;
+    int exact_interval = 1, exact_next_round = 1;
+    int exact_last_begin = 0, exact_last_end = 0;
+    int exact_useful_calls = 0;
 resume_native_pricing:
     for (; !false;) {
         status = save_due_pool_snapshots(
@@ -3293,6 +3305,125 @@ resume_native_pricing:
             }
         }
 
+        uint64_t exact_round_nanoseconds = 0;
+        if (
+            exact_pricing_enabled &&
+            result->cardinality > 1 &&
+            result->solution &&
+            !native_deadline_reached(deadline)
+        ) {
+            /* The master solved at the start of this round has seen the
+             * latest call's cubes; selecting one makes that call useful. */
+            if (exact_last_end > exact_last_begin) {
+                bool useful = false;
+                for (int index = 0; index < selected_cardinality && !useful; ++index)
+                    useful = selected[index] >= exact_last_begin &&
+                        selected[index] < exact_last_end;
+                if (useful) {
+                    exact_useful_calls++;
+                    exact_interval = 1;
+                } else if (exact_interval < NATIVE_EXACT_PRICING_MAX_INTERVAL) {
+                    exact_interval *= 2;
+                }
+                exact_next_round = round + exact_interval - 1;
+                exact_last_begin = exact_last_end = 0;
+            }
+            /* With nothing new from greedy pricing, only exact pricing can
+             * keep the search going, so it always runs. */
+            if (added == 0 || round >= exact_next_round) {
+                const double slice = NATIVE_EXACT_PRICING_CALL_SECONDS;
+                const int columns_before = master.count;
+                int *improved = NULL;
+                ProgressiveNativeExactPriceStep exact_step;
+                const ProgressiveNativeExactPriceStatus exact_status =
+                    progressive_native_exact_price_step(
+                        pi,
+                        &prepared,
+                        &master,
+                        multipliers,
+                        result->cardinality,
+                        result->solution,
+                        options->requested_threads,
+                        options->memory_budget_bytes *
+                            (uint64_t)options->worker_memory_percent / 100u,
+                        slice,
+                        &exact_pricing,
+                        &improved,
+                        &exact_step
+                    );
+                fprintf(
+                    stderr,
+                    "CCUBES_PROGRESSIVE_NATIVE_EXACT_PRICE round=%d kind=%s "
+                    "status=%d returned=%d inserted=%d max=%.9f upper=%.9f "
+                    "complete=%s anchor=%d released=%d residual_rows=%d "
+                    "node_columns=%d node_bound=%.9f node_cover=%d "
+                    "certified_lower=%d improved=%d seconds=%.6f\n",
+                    round,
+                    exact_step.node ? "node" : "global",
+                    (int)exact_status,
+                    exact_step.returned,
+                    exact_step.inserted,
+                    exact_step.max_found,
+                    exact_step.upper,
+                    exact_step.complete ? "yes" : "no",
+                    exact_step.anchor,
+                    exact_step.released,
+                    exact_step.residual_rows,
+                    exact_step.node_columns,
+                    exact_step.node_bound,
+                    exact_step.node_cover,
+                    exact_step.certified_lower,
+                    exact_step.improved_cardinality,
+                    exact_step.seconds
+                );
+                if (exact_status == PROGRESSIVE_NATIVE_EXACT_PRICE_OUT_OF_MEMORY) {
+                    status = PROGRESSIVE_COVER_OUT_OF_MEMORY;
+                    goto cleanup;
+                }
+                exact_round_nanoseconds = (uint64_t)(exact_step.seconds * 1e9);
+                /* Dedicated time: the call does not consume the search budget. */
+                if (deadline > 0 && deadline < UINT64_MAX - exact_round_nanoseconds)
+                    deadline += exact_round_nanoseconds;
+                if (
+                    soft_target.base_deadline > 0 &&
+                    soft_target.base_deadline < UINT64_MAX - exact_round_nanoseconds
+                )
+                    soft_target.base_deadline += exact_round_nanoseconds;
+                exact_last_begin = columns_before;
+                exact_last_end = master.count;
+                if (exact_step.improved_cardinality > 0) {
+                    exact_useful_calls++;
+                    exact_interval = 1;
+                }
+                exact_next_round = round + 1;
+                if (exact_last_end == exact_last_begin && exact_step.improved_cardinality == 0) {
+                    /* Nothing new to select: back off without waiting a round. */
+                    if (exact_interval < NATIVE_EXACT_PRICING_MAX_INTERVAL) exact_interval *= 2;
+                    exact_next_round = round + exact_interval;
+                }
+                if (exact_status == PROGRESSIVE_NATIVE_EXACT_PRICE_OK) {
+                    added += exact_step.inserted;
+                    if (improved) {
+                        status = adopt_incumbent(
+                            ninputs,
+                            &prepared,
+                            options,
+                            result,
+                            exact_step.improved_cardinality,
+                            PROGRESSIVE_INCUMBENT_PRICED_MASTER,
+                            improved
+                        );
+                        if (status != PROGRESSIVE_COVER_OK) goto cleanup;
+                    }
+                } else {
+                    /* An unsupported or failed exact pricer leaves the
+                     * ordinary IPC route unchanged for the rest of the run. */
+                    free(improved);
+                    exact_pricing_enabled = false;
+                }
+            }
+        }
+
         const bool consider_private_micro =
             options->native_private_micro &&
             !native_private_micro_price_attempted &&
@@ -3414,10 +3545,12 @@ resume_native_pricing:
         );
         previous_round_column_floor = trace_master_columns;
         previous_round_added = added;
+        /* Calibrate the soft target on ordinary work only. */
         observe_native_completed_round(
             &soft_target,
             result,
-            native_monotonic_nanoseconds() - round_started
+            native_monotonic_nanoseconds() - round_started -
+                exact_round_nanoseconds
         );
         observe_native_soft_target(
             &soft_target,
@@ -3881,6 +4014,25 @@ resume_native_pricing:
         );
     }
 
+    if (options->native_exact_pricing) {
+        fprintf(
+            stderr,
+            "CCUBES_PROGRESSIVE_NATIVE_EXACT_PRICE_SUMMARY calls=%d "
+            "node_calls=%d inserted=%d node_improvements=%d "
+            "node_certificates=%d useful_calls=%d interval=%d "
+            "enabled=%s seconds=%.6f best=%d\n",
+            exact_pricing.calls,
+            exact_pricing.node_calls,
+            exact_pricing.inserted,
+            exact_pricing.node_improvements,
+            exact_pricing.node_certificates,
+            exact_useful_calls,
+            exact_interval,
+            exact_pricing_enabled ? "yes" : "no",
+            (double)exact_pricing.nanoseconds / 1e9,
+            result->cardinality
+        );
+    }
     result->retained_columns = master.count;
     if (!native_bound_is_fresh(&master, result)) {
         result->lp_objective = NAN;

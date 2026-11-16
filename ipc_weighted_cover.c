@@ -23,6 +23,10 @@ typedef struct {
     uint64_t *diff, *columns;
     size_t capacity, input_words, row_words, mask_words;
     uint64_t (*weight_bytes)[256];
+    IpcWeightHint *hint_entries;
+    uint64_t *hint_weights;
+    size_t hint_count;
+    uint64_t hint_work;
 } WeightedCover;
 
 static double monotonic_seconds(void)
@@ -647,6 +651,54 @@ done:
     return best > 0 ? weights : NULL;
 }
 
+static bool prepare_hints(WeightedCover *w)
+{
+    size_t rows = w->input->positives;
+    size_t entries_bytes = IPC_WEIGHT_HINT_BUCKETS * sizeof(*w->hint_entries);
+    size_t weights_bytes = (IPC_WEIGHT_HINT_BUCKETS / 2) * rows * sizeof(*w->hint_weights);
+    if (entries_bytes + weights_bytes > nsat_memory_available(&w->budget) ||
+        entries_bytes + rows + 1 >= work_remaining(&w->budget)) return true;
+
+    w->hint_entries = nsat_alloc(&w->budget, 1, entries_bytes);
+    w->hint_weights = nsat_alloc(&w->budget, 1, weights_bytes);
+    if (!w->hint_entries || !w->hint_weights) return false;
+    uint64_t before = w->budget.stats.work;
+    bool ready = nsat_copy(&w->budget, w->hint_entries, NULL, entries_bytes);
+    w->hint_work += w->budget.stats.work - before;
+    return ready;
+}
+
+static bool record_hint(WeightedCover *w, uint64_t residual, int slots, const uint64_t *local)
+{
+    /* Only collect for the automatic checker, and only after the search
+     * and repricing workspaces have been allocated. */
+    if (!w->auto_check || w->mask_words != 1 ||
+        w->hint_count >= IPC_WEIGHT_HINT_BUCKETS / 2) return true;
+    if (!w->hint_entries && !prepare_hints(w)) return false;
+    if (!w->hint_entries) return true;
+    if (work_remaining(&w->budget) <= w->input->positives + IPC_WEIGHT_HINT_BUCKETS / 2 + 1)
+        return true;
+    size_t bucket = ipc_weight_hint_bucket(residual, slots);
+    uint64_t before = w->budget.stats.work;
+    while (w->hint_entries[bucket].index) {
+        if (!nsat_work(&w->budget, 1)) return false;
+        if (w->hint_entries[bucket].residual == residual && w->hint_entries[bucket].slots == slots) {
+            w->hint_work += w->budget.stats.work - before;
+            return true;
+        }
+        bucket = (bucket + 1) & (IPC_WEIGHT_HINT_BUCKETS - 1);
+    }
+    size_t rows = w->input->positives;
+    if (!nsat_work(&w->budget, rows + 1)) return false;
+    uint64_t *out = w->hint_weights + w->hint_count * rows;
+    for (size_t r = 0; r < rows; ++r)
+        out[r] = (residual & row_bit((unsigned)r)) ? local[r] : 0;
+    w->hint_entries[bucket] = (IpcWeightHint){.residual = residual,
+        .slots = slots, .index = ++w->hint_count};
+    w->hint_work += w->budget.stats.work - before;
+    return true;
+}
+
 /* Every cube of a k-cube completion must cover at least W-(k-1)U. */
 static bool filter_choices(WeightedCover *w, const uint64_t *remaining, int slots,
                            size_t *child, size_t count, SearchFrame *frame, size_t *frequency,
@@ -718,6 +770,7 @@ static NsatStatus prepare_search(WeightedCover *w, const uint64_t *remaining, in
         depth, slots);
     if (w->budget.status != NSAT_OK) return w->budget.status;
     if (!local) return NSAT_OK;
+    if (!record_hint(w, *remaining, slots, local)) return w->budget.status;
     uint64_t local_total = weight(w, remaining, remaining, local), local_maximum = 0;
     for (size_t c = 0; c < frame->count; ++c) {
         if (!nsat_work(&w->budget, w->mask_words)) return w->budget.status;
@@ -852,7 +905,9 @@ static void verify_bound(WeightedCover *w, const uint64_t *weights,
     bool auto_is_limiting = false;
     if (w->auto_check) {
         const uint64_t spent_checking = w->result.check.work;
-        const uint64_t search_work = work_used - spent_checking;
+        uint64_t search_work = work_used - spent_checking;
+        /* Capturing hints cannot enlarge the checker's automatic work cap. */
+        search_work -= w->hint_work;
         const uint64_t extension = search_work / 8;
         const uint64_t automatic_limit = search_work > UINT64_MAX - extension
             ? UINT64_MAX : search_work + extension;
@@ -874,8 +929,10 @@ static void verify_bound(WeightedCover *w, const uint64_t *weights,
     } else {
         limits.work = allowance == UINT64_MAX ? 0 : allowance;
         if (limits.memory_bytes) limits.memory_bytes -= w->budget.stats.memory_bytes;
-        status = ipc_verify_weighted_bound(w->input, weights, w->input->positives,
-            maximum, proposed, limits, &check);
+        IpcWeightHints hints = {.entries = w->hint_entries, .weights = w->hint_weights,
+            .count = w->hint_count, .rows = w->input->positives};
+        status = ipc_verify_weighted_hint_bound(w->input, weights, w->input->positives,
+            maximum, proposed, limits, &check, hints.count ? &hints : NULL);
     }
     double elapsed = monotonic_seconds() - started;
     w->result.check_seconds += elapsed;
@@ -1057,6 +1114,9 @@ done:
     free_repricing(&w, pricing);
     if (w.budget.status == NSAT_OK)
         verify_bound(&w, weights, maximum, final_bound);
+    nsat_free(&w.budget, w.hint_entries, IPC_WEIGHT_HINT_BUCKETS * sizeof(*w.hint_entries));
+    nsat_free(&w.budget, w.hint_weights,
+              (IPC_WEIGHT_HINT_BUCKETS / 2) * q->positives * sizeof(*w.hint_weights));
     if (w.budget.status == NSAT_ERROR) {
         nsat_free(&w.budget, w.result.cover, q->inputs * (size_t)w.result.terms * sizeof(int));
         w.result.cover = NULL;

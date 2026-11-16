@@ -116,6 +116,7 @@ Arguments with values accept either `--name VALUE` or `--name=VALUE`. A dash in 
 | `--literal-polish-time-limit` | Nonnegative seconds | Separate allowance for final IPC literal polishing; `0` means unlimited. |
 | `--ipc-master` | `native` | Select the native IPC restricted master (default). |
 | `--memory-mb` | Positive integer | IPC process memory envelope in MiB. |
+| `--ipc-exact-pricing` | `0`, `1` | Search for additional cubes with exact pricing, including re-pricing neighbourhoods when full-table pricing stalls. Default `1`. Exact pricing gets additional time beyond the IPC target. |
 | `--ipc-effort` | `0`, `1`, `2` | Native IPC master effort; default `0`. |
 | `--profile-pricing` | `0`, `1` | IPC pricing telemetry; default off (`0`). |
 | `--ipc-time-limit` | Nonnegative seconds | Soft per-output IPC wall target; `0` disables. Finishing work can exceed the target. |
@@ -155,7 +156,9 @@ Run `make test` to check the native solver, proof checker, weighted cover search
 
 Use `--route ipc` for the native incremental prime-cover solver. It handles constant outputs directly and solves and merges supported outputs independently. With `--route auto`, eligible wide or dense inputs can select IPC. Ordinary-only requests such as checkpoints, certification, pooling, and an explicit Gurobi solver keep the ordinary route when automatic routing is selected. The `CCUBES_ROUTE` line records the choice and reason.
 
-IPC defaults to the native master at effort zero with greedy pricing, native repair, bounded recovery, and one final literal-polish pass. It runs without Gurobi. The ordinary route retains its optional Gurobi solver and falls back to the hybrid solver if Gurobi support was not built in. The IPC wall target is soft because current work and finalization may extend beyond it. On a single-output run, the solver can publish validated incumbents atomically as it progresses.
+IPC defaults to the native master at effort zero with greedy and exact pricing, native repair, bounded recovery, and one final literal-polish pass. It runs without Gurobi. The ordinary route retains its optional Gurobi solver and falls back to the hybrid solver if Gurobi support was not built in. The IPC wall target is soft because current work and finalization may extend beyond it. On a single-output run, the solver can publish validated incumbents atomically as it progresses.
+
+Exact pricing adds validated candidates to the native cover pool. When a full-table call finds no new candidates, subsequent calls also try replacing groups of cubes in the current cover. Each pricing search has a two-second allowance. IPC adds the time spent in this stage to the search deadline so that it can still spend its regular allowance on greedy pricing and recovery. The candidates found can vary between runs because pricing uses a wall-clock limit. Set `--ipc-exact-pricing 0` to skip this stage.
 
 For example, `--route ipc --ipc-time-limit 60 --ipc-terminal-reserve 15` gives the main IPC search a 45-second target and reserves up to 15 seconds for local search over the retained columns. The reserve can finish early after the patience interval or when the retained pool already has a proven minimum cover. The patience check runs between search rounds.
 

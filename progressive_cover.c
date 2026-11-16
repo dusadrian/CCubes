@@ -94,6 +94,7 @@ void progressive_cover_options_default(
         .native_reduce_expand_start_round = 8,
         .native_reduce_expand_interval = 4,
         .native_private_micro = true,
+        .native_exact_pricing = true,
 
         .unlimited_tail_growth = false,
 

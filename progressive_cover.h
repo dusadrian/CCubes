@@ -96,6 +96,9 @@ typedef struct {
     int native_reduce_expand_start_round;
     int native_reduce_expand_interval;
     bool native_private_micro;
+    /* Exact full-table pricing inside the native IPC loop, with node
+     * re-pricing once global calls stop finding cubes. */
+    bool native_exact_pricing;
 
     bool unlimited_tail_growth;
 
