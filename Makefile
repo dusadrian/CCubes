@@ -81,6 +81,8 @@ ifeq ($(SAN),1)
 endif
 
 # Sources and target
+WEIGHTED_POLISH_SRC := ipc_weighted_cover.c ipc_weighted_verify.c
+
 # Explicit membership prevents stray experimental files entering production.
 SRC := binomial.c bounded_mmcs.c ccubes_threads.c certified_stop.c \
   checkpoint.c cover_validation.c debug.c gurobi.c \
@@ -91,7 +93,7 @@ SRC := binomial.c bounded_mmcs.c ccubes_threads.c certified_stop.c \
   progressive_native_cover.c progressive_native_exact_price.c progressive_native_master.c progressive_native_phase_policy.c progressive_native_reduce_expand.c \
   progressive_native_repair.c progressive_rwls.c progressive_seed.c progressive_validation.c \
   subsumption_index.c cover_domain.c cover_encoding.c native_sat.c native_sat_verify.c \
-  ipc_weighted_cover.c ipc_weighted_verify.c systematic_certify.c utils.c cli.c \
+  $(WEIGHTED_POLISH_SRC) systematic_certify.c utils.c cli.c \
   runtime_options.c
 OBJ  := $(SRC:.c=.o)
 DEP  := $(OBJ:.o=.d)
@@ -112,6 +114,13 @@ ifneq ($(shell test $(DISABLE_OMP) -eq 1; echo $$?),0)
     CXXFLAGS += -fopenmp
     LDFLAGS  += -fopenmp
     $(info OpenMP found -> enabling)
+    # Bounded polish uses a condition variable for transferable search tasks.
+    ifeq ($(USE_PTHREAD),1)
+      ifneq ($(filter Darwin Linux FreeBSD,$(UNAME_S)),)
+        CFLAGS  += -DHAVE_PTHREAD -pthread
+        LDFLAGS += -pthread
+      endif
+    endif
   else
     ifeq ($(USE_PTHREAD),1)
       CFLAGS  += -DHAVE_PTHREAD -pthread
@@ -217,8 +226,8 @@ $(BIN): $(OBJ) .build-config
 clean:
 	rm -f $(OBJ) $(DEP) $(BIN) .build-config .build-config.tmp
 
-.PHONY: test test-native-sat test-ipc-weighted-cover test-systematic-cli test-ipc-exact-pricing test-bounded-mmcs test-native-node-seed
-test: test-native-sat test-ipc-weighted-cover test-systematic-cli test-ipc-exact-pricing test-bounded-mmcs test-native-node-seed
+.PHONY: test test-native-sat test-ipc-weighted-cover test-ipc-chart-polish test-systematic-cli test-ipc-exact-pricing test-bounded-mmcs test-native-node-seed
+test: test-native-sat test-ipc-weighted-cover test-ipc-chart-polish test-systematic-cli test-ipc-exact-pricing test-bounded-mmcs test-native-node-seed
 
 test-native-sat:
 	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' 0; \
@@ -246,9 +255,14 @@ test-bounded-mmcs:
 	$(CC) -Wall -O2 -std=c11 -I. $(PRICING_TEST_FLAGS) tests/test_bounded_mmcs.c bounded_mmcs.c ccubes_threads.c runtime_options.c -o "$$dir/mmcs" -lm; \
 	"$$dir/mmcs"
 
+test-ipc-chart-polish:
+	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' 0; \
+	$(CC) -Wall -O2 -std=c11 -I. $(PRICING_TEST_FLAGS) tests/test_ipc_chart_polish.c $(WEIGHTED_POLISH_SRC) -o "$$dir/polish" -lm; \
+	"$$dir/polish"
+
 test-native-node-seed:
 	@set -e; dir=$$(mktemp -d); trap 'rm -rf "$$dir"' 0; \
-	$(CC) -Wall -O2 -std=c11 -I. $(PRICING_TEST_FLAGS) tests/test_progressive_native_exact_price.c progressive_global_bound.c bounded_mmcs.c progressive_native_master.c progressive_validation.c lagrangian.c ccubes_threads.c cover_validation.c runtime_options.c -o "$$dir/seed" -lm; \
+	$(CC) -Wall -O2 -std=c11 -I. $(PRICING_TEST_FLAGS) tests/test_progressive_native_exact_price.c progressive_global_bound.c bounded_mmcs.c progressive_native_master.c progressive_validation.c lagrangian.c $(WEIGHTED_POLISH_SRC) ccubes_threads.c cover_validation.c runtime_options.c -o "$$dir/seed" -lm; \
 	"$$dir/seed"
 
 -include $(DEP)

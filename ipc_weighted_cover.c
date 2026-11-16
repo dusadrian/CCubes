@@ -1,6 +1,7 @@
 /* Copyright (c) 2016–2026, Adrian Dusa. See LICENSE. */
 #define _POSIX_C_SOURCE 200809L
 #include "ipc_weighted_cover.h"
+#include "ipc_chart_polish.h"
 #include "ipc_weighted_verify.h"
 #include "native_sat_support.h"
 
@@ -27,6 +28,7 @@ typedef struct {
     uint64_t *hint_weights;
     size_t hint_count;
     uint64_t hint_work;
+    uint64_t polish_deadline, probe_work, next_probe, progress, checkpoint_progress;
 } WeightedCover;
 
 static double monotonic_seconds(void)
@@ -311,7 +313,7 @@ static void free_basis(NsatBudget *budget, PricingBasis basis)
 
 /* The complete family is available for the integer search. The revised
  * simplex proposes weights only. Every bound below uses integer arithmetic. */
-static bool price_weights(WeightedCover *w, uint64_t *weights, PricingBasis *saved)
+static bool price_weights(WeightedCover *w, uint64_t *weights, PricingBasis *saved, bool extend)
 {
     size_t rows = w->input->positives;
     PricingBasis basis = {.rows = rows, .stride = rows};
@@ -338,7 +340,7 @@ static bool price_weights(WeightedCover *w, uint64_t *weights, PricingBasis *sav
             if (pass >= ROOT_PRICING_PASSES) {
                 /* Start another window only while the proposed dual bound
                  * improves. Leave room to search and check the result. */
-                if (best - previous_window <= pivot_tolerance ||
+                if (!extend || best - previous_window <= pivot_tolerance ||
                     best > (double)(w->input->target - 1)) break;
                 if (pass == ROOT_PRICING_PASSES) {
                     uint64_t extra = work_remaining(&w->budget) / 4;
@@ -461,7 +463,10 @@ typedef struct {
     PricingBasis basis;
 } SearchFrame;
 
+#include "ipc_live_basis.h"
+
 typedef struct {
+    CompactPricing *compact;
     size_t min_branches, levels, square;
     unsigned pivots;
     PricingBasis root;
@@ -580,7 +585,8 @@ static uint64_t *reprice_node(WeightedCover *w, Repricing *pricing, SearchFrame 
     PricingBasis parent = frame->basis;
     size_t rows = parent.rows;
     PricingBasis basis = {.rows = rows, .stride = stride,
-        .inverse = pricing->inverse + (depth - 1) * pricing->square,
+        .inverse = pricing->compact ? pricing->compact->projection :
+            pricing->inverse + (depth - 1) * pricing->square,
         .rhs = pricing->rhs + offset, .surplus = pricing->surplus + offset,
         .coordinates = pricing->coordinates + offset};
     if (!nsat_work(&w->budget, (uint64_t)rows * rows + 3 * rows)) return NULL;
@@ -592,7 +598,8 @@ static uint64_t *reprice_node(WeightedCover *w, Repricing *pricing, SearchFrame 
     memcpy(basis.rhs, parent.rhs, rows * sizeof(*basis.rhs));
     memcpy(basis.surplus, parent.surplus, rows * sizeof(*basis.surplus));
 
-    double *prices = pricing->root.rhs + stride, *direction = prices + stride;
+    double *prices = pricing->compact ? pricing->compact->prices : pricing->root.rhs + stride;
+    double *direction = prices + stride;
     ++w->result.repriced;
     for (size_t i = 0; i < basis.rows;) {
         if (contains_row(remaining, basis.coordinates[i])) {
@@ -647,6 +654,8 @@ static uint64_t *reprice_node(WeightedCover *w, Repricing *pricing, SearchFrame 
         ++w->result.reprice_pivots;
     }
 done:
+    if (pricing->compact && !keep_projected_basis(&w->budget, pricing->compact, &basis))
+        return NULL;
     frame->basis = basis;
     return best > 0 ? weights : NULL;
 }
@@ -1012,7 +1021,7 @@ static IpcWeightedCoverResult weighted_cover(const NsatCoverInput *q, int lower,
     if (!weights || !w.weight_bytes ||
         !nsat_copy(&w.budget, weights + q->positives, NULL,
                    (padded_rows - q->positives) * sizeof(*weights))) goto done;
-    if (!price_weights(&w, weights, pricing.pivots ? &pricing.root : NULL)) goto done;
+    if (!price_weights(&w, weights, pricing.pivots ? &pricing.root : NULL, true)) goto done;
     uint64_t total = 0;
     for (size_t byte = 0; byte < w.mask_words * 8; ++byte) {
         if (!nsat_work(&w.budget, 256)) goto done;
@@ -1163,3 +1172,5 @@ IpcWeightedCoverResult ipc_weighted_cover_seed_then_reprice(const NsatCoverInput
 {
     return weighted_cover(q, lower, limits, min_branches, pivots, true, NULL, false);
 }
+
+#include "ipc_chart_polish_impl.h"

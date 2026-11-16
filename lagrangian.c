@@ -9,6 +9,8 @@
 #include "lagrangian.h"
 #include "ccubes_threads.h"
 #include "cover_validation.h"
+#include "polish_order.h"
+#include "ipc_chart_polish.h"
 
 #include <time.h>
 
@@ -122,6 +124,11 @@ void lagrangian_reset_stats(void) {
     lagr_last_stats.polish_skipped_targets = 0;
     lagr_last_stats.polish_searches = 0;
     lagr_last_stats.polish_nodes = 0;
+    lagr_last_stats.polish_warm_nodes = 0;
+    lagr_last_stats.polish_warm_work = 0;
+    lagr_last_stats.polish_warm_peak_bytes = 0;
+    lagr_last_stats.polish_warm_workers = 0;
+    lagr_last_stats.polish_warm_fallbacks = 0;
     lagr_last_stats.polish_aborted_searches = 0;
     lagr_last_stats.polish_exhausted_searches = 0;
     lagr_last_stats.polish_improvements = 0;
@@ -2299,14 +2306,6 @@ static void local_search_drop2_repair(
     free(cand);
 }
 
-typedef struct {
-    int col;
-    int new_cover;
-    int cover_count;
-    double lagr_score;
-    double weight;
-} PolishCandidate;
-
 /*
  * Fixed-width row-coverage bitset for the exact-search fast path, covering
  * up to POLISH_MASK_WORDS * 64 rows. Passed by value like a single uint64_t
@@ -2352,69 +2351,6 @@ typedef struct {
     PolishMask full_mask;         /* all rows covered */
     int mask_words;               /* words of col_mask/full_mask actually in use */
 } PolishSearch;
-
-static bool polish_candidate_better(const PolishCandidate *a, const PolishCandidate *b) {
-    if (a->new_cover != b->new_cover) return a->new_cover > b->new_cover;
-    if (fabs(a->lagr_score - b->lagr_score) > EPS) return a->lagr_score < b->lagr_score;
-    if (a->cover_count != b->cover_count) return a->cover_count > b->cover_count;
-    if (fabs(a->weight - b->weight) > EPS) return a->weight > b->weight;
-    return a->col < b->col;
-}
-
-static void polish_sort_candidates(PolishCandidate *candidates, int count) {
-    if (count > 32) {
-        /*
-        Wide nodes: a full sort is wasted work — on failure every branch is
-        explored regardless of order, and a successful dive follows the front
-        candidates. The previous partial selection sort still compared every
-        one of the front 8 slots against the whole remaining range (O(8n)
-        comparisons unconditionally); this streams the front 8 once instead:
-        seed them with a small insertion sort, then give every remaining
-        candidate a single comparison against the current 8th-best, only
-        paying the (rare) shift cost when it actually displaces one of the
-        front 8. Same top-8 set and order as before -- this is the standard
-        streaming top-K argument, not a change in which candidates rank best
-        -- just far fewer comparisons (O(n) with a small constant instead of
-        O(8n)). The bumped-out front candidate is swapped into the vacated
-        tail slot so the full candidate multiset (needed by the caller's
-        subsequent scan over all `count` of them) is preserved either way;
-        only the tail's incidental leftover order differs from before.
-        */
-        const int front = 8;
-        for (int i = 1; i < front; ++i) {
-            PolishCandidate value = candidates[i];
-            int j = i - 1;
-            while (j >= 0 && polish_candidate_better(&value, &candidates[j])) {
-                candidates[j + 1] = candidates[j];
-                --j;
-            }
-            candidates[j + 1] = value;
-        }
-        for (int i = front; i < count; ++i) {
-            if (!polish_candidate_better(&candidates[i], &candidates[front - 1])) continue;
-
-            PolishCandidate incoming = candidates[i];
-            PolishCandidate outgoing = candidates[front - 1];
-            int j = front - 1;
-            while (j > 0 && polish_candidate_better(&incoming, &candidates[j - 1])) {
-                candidates[j] = candidates[j - 1];
-                --j;
-            }
-            candidates[j] = incoming;
-            candidates[i] = outgoing;
-        }
-        return;
-    }
-    for (int i = 1; i < count; ++i) {
-        PolishCandidate value = candidates[i];
-        int j = i - 1;
-        while (j >= 0 && polish_candidate_better(&value, &candidates[j])) {
-            candidates[j + 1] = candidates[j];
-            --j;
-        }
-        candidates[j + 1] = value;
-    }
-}
 
 static int polish_new_cover(
     const PolishSearch *search,
@@ -2510,11 +2446,12 @@ static bool polish_search_rec(
         search->aborted = 1;
         return true;
     }
-    if (search->nodes++ >= search->node_limit) {
+    if (search->nodes >= search->node_limit) {
         search->aborted = 1;
         return true; /* unwind immediately */
     }
 
+    ++search->nodes;
     int slots_left = search->target - depth;
     int uncovered = search->rows - covered;
     int row = polish_choose_row(search, uncovered, slots_left);
@@ -2618,11 +2555,12 @@ static bool polish_search_rec_bits(
         search->aborted = 1;
         return true;
     }
-    if (search->nodes++ >= search->node_limit) {
+    if (search->nodes >= search->node_limit) {
         search->aborted = 1;
         return true;
     }
 
+    ++search->nodes;
     PolishMask uncovered_mask;
     int uncovered = 0;
     for (int w = 0; w < words; ++w) {
@@ -2777,6 +2715,7 @@ static int lagr_bounded_cover_search(
         free(cand_buf);
         free(col_mask);
         free(mask_done);
+        if (aborted_out) *aborted_out = 1;
         return 0;
     }
 
@@ -3053,7 +2992,10 @@ static void lagr_bounded_finish(
     int *pool_count,
     int *pool_min_len,
     int *norm_buf,
-    uint64_t deadline_nanoseconds
+    uint64_t deadline_nanoseconds,
+    const PIChartView *polish_chart,
+    size_t warm_memory,
+    unsigned warm_workers
 ) {
     if (!solution || !solmin || *solmin <= 0) return;
 
@@ -3082,6 +3024,8 @@ static void lagr_bounded_finish(
         return;
     }
 
+    IpcChartPolish *warm = NULL;
+    bool warm_considered = false;
     int UB = *solmin;
     int proved = proved_optimal_io ? *proved_optimal_io : 0;
 
@@ -3194,21 +3138,87 @@ static void lagr_bounded_finish(
             int found_len_one = 0;
             int aborted = 0;
             long visited_nodes = 0;
-            int n = lagr_bounded_cover_search(
-                rows, cols,
-                rowsCovered, rowsCoveredCount,
-                core_covering, core_counts,
-                ls_best, weights,
-                NULL, /* adjacency already core-restricted */
-                forced, forced_len,
-                target,
-                node_limit,
-                1,
-                one, &found_len_one,
-                &aborted,
-                &visited_nodes,
-                deadline_nanoseconds
-            );
+            long remaining_nodes = node_limit;
+            if (polish_chart) remaining_nodes -= lagr_last_stats.polish_nodes;
+            if (remaining_nodes <= 0) {
+                lagr_last_stats.polish_stop_reason = LAGR_POLISH_ABORTED;
+                lagr_free_core(core_covering, core_counts, rows);
+                break;
+            }
+
+            /* The admission test uses the existing integer bound, before
+             * allocating a pricing basis. Retain the unpriced route for
+             * chart geometries or work budgets the warm search cannot use. */
+            if (polish_chart && !warm_considered) {
+                warm_considered = true;
+                if (bestLB_io && (double)target - *bestLB_io <= 6.0) {
+                    uint64_t stop = polish_started + (node_limit <= 80000
+                        ? UINT64_C(4000000000) : UINT64_C(8000000000));
+                    if (deadline_nanoseconds && deadline_nanoseconds < stop)
+                        stop = deadline_nanoseconds;
+                    warm = ipc_chart_polish_open(polish_chart, warm_memory, stop, warm_workers);
+                } else {
+                    ++lagr_last_stats.polish_warm_fallbacks;
+                }
+            }
+
+            bool decided = false;
+            int n = 0;
+            if (warm) {
+                int degree = 1;
+                for (int row = 0; row < rows; ++row)
+                    if (core_counts[row] > degree) degree = core_counts[row];
+                const IpcChartPolishQuery query = {
+                    .allowed = allowed, .forced = forced, .forced_len = forced_len,
+                    .target = target, .max_row_degree = degree,
+                    .coverage_counts = rowsCoveredCount, .reduced_costs = ls_best,
+                    .tie_weights = weights, .node_limit = (uint64_t)remaining_nodes
+                };
+                IpcChartPolishResult result = ipc_chart_polish_decide(warm, &query, one);
+                lagr_last_stats.polish_warm_work += result.work;
+                lagr_last_stats.polish_warm_nodes += result.nodes;
+                if (result.peak_bytes > lagr_last_stats.polish_warm_peak_bytes)
+                    lagr_last_stats.polish_warm_peak_bytes = result.peak_bytes;
+                if (result.workers > lagr_last_stats.polish_warm_workers)
+                    lagr_last_stats.polish_warm_workers = result.workers;
+                visited_nodes = (long)result.nodes;
+                decided = result.status == NSAT_UNSAT;
+                if (result.status == NSAT_SAT && result.terms <= target &&
+                    cover_is_feasible(polish_chart, one, result.terms)) {
+                    decided = true;
+                    n = 1;
+                    found_len_one = result.terms;
+                    qsort(one, (size_t)found_len_one, sizeof(int), pool_cmp_int_asc);
+                }
+                if (!decided) {
+                    ++lagr_last_stats.polish_warm_fallbacks;
+                    ipc_chart_polish_close(warm);
+                    warm = NULL;
+                }
+            }
+
+            if (!decided && visited_nodes < remaining_nodes &&
+                (!deadline_nanoseconds || lagr_monotonic_nanoseconds() < deadline_nanoseconds)) {
+                long ordinary_nodes = 0;
+                n = lagr_bounded_cover_search(
+                    rows, cols,
+                    rowsCovered, rowsCoveredCount,
+                    core_covering, core_counts,
+                    ls_best, weights,
+                    NULL, /* adjacency already core-restricted */
+                    forced, forced_len,
+                    target,
+                    remaining_nodes - visited_nodes,
+                    1,
+                    one, &found_len_one,
+                    &aborted,
+                    &ordinary_nodes,
+                    deadline_nanoseconds
+                );
+                visited_nodes += ordinary_nodes;
+            } else if (!decided) {
+                aborted = 1;
+            }
             lagr_last_stats.polish_searches++;
             lagr_last_stats.polish_nodes += visited_nodes;
 
@@ -3253,6 +3263,8 @@ static void lagr_bounded_finish(
         if (proved_optimal_io) *proved_optimal_io = 1;
         lagr_last_stats.polish_proved_optimal = 1;
     }
+
+    ipc_chart_polish_close(warm);
 
     /* ---- pool enumeration at the final size ---- */
     if (max_pool > 1 && pool_solutions && pool_count && pool_min_len && norm_buf) {
@@ -3495,6 +3507,7 @@ typedef struct {
     double bundle_momentum;
     int stop_at_step_floor;
     int reset_on_continuous_improvement;
+    const PIChartView *polish_chart;
 } LagrangianConfig;
 
 #define LAGR_PORTFOLIO_PROFILE_COUNT 6
@@ -3544,6 +3557,7 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     cfg->bundle_momentum = 0.0;
     cfg->stop_at_step_floor = 1;
     cfg->reset_on_continuous_improvement = 0;
+    cfg->polish_chart = NULL;
 
     if (effort_level == 1) {
         cfg->max_iter = 1000;
@@ -3688,6 +3702,13 @@ static void lagr_merge_polish_stats(
         additional->polish_skipped_targets;
     aggregate->polish_searches += additional->polish_searches;
     aggregate->polish_nodes += additional->polish_nodes;
+    aggregate->polish_warm_nodes += additional->polish_warm_nodes;
+    aggregate->polish_warm_work += additional->polish_warm_work;
+    aggregate->polish_warm_fallbacks += additional->polish_warm_fallbacks;
+    if (additional->polish_warm_peak_bytes > aggregate->polish_warm_peak_bytes)
+        aggregate->polish_warm_peak_bytes = additional->polish_warm_peak_bytes;
+    if (additional->polish_warm_workers > aggregate->polish_warm_workers)
+        aggregate->polish_warm_workers = additional->polish_warm_workers;
     aggregate->polish_aborted_searches +=
         additional->polish_aborted_searches;
     aggregate->polish_exhausted_searches +=
@@ -5086,7 +5107,10 @@ static void solve_scp_lagrangian_config(
             &bestLB,
             &proved,
             1, NULL, NULL, NULL, NULL,
-            deadline_nanoseconds
+            deadline_nanoseconds,
+            cfg->polish_chart,
+            (size_t)(cfg->polish_node_limit <= 80000 ? 32 : 128) * 1024 * 1024,
+            (unsigned)ccubes_thread_count()
         );
 
         if ((double)best_sol_size < bestUB - EPS) {
@@ -5163,7 +5187,8 @@ static void solve_scp_lagrangian_with_deadline(
     const int *polish_incumbent,
     int polish_incumbent_cardinality,
     const double *initial_multipliers,
-    uint64_t deadline_nanoseconds
+    uint64_t deadline_nanoseconds,
+    bool native_ipc
 ) {
     if (solmin) *solmin = -1;
     const int foundPI = chart ? chart->cols : 0;
@@ -5300,6 +5325,7 @@ static void solve_scp_lagrangian_with_deadline(
 
     LagrangianConfig baseline;
     lagr_config_for_effort(&baseline, effort_level);
+    if (native_ipc) baseline.polish_chart = chart;
     lagr_apply_certification_policy(
         &baseline,
         effort_level,
@@ -5372,6 +5398,7 @@ static void solve_scp_lagrangian_with_deadline(
         }
 
         for (int i = 1; i < profile_count; ++i) {
+            profiles[i].polish_chart = NULL;
             if (
                 deadline_nanoseconds > 0 &&
                 lagr_monotonic_nanoseconds() >= deadline_nanoseconds
@@ -5634,6 +5661,11 @@ static void solve_scp_lagrangian_with_deadline(
             merged_stats.polish_searches;
         lagr_last_stats.polish_nodes =
             merged_stats.polish_nodes;
+        lagr_last_stats.polish_warm_nodes = merged_stats.polish_warm_nodes;
+        lagr_last_stats.polish_warm_work = merged_stats.polish_warm_work;
+        lagr_last_stats.polish_warm_peak_bytes = merged_stats.polish_warm_peak_bytes;
+        lagr_last_stats.polish_warm_workers = merged_stats.polish_warm_workers;
+        lagr_last_stats.polish_warm_fallbacks = merged_stats.polish_warm_fallbacks;
         lagr_last_stats.polish_aborted_searches =
             merged_stats.polish_aborted_searches;
         lagr_last_stats.polish_exhausted_searches =
@@ -5748,7 +5780,8 @@ void solve_scp_lagrangian_with_multipliers_and_polish_incumbent(
         polish_incumbent,
         polish_incumbent_cardinality,
         initial_multipliers,
-        0
+        0,
+        true
     );
 }
 
@@ -5765,7 +5798,7 @@ void solve_scp_lagrangian_with_multipliers(
     int multiplier_count,
     const double *initial_multipliers
 ) {
-    solve_scp_lagrangian_with_multipliers_and_polish_incumbent(
+    solve_scp_lagrangian_with_deadline(
         chart,
         weights,
         solution,
@@ -5778,7 +5811,9 @@ void solve_scp_lagrangian_with_multipliers(
         multiplier_count,
         NULL,
         0,
-        initial_multipliers
+        initial_multipliers,
+        0,
+        false
     );
 }
 
@@ -5832,7 +5867,8 @@ void solve_scp_lagrangian_until(
         NULL,
         0,
         NULL,
-        deadline_nanoseconds
+        deadline_nanoseconds,
+        false
     );
 }
 
@@ -6807,7 +6843,7 @@ void solve_scp_lagrangian_pool(
             &pool_count,
             &pool_min_len,
             norm,
-            0
+            0, NULL, 0, 0
         );
 
         if (*solmin < solmin_before) {

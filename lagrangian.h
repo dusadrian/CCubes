@@ -95,6 +95,10 @@ typedef struct {
     int polish_skipped_targets;
     int polish_searches;
     long polish_nodes;
+    uint64_t polish_warm_nodes, polish_warm_work;
+    size_t polish_warm_peak_bytes;
+    unsigned polish_warm_workers;
+    int polish_warm_fallbacks;
     int polish_aborted_searches;
     int polish_exhausted_searches;
     int polish_improvements;
@@ -249,7 +253,8 @@ void solve_scp_lagrangian_with_multipliers(
 
 /*
  * Variant used by a restricted master that has a retained incumbent which
- * should bound only the final enumerative finish. Unlike `initial_solution`,
+ * should bound only the final enumerative finish. This native IPC entry
+ * enables projected pricing during eligible polish. Unlike `initial_solution`,
  * `polish_incumbent` does not steer the Lagrangian/subgradient trajectory.
  */
 void solve_scp_lagrangian_with_multipliers_and_polish_incumbent(
