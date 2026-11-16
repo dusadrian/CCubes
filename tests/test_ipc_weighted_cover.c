@@ -214,6 +214,7 @@ static void reject_unproved_bounds(void)
     q.target = 2;
     IpcWeightedCoverResult result = ipc_weighted_cover(&q, 1, (NsatLimits){.shared = &resources});
     uint64_t pricing_work = resources.work;
+    uint64_t search_work = pricing_work - result.check.work;
     assert(result.nodes == 0 && result.check.work > 1);
     validate(&q, result, 2);
 
@@ -226,6 +227,48 @@ static void reject_unproved_bounds(void)
     result = ipc_weighted_cover(&q, 1, (NsatLimits){.work = pricing_work - 1});
     assert(result.check_status == NSAT_UNKNOWN && result.check.stop == NSAT_STOP_WORK);
     assert(result.status == NSAT_UNKNOWN && result.lower == 1 && !result.cover);
+
+    /* Exactly enough search work for pricing. The independent check can
+     * finish only if charged to its own allowance. */
+    q.target = 2;
+    IpcWeightedCheckBudget budget = {.search_seconds = 10, .verifier_seconds = 10};
+    resources = (NsatResources){0};
+    NsatLimits limits = {.work = search_work, .shared = &resources};
+    result = ipc_weighted_cover_reprice_with_check_budget(&q, 1, limits, 4, 256, &budget);
+    validate(&q, result, 2);
+    assert(resources.work == pricing_work);
+
+    resources = (NsatResources){.work_limit = pricing_work - 1};
+    result = ipc_weighted_cover_reprice_with_check_budget(&q, 1, limits, 4, 256, &budget);
+    assert(result.lower == 1 && result.check_status == NSAT_UNKNOWN &&
+           result.check.stop == NSAT_STOP_WORK && resources.work <= resources.work_limit);
+
+    resources = (NsatResources){0};
+    budget.verifier_work = 1;
+    result = ipc_weighted_cover_reprice_with_check_budget(&q, 1, limits, 4, 256, &budget);
+    assert(result.lower == 1 && result.check_status == NSAT_UNKNOWN &&
+           result.check.stop == NSAT_STOP_WORK && result.check.work <= budget.verifier_work);
+
+    resources = (NsatResources){0};
+    budget.verifier_work = 0;
+    budget.verifier_seconds = 1e-12;
+    result = ipc_weighted_cover_reprice_with_check_budget(&q, 1, limits, 4, 256, &budget);
+    assert(result.lower == 1 && result.check_status == NSAT_UNKNOWN &&
+           result.check.stop == NSAT_STOP_CANCELLED);
+
+    resources = (NsatResources){0};
+    limits.work = 0;
+    result = ipc_weighted_cover_reprice_with_auto_check(&q, 1, limits, 4, 256);
+    validate(&q, result, 2);
+    assert(result.check_auto_base == search_work);
+    assert(result.check_auto_limit == search_work + search_work / 8);
+    assert(resources.work == pricing_work && !result.check_auto_limit_hit);
+
+    resources = (NsatResources){.work_limit = pricing_work - 1};
+    result = ipc_weighted_cover_reprice_with_auto_check(&q, 1, limits, 4, 256);
+    assert(result.lower == 1 && result.check_status == NSAT_UNKNOWN);
+    assert(result.check.stop == NSAT_STOP_WORK && !result.check_auto_limit_hit);
+    assert(resources.work <= resources.work_limit);
 }
 
 static void adaptive_root_pricing(void)
@@ -256,6 +299,16 @@ static void adaptive_root_pricing(void)
     assert(result.pivots > 1024 && result.lower_target == 9);
     assert(result.lower == 10 && result.check_status == NSAT_UNSAT);
     assert(resources.work <= resources.work_limit && resources.memory == 0);
+    free(result.cover);
+
+    resources = (NsatResources){.memory_limit = 128u << 20};
+    limits.work = 512000000;
+    IpcWeightedCheckBudget budget = {
+        .search_seconds = 15, .verifier_seconds = 15, .verifier_work = 300000000};
+    result = ipc_weighted_cover_reprice_with_check_budget(&q, 9, limits, 4, 256, &budget);
+    assert(result.lower == 10 && result.check_status == NSAT_UNSAT);
+    assert(resources.work > limits.work && resources.work - result.check.work <= limits.work);
+    assert(result.check.work <= budget.verifier_work && resources.memory == 0);
     free(result.cover);
 }
 

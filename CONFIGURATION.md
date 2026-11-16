@@ -42,6 +42,22 @@ The parser lives in `cli.c`/`cli.h`. One option registry supplies name matching,
 
 The writer uses checkpoint version 11. The reader accepts versions 8 through 11. When resuming version 8, CCubes replays the interrupted generation level from task zero. Resume restores the saved word width, weights, solver, and pool settings. Supply invocation-specific controls again as needed. Ordinary runs fall back to the bundled hybrid solver when Gurobi is unavailable.
 
+## Systematic certification migration
+
+Use `--certify-systematic` to request a proof and `--certification-time-limit SECONDS` to set a positive time allowance for each output. These are the public systematic certification controls.
+
+The following compatibility options remain available during migration.
+
+| Compatibility options | Behavior |
+| --- | --- |
+| `--systematic-weighted-seconds`, `--systematic-native-sat-seconds` | Set individual stage times. Zero skips that stage. |
+| `--systematic-weighted-work`, `--systematic-certification-work` | Bound weighted or combined work respectively. Zero removes the corresponding work cap. With a combined cap and SAT enabled, the weighted stage gets at most half of the remaining work. |
+| `--systematic-verifier-seconds`, `--systematic-verifier-work` | Use a separate checker budget and pause the weighted search clock while checking. The default checker time is one second when enabled. An explicit work limit of zero removes the checker-specific cap. Any combined work cap still applies. |
+| `--systematic-certification-seconds`, `--systematic-sat-seconds` | Use the legacy shared clock starting before or after initial IPC pricing, respectively. The weighted stage retains its one-second and 512-million-unit caps. Zero requests the cardinality floor or initial pricing only, respectively. |
+| `--systematic-strengthening`, `--systematic-descent` | Retain the experimental SAT profiles (`none`, `groups`, `ordering`, `combined`) and target descent modes (`fresh`, `reuse`). |
+
+A command using `--certification-time-limit` can still set `--systematic-certification-work` or the experimental SAT options. Use either the new time limit or the legacy clocks and individual stage limits.
+
 ## IPC configuration
 
 Ordinary solving remains the default. Use `--route ipc` to select the native solver or `--route auto` for automatic selection. The legacy route value `e0` means ordinary, and `--progressive-cover` selects IPC. IPC-only resource, pool, and finishing options require a run routed to IPC.

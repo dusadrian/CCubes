@@ -5,6 +5,26 @@ bin=${1:-./ccubes}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+"$bin" --help >"$work/help"
+grep -q '^  --certify-systematic$' "$work/help"
+grep -q '^  --certification-time-limit VALUE$' "$work/help"
+if grep -q '^  --systematic-' "$work/help"; then
+    echo "migration controls leaked into production help" >&2
+    exit 1
+fi
+
+if "$bin" --certification-time-limit=2 "$work/unused.pla" >"$work/parse.log" 2>&1; then
+    echo "certification deadline accepted without --certify-systematic" >&2
+    exit 1
+fi
+grep -q 'require --certify-systematic' "$work/parse.log"
+if "$bin" --certify-systematic --certification-time-limit=2 --systematic-verifier-work=10 \
+    "$work/unused.pla" >"$work/parse.log" 2>&1; then
+    echo "conflicting stage and per-output limits were accepted" >&2
+    exit 1
+fi
+grep -q -- '--certification-time-limit cannot be combined' "$work/parse.log"
+
 "$bin" --certify-systematic --systematic-sat-seconds=0 --threads=1 \
     examples/certified_two_term.pla "$work/bound-cover.pla" >"$work/bound.log" 2>&1
 grep -q 'cover=2 status=certified method=ipc-global-bound' "$work/bound.log"
@@ -37,6 +57,26 @@ fi
 grep -q 'cover=3 status=unproved' "$work/unproved.log"
 grep -qx preserve "$work/unproved.pla"
 
+if "$bin" --certify-systematic --certification-time-limit=0.000000000001 \
+    --threads=1 "$work/sat.pla" "$work/unproved.pla" >"$work/certification-deadline.log" 2>&1; then
+    echo "systematic certification succeeded after the per-output deadline" >&2
+    exit 1
+fi
+grep -q '^CCUBES_SYSTEMATIC_CERTIFICATE .*status=unproved stop_reason=deadline' \
+    "$work/certification-deadline.log"
+grep -qx preserve "$work/unproved.pla"
+
+# The minimization checkpoint fires before the certification clock starts.
+"$bin" --certify-systematic --certification-time-limit=2 --time-limit=0.000000000001 \
+    --checkpoint "$work/before-certification.chk" --threads=1 \
+    examples/rnd_20x10x40.pla "$work/unproved.pla" >"$work/before-certification.log" 2>&1
+test -s "$work/before-certification.chk"
+grep -qx preserve "$work/unproved.pla"
+if grep -q '^CCUBES_SYSTEMATIC_' "$work/before-certification.log"; then
+    echo "certification ran on an interrupted minimization" >&2
+    exit 1
+fi
+
 # Run weighted certification with SAT disabled and no external executables.
 env PATH=/nonexistent "$bin" --certify-systematic --threads=1 --deterministic \
     --systematic-native-sat-seconds=0 \
@@ -46,6 +86,13 @@ grep -q 'cover=2 status=certified method=ipc-global-bound' "$work/sat.log"
 test "$(grep -c '^CCUBES_SYSTEMATIC_SAT ' "$work/sat.log" || true)" -eq 0
 grep -qx -- '---00000 1' "$work/sat-cover.pla"
 grep -qx -- '---11--- 1' "$work/sat-cover.pla"
+
+# Both hidden verifier controls still select a separate checking budget.
+env PATH=/nonexistent "$bin" --certify-systematic --threads=1 --deterministic \
+    --systematic-verifier-seconds=2 --systematic-verifier-work=1000000 \
+    --systematic-native-sat-seconds=0 \
+    "$work/sat.pla" "$work/legacy-verifier.pla" >"$work/legacy-verifier.log" 2>&1
+cmp "$work/sat-cover.pla" "$work/legacy-verifier.pla"
 
 # If weighted search is skipped or times out, SAT can use its own full budget.
 for weighted_seconds in 0 0.000000000001; do
@@ -160,14 +207,16 @@ for log in "$work/proved.log" "$work/proved-parallel.log"; do
     awk '/^CCUBES_SYSTEMATIC_CERTIFICATE / { print $2, $4 }' "$log" | sort >"$log.counts"
 done
 cmp "$work/proved.log.counts" "$work/proved-parallel.log.counts"
-env PATH=/nonexistent "$bin" --certify-systematic --threads=12 --deterministic \
-    examples/rnd_30x10x100.pla "$work/proved30.pla" >"$work/proved30.log" 2>&1
+env PATH=/nonexistent "$bin" --certify-systematic --certification-time-limit=12 \
+    --threads=12 --deterministic examples/rnd_30x10x100.pla "$work/proved30.pla" >"$work/proved30.log" 2>&1
 test "$(grep -c 'scope=scalar .*status=certified' "$work/proved30.log")" -eq 10
 test "$(grep -c '^CCUBES_SYSTEMATIC_INTEGER .*check_status=verified' "$work/proved30.log")" -eq 9
 for output in 5 7; do
     grep -q "^CCUBES_SYSTEMATIC_INTEGER output=$output status=certified .*incumbent=8 cover=7 lower=7" "$work/proved30.log"
 done
 grep -Eq '^CCUBES_SYSTEMATIC_INTEGER output=7 .*check_status=verified .*lower_target=6 repriced=[1-9][0-9]*' \
+    "$work/proved30.log"
+grep -Eq '^CCUBES_SYSTEMATIC_INTEGER output=7 .*check_auto_base=[1-9][0-9]* .*check_auto_limit_hit=no' \
     "$work/proved30.log"
 test "$(grep -c '^CCUBES_SYSTEMATIC_SAT ' "$work/proved30.log" || true)" -eq 0
 

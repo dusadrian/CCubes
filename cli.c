@@ -19,8 +19,11 @@
 
 typedef enum {
     BITS, THREADS, WEIGHTS, SOLVER, EFFORT, DETERMINISTIC, CERTIFY,
-    CERTIFY_SYSTEMATIC, SYSTEMATIC_SAT_SECONDS, SYSTEMATIC_SECONDS, SYSTEMATIC_WORK,
+    CERTIFY_SYSTEMATIC, CERTIFICATION_TIME_LIMIT,
+    /* The contiguous block below stays accepted during CLI migration. */
+    SYSTEMATIC_SAT_SECONDS, SYSTEMATIC_SECONDS, SYSTEMATIC_WORK,
     SYSTEMATIC_WEIGHTED_SECONDS, SYSTEMATIC_WEIGHTED_WORK, SYSTEMATIC_NATIVE_SAT_SECONDS,
+    SYSTEMATIC_VERIFIER_SECONDS, SYSTEMATIC_VERIFIER_WORK,
     SYSTEMATIC_STRENGTHENING, SYSTEMATIC_DESCENT,
     POOL, LOCK_STATS, TIME_LIMIT, CHECKPOINT_EVERY, CHECKPOINT,
     RESUME, INSPECT, INSPECT_LEVEL, DEBUG, DEBUG_FILE, LOG_FILE, HELP,
@@ -36,7 +39,7 @@ typedef struct {
     const char *description;
 } Option;
 
-/* The public interface and help text share one registry. */
+/* Parsing and help share one registry, with migration options hidden from help. */
 static const Option option_table[] = {
     {"bits-per-word", "b", true, BITS, "8, 16, 32, or 64 (default). Legacy 128 uses 64"},
     {"threads", "t", true, THREADS, "CPU worker threads; 0 (default) uses available cores"},
@@ -46,8 +49,11 @@ static const Option option_table[] = {
     {"deterministic", "d", false, DETERMINISTIC, "canonical PI ordering"},
     {"certify", "c", false, CERTIFY, "complete-prime enumeration and exact cover (point rows only)"},
     {"certify-systematic", NULL, false, CERTIFY_SYSTEMATIC, "certify ordinary scalar covers with IPC pricing, weighted integer search and checked native SAT"},
+    {"certification-time-limit", NULL, true, CERTIFICATION_TIME_LIMIT, "positive seconds per output for systematic certification, after minimization"},
     {"systematic-weighted-seconds", NULL, true, SYSTEMATIC_WEIGHTED_SECONDS, "weighted search and bound checking seconds per output (default 10; 0 skips)"},
     {"systematic-weighted-work", NULL, true, SYSTEMATIC_WEIGHTED_WORK, "weighted search and bound checking work per output (default 0: unlimited)"},
+    {"systematic-verifier-seconds", NULL, true, SYSTEMATIC_VERIFIER_SECONDS, "separate weighted bound-checking time per output (positive seconds; default 1 when enabled)"},
+    {"systematic-verifier-work", NULL, true, SYSTEMATIC_VERIFIER_WORK, "enable a separate weighted bound-checking work limit per output (0: unlimited)"},
     {"systematic-native-sat-seconds", NULL, true, SYSTEMATIC_NATIVE_SAT_SECONDS, "native SAT and checking seconds per output (default 2; 0 skips)"},
     {"systematic-certification-seconds", NULL, true, SYSTEMATIC_SECONDS, "legacy shared seconds per output, including IPC pricing (0: cardinality floor only)"},
     {"systematic-certification-work", NULL, true, SYSTEMATIC_WORK, "native certification work per output, including proof checking (0: unlimited)"},
@@ -78,6 +84,7 @@ void cli_help(FILE *out) {
                  "Options (values accept --name VALUE or --name=VALUE):\n");
     for (size_t i = 0; i < sizeof(option_table) / sizeof(option_table[0]); ++i) {
         const Option *option = &option_table[i];
+        if (option->id >= SYSTEMATIC_SAT_SECONDS && option->id <= SYSTEMATIC_DESCENT) continue;
         fprintf(out, "  --%s%s\n      %s\n", option->name,
                 option->takes_value ? " VALUE" : "", option->description);
     }
@@ -131,16 +138,19 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
         case DETERMINISTIC: o->deterministic = true; return true;
         case CERTIFY: o->certify = true; return true;
         case CERTIFY_SYSTEMATIC: o->certify_systematic = true; return true;
+        case CERTIFICATION_TIME_LIMIT:
         case SYSTEMATIC_SAT_SECONDS:
         case SYSTEMATIC_SECONDS: {
-            SystematicBudgetMode mode = id == SYSTEMATIC_SECONDS
-                ? SYSTEMATIC_SHARED_BUDGET : SYSTEMATIC_POST_PRICING_BUDGET;
+            SystematicBudgetMode mode = SYSTEMATIC_TOTAL_BUDGET;
+            if (id == SYSTEMATIC_SECONDS) mode = SYSTEMATIC_SHARED_BUDGET;
+            if (id == SYSTEMATIC_SAT_SECONDS) mode = SYSTEMATIC_POST_PRICING_BUDGET;
             if (o->systematic_budget.mode != SYSTEMATIC_STAGE_BUDGETS &&
                 o->systematic_budget.mode != mode) {
                 return false;
             }
             o->systematic_budget.mode = mode;
-            return parse_seconds(value, &o->systematic_budget.shared_seconds);
+            return parse_seconds(value, &o->systematic_budget.shared_seconds) &&
+                (mode != SYSTEMATIC_TOTAL_BUDGET || o->systematic_budget.shared_seconds > 0.0);
         }
         case SYSTEMATIC_WEIGHTED_SECONDS:
             o->systematic_stage_limits_explicit = true;
@@ -148,7 +158,13 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
         case SYSTEMATIC_NATIVE_SAT_SECONDS:
             o->systematic_stage_limits_explicit = true;
             return parse_seconds(value, &o->systematic_budget.sat_seconds);
+        case SYSTEMATIC_VERIFIER_SECONDS:
+            o->systematic_stage_limits_explicit = true;
+            o->systematic_budget.separate_verifier = true;
+            return parse_seconds(value, &o->systematic_budget.verifier_seconds) &&
+                o->systematic_budget.verifier_seconds > 0.0;
         case SYSTEMATIC_WEIGHTED_WORK:
+        case SYSTEMATIC_VERIFIER_WORK:
         case SYSTEMATIC_WORK: {
             if (!value || !isdigit((unsigned char)*value)) return false;
             char *end;
@@ -157,6 +173,10 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
             if (errno || *end || work > UINT64_MAX) return false;
             if (id == SYSTEMATIC_WEIGHTED_WORK) {
                 o->systematic_budget.weighted_work = (uint64_t)work;
+                o->systematic_stage_limits_explicit = true;
+            } else if (id == SYSTEMATIC_VERIFIER_WORK) {
+                o->systematic_budget.verifier_work = (uint64_t)work;
+                o->systematic_budget.separate_verifier = true;
                 o->systematic_stage_limits_explicit = true;
             } else {
                 o->systematic_budget.work = (uint64_t)work;
@@ -207,7 +227,8 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
 
 int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
     *o = (CliOptions){.bits_per_word = 64, .weights = 1, .literal_polish = 1,
-                     .systematic_budget = {.weighted_seconds = 10.0, .sat_seconds = 2.0}};
+                     .systematic_budget = {.weighted_seconds = 10.0, .sat_seconds = 2.0,
+                                           .verifier_seconds = 1.0}};
     ccubes_options_reset();
     bool positional_only = false;
     bool inspect_level_set = false;
@@ -337,7 +358,10 @@ int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
         return -1;
     }
     if (shared_budget && o->systematic_stage_limits_explicit) {
-        fprintf(err, "Use either a legacy shared certification time or separate stage budgets.\n");
+        if (o->systematic_budget.mode == SYSTEMATIC_TOTAL_BUDGET)
+            fprintf(err, "--certification-time-limit cannot be combined with individual stage limits.\n");
+        else
+            fprintf(err, "Use either a legacy shared certification time or separate stage budgets.\n");
         return -1;
     }
     if (o->pool) o->weights = 2;

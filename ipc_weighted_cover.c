@@ -1,18 +1,43 @@
 /* Copyright (c) 2016–2026, Adrian Dusa. See LICENSE. */
+#define _POSIX_C_SOURCE 200809L
 #include "ipc_weighted_cover.h"
 #include "ipc_weighted_verify.h"
 #include "native_sat_support.h"
 
 #include <math.h>
+#include <time.h>
+
+typedef struct {
+    double deadline;
+    bool (*cancel)(void *context);
+    void *context;
+} WeightedClock;
 
 typedef struct {
     NsatBudget budget;
     IpcWeightedCoverResult result;
     const NsatCoverInput *input;
+    const IpcWeightedCheckBudget *check_budget;
+    bool auto_check;
+    WeightedClock search_clock;
     uint64_t *diff, *columns;
     size_t capacity, input_words, row_words, mask_words;
     uint64_t (*weight_bytes)[256];
 } WeightedCover;
+
+static double monotonic_seconds(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+}
+
+static bool clock_expired(void *context)
+{
+    WeightedClock *clock = context;
+    return monotonic_seconds() >= clock->deadline ||
+        (clock->cancel && clock->cancel(clock->context));
+}
 
 static uint64_t row_bit(unsigned row)
 {
@@ -812,21 +837,57 @@ static void verify_bound(WeightedCover *w, const uint64_t *weights,
     NsatLimits limits = w->budget.limits;
     NsatStats check = {0};
     NsatStatus status = NSAT_UNKNOWN;
-    if (limits.work && w->budget.stats.work >= limits.work) {
+    double started = monotonic_seconds();
+    WeightedClock clock = w->search_clock;
+    uint64_t work_used = w->budget.stats.work;
+    if (w->check_budget) {
+        limits.work = w->check_budget->verifier_work;
+        work_used = w->result.check.work;
+        clock.deadline = started + (w->check_budget->verifier_seconds - w->result.check_seconds);
+        limits.poll = clock_expired;
+        limits.context = &clock;
+    }
+    uint64_t allowance = limits.work
+        ? (work_used < limits.work ? limits.work - work_used : 0) : UINT64_MAX;
+    bool auto_is_limiting = false;
+    if (w->auto_check) {
+        const uint64_t spent_checking = w->result.check.work;
+        const uint64_t search_work = work_used - spent_checking;
+        const uint64_t extension = search_work / 8;
+        const uint64_t automatic_limit = search_work > UINT64_MAX - extension
+            ? UINT64_MAX : search_work + extension;
+        const uint64_t remaining = spent_checking < automatic_limit
+            ? automatic_limit - spent_checking : 0;
+        w->result.check_auto_base = search_work;
+        w->result.check_auto_limit = automatic_limit;
+        if (remaining < allowance) {
+            allowance = remaining;
+            const NsatResources *shared = limits.shared;
+            auto_is_limiting = !shared || !shared->work_limit ||
+                remaining < shared->work_limit - shared->work;
+        }
+    }
+    if (!allowance) {
         check.stop = NSAT_STOP_WORK;
     } else if (limits.memory_bytes && w->budget.stats.memory_bytes >= limits.memory_bytes) {
         check.stop = NSAT_STOP_MEMORY;
     } else {
-        if (limits.work) limits.work -= w->budget.stats.work;
+        limits.work = allowance == UINT64_MAX ? 0 : allowance;
         if (limits.memory_bytes) limits.memory_bytes -= w->budget.stats.memory_bytes;
         status = ipc_verify_weighted_bound(w->input, weights, w->input->positives,
             maximum, proposed, limits, &check);
     }
-    w->budget.stats.work += check.work; /* Shared work was charged by the checker. */
+    double elapsed = monotonic_seconds() - started;
+    w->result.check_seconds += elapsed;
+    if (w->check_budget)
+        w->search_clock.deadline += elapsed;
+    else
+        w->budget.stats.work += check.work; /* Shared work was charged by the checker. */
     w->result.check.work += check.work;
     if (check.peak_memory_bytes > w->result.check.peak_memory_bytes)
         w->result.check.peak_memory_bytes = check.peak_memory_bytes;
     w->result.check.stop = check.stop;
+    w->result.check_auto_limit_hit = auto_is_limiting && check.stop == NSAT_STOP_WORK;
     if (status == NSAT_UNSAT) {
         w->result.lower = proposed;
         w->result.check_status = NSAT_UNSAT;
@@ -847,15 +908,24 @@ static uint64_t lower_probe_work(const NsatBudget *budget)
 
 static IpcWeightedCoverResult weighted_cover(const NsatCoverInput *q, int lower,
                                               NsatLimits limits, size_t min_branches,
-                                              unsigned pivots, bool seed_first)
+                                              unsigned pivots, bool seed_first,
+                                              const IpcWeightedCheckBudget *check_budget,
+                                              bool auto_check)
 {
-    WeightedCover w = {.budget = {.limits = limits}, .input = q,
+    WeightedCover w = {.budget = {.limits = limits}, .input = q, .auto_check = auto_check,
                        .result = {.lower = lower, .status = NSAT_UNKNOWN}};
     if (!q || !q->on || !q->off || !q->inputs ||
         !q->positives || q->positives > INT_MAX || !q->negatives ||
         lower < 1 || q->target <= (size_t)lower || q->target > q->positives)
         return w.result;
     w.result.supported = true;
+    if (check_budget) {
+        w.check_budget = check_budget;
+        w.search_clock = (WeightedClock){.deadline = monotonic_seconds() + check_budget->search_seconds,
+            .cancel = limits.poll, .context = limits.context};
+        w.budget.limits.poll = clock_expired;
+        w.budget.limits.context = &w.search_clock;
+    }
     size_t *order = NULL, *scratch = NULL, *frequency = NULL, *chosen = NULL;
     uint64_t *remaining = NULL, *weights = NULL;
     uint64_t maximum = 0;
@@ -1004,19 +1074,32 @@ done:
 IpcWeightedCoverResult ipc_weighted_cover(const NsatCoverInput *q, int lower,
                                           NsatLimits limits)
 {
-    return weighted_cover(q, lower, limits, 0, 0, false);
+    return weighted_cover(q, lower, limits, 0, 0, false, NULL, false);
 }
 
 IpcWeightedCoverResult ipc_weighted_cover_reprice(const NsatCoverInput *q, int lower,
                                                   NsatLimits limits, size_t min_branches,
                                                   unsigned pivots)
 {
-    return weighted_cover(q, lower, limits, min_branches, pivots, false);
+    return weighted_cover(q, lower, limits, min_branches, pivots, false, NULL, false);
+}
+
+IpcWeightedCoverResult ipc_weighted_cover_reprice_with_auto_check(const NsatCoverInput *q,
+    int lower, NsatLimits limits, size_t min_branches, unsigned pivots)
+{
+    return weighted_cover(q, lower, limits, min_branches, pivots, false, NULL, true);
+}
+
+IpcWeightedCoverResult ipc_weighted_cover_reprice_with_check_budget(const NsatCoverInput *q,
+    int lower, NsatLimits limits, size_t min_branches, unsigned pivots,
+    const IpcWeightedCheckBudget *budget)
+{
+    return weighted_cover(q, lower, limits, min_branches, pivots, false, budget, false);
 }
 
 IpcWeightedCoverResult ipc_weighted_cover_seed_then_reprice(const NsatCoverInput *q,
                                                             int lower, NsatLimits limits,
                                                             size_t min_branches, unsigned pivots)
 {
-    return weighted_cover(q, lower, limits, min_branches, pivots, true);
+    return weighted_cover(q, lower, limits, min_branches, pivots, true, NULL, false);
 }

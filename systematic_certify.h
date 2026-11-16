@@ -7,7 +7,8 @@
 typedef enum {
     SYSTEMATIC_STAGE_BUDGETS,
     SYSTEMATIC_SHARED_BUDGET,
-    SYSTEMATIC_POST_PRICING_BUDGET
+    SYSTEMATIC_POST_PRICING_BUDGET,
+    SYSTEMATIC_TOTAL_BUDGET
 } SystematicBudgetMode;
 
 typedef struct {
@@ -15,8 +16,11 @@ typedef struct {
     double shared_seconds;
     double weighted_seconds;
     double sat_seconds;
+    double verifier_seconds;
     uint64_t work;
     uint64_t weighted_work;
+    uint64_t verifier_work;
+    bool separate_verifier;
 } SystematicBudget;
 
 /* Certify the decoded cover in pi->solution. An improvement may replace
