@@ -438,14 +438,16 @@ typedef struct {
 
 typedef struct {
     FeasibilityJumpWorker *workers;
-    int family_count;
+    const int *family_ordinals;
+    atomic_uint next_extra_family;
     int physical_threads_used;
     int incumbent_cardinality;
     const int *incumbent;
     ProgressiveNativeFeasibilityJumpOptions options;
     int target_ordinal;
     int adaptive_round;
-    bool fixed_only;
+    uint64_t steps_per_family;
+    uint64_t extra_steps;
 } FeasibilityJumpParallelContext;
 
 static uint64_t jump_monotonic_nanoseconds(void) {
@@ -488,6 +490,9 @@ void progressive_native_feasibility_jump_options_default(
     if (!options) return;
     *options = (ProgressiveNativeFeasibilityJumpOptions){
         .steps_per_family = UINT64_C(8192),
+        /* Preserve the established 512 Ki iteration allowance as the
+           default work scale, independently of cores and family breadth. */
+        .round_step_limit = UINT64_C(524288),
         .max_adaptive_rounds = 8,
         .requested_threads = 0,
         .logical_family_count = 0,
@@ -495,6 +500,7 @@ void progressive_native_feasibility_jump_options_default(
         .mixed_soft_worker_divisor = 4,
         .seed = 0,
         .deadline_nanoseconds = 0,
+        .round_deadline_nanoseconds = 0,
         .memory_budget_bytes = 0,
         .budget_mode = PROGRESSIVE_RWLS_BUDGET_WORK,
         .worker_policy = PROGRESSIVE_RWLS_WORKER_MIXED,
@@ -517,22 +523,22 @@ ProgressiveRWLSWorkerPolicy progressive_rwls_mixed_family_policy(
 }
 
 int progressive_rwls_mixed_logical_family_count(
-    int physical_thread_count,
+    int logical_work_units,
     int soft_divisor
 ) {
     if (
-        physical_thread_count < 1 ||
+        logical_work_units < 1 ||
         soft_divisor < 2 ||
         soft_divisor > RWLS_MAX_MIXED_DIVISOR
     ) {
         return 0;
     }
-    if (physical_thread_count > INT_MAX - (soft_divisor - 1)) {
+    if (logical_work_units > INT_MAX - (soft_divisor - 1)) {
         return 0;
     }
     const int family_count =
         (
-            physical_thread_count + soft_divisor - 1
+            logical_work_units + soft_divisor - 1
         ) / soft_divisor * soft_divisor;
     return family_count <= RWLS_MAX_LOGICAL_FAMILIES
         ? family_count
@@ -1764,13 +1770,16 @@ static void search_restart_family_worker(
     int worker_count,
     void *data
 ) {
+    (void)stride;
     FeasibilityJumpParallelContext *parallel =
         (FeasibilityJumpParallelContext *)data;
     if (worker_id == 0) {
         parallel->physical_threads_used = worker_count;
     }
-    for (uint64_t family = start; family < end; family += stride) {
-        if (family >= (uint64_t)parallel->family_count) break;
+    /* Start each executor with one family. Then claim any surplus families
+       as executors finish, while results stay indexed by logical ordinal. */
+    for (uint64_t job = start; job < end;) {
+        const int family = parallel->family_ordinals[job];
         FeasibilityJumpWorker *worker = &parallel->workers[family];
         ProgressiveNativeFeasibilityJumpOptions family_options =
             parallel->options;
@@ -1780,17 +1789,8 @@ static void search_restart_family_worker(
             ((uint64_t)(unsigned int)(parallel->adaptive_round + 1) << 32) ^
             (uint64_t)(unsigned int)(family + 1)
         );
-        if (parallel->adaptive_round > 0) {
-            const uint64_t multiplier =
-                parallel->adaptive_round + 1 < 4
-                    ? (uint64_t)(parallel->adaptive_round + 1)
-                    : UINT64_C(4);
-            family_options.steps_per_family =
-                family_options.steps_per_family >
-                        UINT64_MAX / multiplier
-                    ? UINT64_MAX
-                    : family_options.steps_per_family * multiplier;
-        }
+        family_options.steps_per_family = parallel->steps_per_family +
+            (job < parallel->extra_steps);
         if (
             family_options.worker_policy ==
                 PROGRESSIVE_RWLS_WORKER_MIXED
@@ -1800,13 +1800,6 @@ static void search_restart_family_worker(
                     family_options.mixed_soft_worker_divisor,
                     family
                 );
-        }
-        if (
-            parallel->fixed_only &&
-            family_options.worker_policy !=
-                PROGRESSIVE_RWLS_WORKER_FIXED_TARGET
-        ) {
-            continue;
         }
         worker->attempted = true;
         if (
@@ -1832,12 +1825,13 @@ static void search_restart_family_worker(
             );
         }
         /*
-         * A successful family must not suppress later logical families in
-         * the same physical shard.  Running the complete logical prefix is
-         * what makes equal work deterministic across physical thread counts
-         * and lets every persistent family carry its weights forward.
+         * Finish the eligible families even after a success. This preserves
+         * the work-mode trajectory, winner order and each family's weights.
          */
-        if (worker->stats.deadline_reached) break;
+        if (worker->stats.deadline_reached || end <= (uint64_t)worker_count) break;
+        job = (uint64_t)worker_count + atomic_fetch_add_explicit(
+            &parallel->next_extra_family, 1, memory_order_relaxed
+        );
     }
 }
 
@@ -2065,6 +2059,30 @@ static void collect_invocation_telemetry(
     }
 }
 
+static uint64_t rwls_saturating_product(uint64_t value, uint64_t multiplier) {
+    return value > UINT64_MAX / multiplier ? UINT64_MAX : value * multiplier;
+}
+
+static int rwls_work_admitted_families(
+    int proposed,
+    const ProgressiveNativeFeasibilityJumpOptions *options
+) {
+    if (options->logical_family_count ||
+        options->budget_mode != PROGRESSIVE_RWLS_BUDGET_WORK ||
+        !options->round_step_limit) return proposed;
+    /* Fund the requested search depth before adding another policy cohort.
+     * This ratio is work, not hardware: a smaller cap or deeper requested
+     * search admits fewer families. Keep one cohort when the allowance is
+     * tiny; the existing deterministic round allocator then shortens it.
+     * Both work and depth receive the same progress-driven retry multiplier,
+     * so the admitted breadth stays stable throughout target descent. */
+    const uint64_t cohort = (uint64_t)options->mixed_soft_worker_divisor;
+    uint64_t funded = options->round_step_limit / options->steps_per_family;
+    funded -= funded % cohort;
+    if (funded < cohort) funded = cohort;
+    return funded < (uint64_t)proposed ? (int)funded : proposed;
+}
+
 static bool search_target_adaptive(
     FeasibilityJumpWorker *workers,
     int family_count,
@@ -2081,15 +2099,45 @@ static bool search_target_adaptive(
 ) {
     const int target = incumbent_cardinality - 1;
     int best_failed_uncovered = workers[0].state.master->rows;
+    int family_ordinals[RWLS_MAX_LOGICAL_FAMILIES];
+    int eligible_count = 0;
+    for (int family = 0; family < family_count; ++family) {
+        if (fixed_only && progressive_rwls_mixed_family_policy(
+            options->mixed_soft_worker_divisor, (uint64_t)family
+        ) == PROGRESSIVE_RWLS_WORKER_SOFT_PRESSURE) continue;
+        family_ordinals[eligible_count++] = family;
+    }
+    const bool work_mode = options->budget_mode == PROGRESSIVE_RWLS_BUDGET_WORK;
+    uint64_t round_limit = work_mode ? options->round_step_limit : 0;
+    if (round_limit && fixed_only) {
+        /* Recovery retains only the fixed-policy share of a mixed round. */
+        round_limit -= round_limit / (uint64_t)options->mixed_soft_worker_divisor;
+    }
+    if (round_limit && (uint64_t)eligible_count > round_limit) {
+        eligible_count = (int)round_limit;
+    }
+    const int round_threads = physical_thread_count < eligible_count
+        ? physical_thread_count : eligible_count;
     const bool sustained =
         options->sustained_until_deadline &&
-        options->budget_mode == PROGRESSIVE_RWLS_BUDGET_WALL &&
-        options->deadline_nanoseconds > 0;
+        (work_mode ? options->round_deadline_nanoseconds
+                   : options->deadline_nanoseconds) > 0;
+    uint64_t previous_round_nanoseconds = 0;
     for (
         int round = 0;
         round < options->max_adaptive_rounds || sustained;
         ++round
     ) {
+        const uint64_t round_started = jump_monotonic_nanoseconds();
+        if (work_mode && options->round_deadline_nanoseconds > 0 &&
+            (round_started >= options->round_deadline_nanoseconds ||
+             previous_round_nanoseconds >=
+                 options->round_deadline_nanoseconds - round_started)) {
+            /* Never truncate a logical family round. Admit another only
+             * while the remaining allowance can pay its observed cost. */
+            stats->deadline_reached = true;
+            break;
+        }
         if (
             options->budget_mode == PROGRESSIVE_RWLS_BUDGET_WALL &&
             jump_deadline_reached(options->deadline_nanoseconds)
@@ -2114,41 +2162,58 @@ static bool search_target_adaptive(
                 workers[family].state.master->rows
             );
         }
+        const uint64_t multiplier = round < 3 ? (uint64_t)round + 1 : 4;
+        uint64_t steps = rwls_saturating_product(options->steps_per_family, multiplier);
+        uint64_t extra_steps = 0;
+        if (round_limit) {
+            const uint64_t allowance = rwls_saturating_product(round_limit, multiplier);
+            if (steps > allowance / (uint64_t)eligible_count) {
+                steps = allowance / (uint64_t)eligible_count;
+                extra_steps = allowance % (uint64_t)eligible_count;
+            }
+        }
+        if (work_mode) {
+            const uint64_t granted = rwls_saturating_product(steps, (uint64_t)eligible_count);
+            const uint64_t remaining = UINT64_MAX - stats->scheduled_iterations;
+            stats->scheduled_iterations = granted > remaining || extra_steps > remaining - granted
+                ? UINT64_MAX : stats->scheduled_iterations + granted + extra_steps;
+        }
+        if (stats->family_steps_min == 0 || steps < stats->family_steps_min)
+            stats->family_steps_min = steps;
+        if (steps + (extra_steps > 0) > stats->family_steps_max)
+            stats->family_steps_max = steps + (extra_steps > 0);
+        /* Deterministic shares follow logical queue order, irrespective of
+           which executor claims a family or when it finishes. */
         FeasibilityJumpParallelContext parallel = {
             .workers = workers,
-            .family_count = family_count,
+            .family_ordinals = family_ordinals,
             .physical_threads_used = 0,
             .incumbent_cardinality = incumbent_cardinality,
             .incumbent = incumbent,
             .options = *options,
             .target_ordinal = target_ordinal,
             .adaptive_round = round,
-            .fixed_only = fixed_only
+            .steps_per_family = steps,
+            .extra_steps = extra_steps
         };
+        atomic_init(&parallel.next_extra_family, 0);
         const bool parallel_completed = ccubes_parallel_for(
             0,
-            (uint64_t)family_count,
-            physical_thread_count,
+            (uint64_t)eligible_count,
+            round_threads,
             true,
             search_restart_family_worker,
             &parallel
         );
         if (!parallel_completed) {
-            for (int family = 0; family < family_count; ++family) {
-                reset_worker_result(
-                    &workers[family],
-                    workers[family].state.master->rows
-                );
-            }
             search_restart_family_worker(
                 0,
-                (uint64_t)family_count,
+                (uint64_t)eligible_count,
                 1,
                 0,
                 1,
                 &parallel
             );
-            parallel.physical_threads_used = 1;
         }
         if (parallel.physical_threads_used > stats->threads_used) {
             stats->threads_used = parallel.physical_threads_used;
@@ -2218,6 +2283,8 @@ static bool search_target_adaptive(
             best_failed_uncovered = round_best_uncovered;
         }
         if (stats->deadline_reached) break;
+        previous_round_nanoseconds =
+            jump_monotonic_nanoseconds() - round_started;
         if (!recent_improvement && !sustained) {
             break;
         }
@@ -2320,9 +2387,17 @@ progressive_native_feasibility_jump_improve(
     );
     int family_count = options->logical_family_count;
     if (family_count == 0) {
+        /* A restart per incumbent term, in complete policy cohorts. The
+           chart and incumbent define logical work; executor count does not.
+           Keep the same families throughout target descent. */
+        int work_units = incumbent_cardinality;
+        if (work_units > master->rows) work_units = master->rows;
+        if (work_units > master->count) work_units = master->count;
+        int maximum = RWLS_MAX_LOGICAL_FAMILIES /
+            options->mixed_soft_worker_divisor * options->mixed_soft_worker_divisor;
+        if (work_units > maximum) work_units = maximum;
         family_count = progressive_rwls_mixed_logical_family_count(
-            physical_thread_count,
-            options->mixed_soft_worker_divisor
+            work_units, options->mixed_soft_worker_divisor
         );
     } else if (
         family_count < 1 ||
@@ -2334,6 +2409,9 @@ progressive_native_feasibility_jump_improve(
     if (family_count <= 0) {
         return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_INVALID;
     }
+    stats->proposed_family_states = family_count;
+    family_count = rwls_work_admitted_families(family_count, options);
+    stats->work_admitted_family_states = family_count;
     uint64_t allocated_bytes = 0;
     if (!estimate_peak_memory(
         master,
@@ -2344,6 +2422,15 @@ progressive_native_feasibility_jump_improve(
         &allocated_bytes
     )) {
         return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY;
+    }
+    if (!options->logical_family_count && options->memory_budget_bytes) {
+        while (allocated_bytes > options->memory_budget_bytes &&
+               family_count > options->mixed_soft_worker_divisor) {
+            family_count -= options->mixed_soft_worker_divisor;
+            if (!estimate_peak_memory(master, shared_bytes, worker_bytes, family_count,
+                                      incumbent_cardinality, &allocated_bytes))
+                return PROGRESSIVE_NATIVE_FEASIBILITY_JUMP_OUT_OF_MEMORY;
+        }
     }
     stats->initial_cardinality = incumbent_cardinality;
     stats->final_cardinality = incumbent_cardinality;

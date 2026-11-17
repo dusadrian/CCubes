@@ -39,7 +39,6 @@
  * still being ~10^4 times the old fixed budget.
  */
 #define CCUBES_AUTO_MMCS_MAX_NODE_LIMIT UINT64_C(100000000)
-#define CCUBES_AUTO_MMCS_MAX_TRIAL_THREADS 4
 
 #define CCUBES_INITIAL_PI_MEMORY_BYTES UINT64_C(268435456)
 #define CCUBES_INITIAL_PI_CAPACITY_MIN 64
@@ -2590,10 +2589,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        int mmcs_threads =
-            automatic_mmcs_trial && THREADS > CCUBES_AUTO_MMCS_MAX_TRIAL_THREADS
-                ? CCUBES_AUTO_MMCS_MAX_TRIAL_THREADS
-                : THREADS;
+        /* Dispatch already limits workers to available CPUs and output tasks.
+           Trial node limits remain unchanged for every output. */
+        int mmcs_threads = ccubes_effective_thread_count(THREADS);
         bool use_mmcs_level = false;
         uint64_t maxtasks = attempt_mmcs
             ? (uint64_t)noutputs

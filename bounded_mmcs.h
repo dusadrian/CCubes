@@ -50,6 +50,7 @@ typedef struct {
     uint64_t candidate_collection_nanoseconds;
     uint64_t merge_nanoseconds;
     uint64_t pricing_call_nanoseconds;
+    uint64_t subtrees_searched;
 } WeightedMMCSPriceTelemetry;
 
 typedef struct {

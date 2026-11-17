@@ -34,6 +34,9 @@ typedef struct {
 typedef enum { WORKER_IDLE, WORKER_ASSIGNED, WORKER_RUNNING } WorkerState;
 
 struct WarmWorker {
+#if defined(HAVE_PTHREAD)
+    pthread_t thread; /* Accounted with the dynamically allocated worker. */
+#endif
     WeightedCover weighted;
     Repricing pricing;
     CompactPricing compact;
@@ -99,7 +102,7 @@ IpcChartPolish *ipc_chart_polish_open(const PIChartView *chart, size_t memory_by
         sizeof(IpcChartPolish) > memory_bytes) return NULL;
     IpcChartPolish *state = calloc(1, sizeof(*state));
     if (!state) return NULL;
-    state->workers = workers > 4 ? 4 : workers < 1 ? 1 : workers;
+    state->workers = workers < 1 ? 1 : workers;
 #if !defined(HAVE_PTHREAD)
     state->workers = 1;
 #endif
@@ -480,14 +483,13 @@ static unsigned warm_run_pool(WarmPool *pool, WarmWorker *workers, unsigned coun
     pool->available = probe_end > current ? probe_end - current : 0;
     pool->future = hard - current - pool->available;
     if (w->progress > w->checkpoint_progress) pool->checkpoint = UINT64_MAX;
-    pthread_t threads[4];
     pthread_mutex_lock(&pool->mutex);
     for (unsigned i = 0; i < count; ++i) {
         workers[i].pool = pool;
         workers[i].weighted.budget = (NsatBudget){.limits = {
             .poll = warm_worker_poll, .context = &workers[i]
         }};
-        if (pthread_create(&threads[i], NULL, warm_worker_run, &workers[i]) != 0) break;
+        if (pthread_create(&workers[i].thread, NULL, warm_worker_run, &workers[i]) != 0) break;
         ++pool->started;
     }
     if (pool->started) {
@@ -525,7 +527,7 @@ static unsigned warm_run_pool(WarmPool *pool, WarmWorker *workers, unsigned coun
     }
     pthread_cond_broadcast(&pool->changed);
     pthread_mutex_unlock(&pool->mutex);
-    for (unsigned i = 0; i < pool->started; ++i) pthread_join(threads[i], NULL);
+    for (unsigned i = 0; i < pool->started; ++i) pthread_join(workers[i].thread, NULL);
     pthread_cond_destroy(&pool->changed);
     pthread_mutex_destroy(&pool->mutex);
     return pool->started;
@@ -559,7 +561,12 @@ IpcChartPolishResult ipc_chart_polish_decide(IpcChartPolish *state,
         rows * rows * sizeof(double) + sizeof(SavedBasis);
     const size_t available = nsat_memory_available(&w->budget);
     unsigned requested = state->workers;
-    while (requested && minimum > available / requested) --requested;
+    size_t affordable = minimum ? available / minimum : 0;
+    if ((size_t)requested > affordable) requested = (unsigned)affordable;
+    /* At most this many alternatives can be exposed at a pivot. Workers
+       receive further descendants as they become available. */
+    if (requested > (unsigned)query->max_row_degree) requested = (unsigned)query->max_row_degree;
+    if ((uint64_t)requested > query->node_limit) requested = (unsigned)query->node_limit;
     if (!requested) goto finish;
 
     WarmWorker *workers = nsat_alloc(&w->budget, requested, sizeof(*workers));

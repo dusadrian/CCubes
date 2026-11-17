@@ -43,18 +43,27 @@ typedef enum {
 
 typedef struct {
     uint64_t steps_per_family;
+    /* Shared first-round iteration limit in work mode. Zero uses only the
+       per-family limit. Later rounds retain the usual depth multiplier. */
+    uint64_t round_step_limit;
     int max_adaptive_rounds;
     int requested_threads;
+    /* Zero: chart/incumbent-sized policy cohorts, limited by the work budget
+       at the requested depth, then memory, independently of physical threads.
+       Positive: exact family count (the shared work cap still applies). */
     int logical_family_count;
     int tabu_tenure;
     int mixed_soft_worker_divisor;
     uint64_t seed;
     uint64_t deadline_nanoseconds;
+    /* Optional work-mode deadline, checked only between complete capped
+     * family rounds. Ordinary work-mode calls leave this zero. */
+    uint64_t round_deadline_nanoseconds;
     uint64_t memory_budget_bytes;
     ProgressiveRWLSBudgetMode budget_mode;
     ProgressiveRWLSWorkerPolicy worker_policy;
-    /* Wall mode only: repeat adaptive rounds on a failed target until the
-     * deadline instead of stopping after the first failed round. */
+    /* Repeat adaptive rounds on a failed target until the wall deadline,
+     * or the round deadline in work mode. Work shares remain capped. */
     bool sustained_until_deadline;
     /* Sustained mode only: stop once this many seconds pass without a
      * smaller cover (counted from the start or the last improvement);
@@ -72,9 +81,14 @@ typedef struct {
     uint64_t adaptive_rounds;
     uint64_t restart_families;
     int threads_used;
+    int proposed_family_states;
+    int work_admitted_family_states;
     int logical_family_states;
+    uint64_t family_steps_min;
+    uint64_t family_steps_max;
     uint64_t restarts;
     uint64_t iterations;
+    uint64_t scheduled_iterations; /* Total granted across work-mode rounds. */
     uint64_t add_moves;
     uint64_t remove_moves;
     uint64_t penalty_updates;
@@ -146,13 +160,13 @@ ProgressiveRWLSWorkerPolicy progressive_rwls_mixed_family_policy(
 );
 
 /*
- * Return the smallest complete persistent policy prefix that can keep the
- * requested physical executors occupied. Growth is in complete policy blocks,
+ * Round a logical-work allowance up to a complete persistent policy prefix.
+ * Growth is in complete policy blocks,
  * so the fixed/soft proportion never depends on a partial final block. Zero
  * reports invalid arguments or an unsupported family count.
  */
 int progressive_rwls_mixed_logical_family_count(
-    int physical_thread_count,
+    int logical_work_units,
     int soft_divisor
 );
 

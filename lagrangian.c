@@ -12,7 +12,13 @@
 #include "polish_order.h"
 #include "ipc_chart_polish.h"
 
+#include <stdatomic.h>
 #include <time.h>
+#if defined(HAVE_PTHREAD)
+#include <pthread.h>
+#elif defined(HAVE_OPENMP) && defined(_WIN32)
+#include <windows.h>
+#endif
 
 #define EPS 1e-12
 #define LAGRANGIAN_REDUCTION_BUCKET_LIMIT 64
@@ -137,8 +143,13 @@ void lagrangian_reset_stats(void) {
     lagr_last_stats.polish_stop_reason = LAGR_POLISH_NOT_RUN;
     lagr_last_stats.reduced_cost_nanoseconds = 0;
     lagr_last_stats.heuristic_nanoseconds = 0;
+    lagr_last_stats.heuristic_row_min_nanoseconds = 0;
+    lagr_last_stats.heuristic_greedy_nanoseconds = 0;
+    lagr_last_stats.heuristic_repair_nanoseconds = 0;
     lagr_last_stats.bundle_nanoseconds = 0;
     lagr_last_stats.subgradient_nanoseconds = 0;
+    lagr_last_stats.reduced_cost_teams = (LagrangianTeamStats){0};
+    lagr_last_stats.slack_teams = (LagrangianTeamStats){0};
     lagr_last_stats.nonzero_subgradient_rows = 0;
     lagr_last_stats.reduced_cost_calls = 0;
     lagr_last_stats.heuristic_calls = 0;
@@ -357,6 +368,72 @@ static void lagr_reduction_bucket_bounds(
 }
 
 typedef struct {
+    int columns;
+    int rows;
+} LagrangianLoopThreads;
+
+static _Thread_local uint64_t lagr_incidence_work;
+
+static int lagr_reduction_threads(int items, uint64_t incidences, int requested) {
+    (void)incidences;
+    /* Arithmetic buckets no longer limit the executor team. This is an
+       upper allowance; the measured controller chooses the actual team. */
+    return items < requested ? (items > 0 ? items : 1) : (requested > 0 ? requested : 1);
+}
+
+static LagrangianLoopThreads lagr_loop_threads(int rows, int cols, const int *rowsCoveredCount) {
+    int requested = ccubes_thread_count();
+    lagr_incidence_work = 0;
+    for (int col = 0; col < cols; ++col) lagr_incidence_work += (uint64_t)rowsCoveredCount[col];
+    return (LagrangianLoopThreads){
+        .columns = lagr_reduction_threads(cols, lagr_incidence_work, requested),
+        .rows = lagr_reduction_threads(rows, lagr_incidence_work, requested)
+    };
+}
+
+static _Thread_local LagrangianCalibrationStats *lagr_calibration_stats;
+
+static void lagr_record_team(LagrangianTeamStats *stats, int workers) {
+    if (!stats->calls || workers < stats->min_workers) stats->min_workers = workers;
+    if (workers > stats->max_workers) stats->max_workers = workers;
+    stats->calls++;
+    stats->serial_calls += workers == 1;
+    stats->worker_sum += (uint64_t)workers;
+}
+
+static void lagr_merge_teams(LagrangianTeamStats *total, const LagrangianTeamStats *part) {
+    if (!part->calls) return;
+    if (!total->calls || part->min_workers < total->min_workers) total->min_workers = part->min_workers;
+    if (part->max_workers > total->max_workers) total->max_workers = part->max_workers;
+    total->calls += part->calls;
+    total->serial_calls += part->serial_calls;
+    total->worker_sum += part->worker_sum;
+}
+
+static int lagr_run_reduction(int items, int threads, ccubes_range_worker worker,
+                               void *context, ccubes_adaptive_team *team) {
+    threads = ccubes_adaptive_team_choose(team, (uint64_t)items,
+        lagr_incidence_work + (uint64_t)items, threads);
+    bool measure = !team->settled;
+    uint64_t started = measure ? ccubes_monotonic_nanoseconds() : 0;
+    int actual_threads = 1;
+    if (threads <= 1) {
+        worker(0, (uint64_t)items, 1, 0, 1, context);
+    } else if (!ccubes_parallel_for_counted(0, (uint64_t)items, threads, false,
+                                          worker, context, &actual_threads)) {
+        worker(0, (uint64_t)items, 1, 0, 1, context);
+        actual_threads = 1;
+        team->best = 1;
+        team->settled = true;
+    }
+    if (measure) {
+        uint64_t finished = ccubes_monotonic_nanoseconds();
+        ccubes_adaptive_team_observe(team, finished > started ? finished - started : 0);
+    }
+    return actual_threads;
+}
+
+typedef struct {
     const PIChartView *chart;
     int rows;
     int cols;
@@ -447,31 +524,14 @@ static void lagr_reduced_worker(
     (void)worker_id;
     (void)worker_count;
     lagr_reduced_context *ctx = (lagr_reduced_context *)data;
-    for (uint64_t b0 = start; b0 < end; b0 += stride) {
-        const int bucket = (int)b0;
-        uint64_t first = 0;
-        uint64_t last = 0;
-        lagr_reduction_bucket_bounds(
-            ctx->cols,
-            ctx->bucket_count,
-            bucket,
-            &first,
-            &last
-        );
-        double neg = 0.0;
-        for (uint64_t c0 = first; c0 < last; ++c0) {
-            int c = (int)c0;
-            double sum = 0.0;
-            for (int k = 0; k < ctx->rowsCoveredCount[c]; ++k) {
-                int r = ctx->rowsCovered[c][k];
-                sum += ctx->t[r];
-            }
-            double cost = ctx->col_costs ? ctx->col_costs[c] : 1.0;
-            ctx->ls[c] = cost - sum;
-            if (ctx->x) ctx->x[c] = (ctx->ls[c] < 0.0) ? 1 : 0;
-            if (ctx->ls[c] < 0.0) neg += ctx->ls[c];
-        }
-        ctx->partials[bucket] = neg;
+    for (uint64_t c0 = start; c0 < end; c0 += stride) {
+        int c = (int)c0;
+        double sum = 0.0;
+        for (int k = 0; k < ctx->rowsCoveredCount[c]; ++k)
+            sum += ctx->t[ctx->rowsCovered[c][k]];
+        double cost = ctx->col_costs ? ctx->col_costs[c] : 1.0;
+        ctx->ls[c] = cost - sum;
+        if (ctx->x) ctx->x[c] = ctx->ls[c] < 0.0;
     }
 }
 
@@ -497,36 +557,67 @@ static void lagr_slack_worker(
     (void)worker_id;
     (void)worker_count;
     lagr_slack_context *ctx = (lagr_slack_context *)data;
-    for (uint64_t b0 = start; b0 < end; b0 += stride) {
-        const int bucket = (int)b0;
-        uint64_t first = 0;
-        uint64_t last = 0;
-        lagr_reduction_bucket_bounds(
-            ctx->rows,
-            ctx->bucket_count,
-            bucket,
-            &first,
-            &last
-        );
-        double sum_s2 = 0.0;
-        uint64_t nonzero = 0;
-        for (uint64_t i0 = first; i0 < last; ++i0) {
-            int i = (int)i0;
-            int covered = 0;
-            for (int k = 0; k < ctx->colsCoveringCount[i]; ++k) {
-                int c = ctx->colsCovering[i][k];
-                covered += ctx->x[c];
-            }
-            double s = 1.0 - (double)covered;
-            ctx->slack[i] = s;
-            sum_s2 += s * s;
-            if (s != 0.0) nonzero++;
-        }
-        ctx->partials[bucket] = sum_s2;
-        if (ctx->nonzero_partials) {
-            ctx->nonzero_partials[bucket] = nonzero;
-        }
+    for (uint64_t r0 = start; r0 < end; r0 += stride) {
+        int r = (int)r0;
+        int covered = 0;
+        for (int k = 0; k < ctx->colsCoveringCount[r]; ++k)
+            covered += ctx->x[ctx->colsCovering[r][k]];
+        ctx->slack[r] = 1.0 - (double)covered;
     }
+}
+
+static double lagr_compute_slacks(
+    int rows,
+    int **colsCovering,
+    int *colsCoveringCount,
+    const unsigned char *x,
+    double *slack,
+    int *nonzero_rows_out,
+    int threads
+) {
+    const int bucket_count = lagr_reduction_bucket_count(rows);
+    double partials[LAGRANGIAN_REDUCTION_BUCKET_LIMIT];
+    uint64_t nonzero_partials[LAGRANGIAN_REDUCTION_BUCKET_LIMIT];
+    lagr_slack_context context = {
+        .colsCovering = colsCovering,
+        .colsCoveringCount = colsCoveringCount,
+        .x = x,
+        .slack = slack,
+        .partials = partials,
+        .nonzero_partials = nonzero_partials,
+        .rows = rows,
+        .bucket_count = bucket_count
+    };
+    static _Thread_local ccubes_adaptive_team teams[65];
+    unsigned key = 0;
+    for (uint64_t work = lagr_incidence_work + (uint64_t)rows; work; work >>= 1) ++key;
+    int workers = lagr_run_reduction(rows, threads, lagr_slack_worker, &context, &teams[key]);
+    lagr_record_team(lagr_calibration_stats ? &lagr_calibration_stats->slack_teams
+        : &lagr_last_stats.slack_teams, workers);
+    /* Preserve every original addition and bucket boundary, independently
+       of which executor computed each row's slack. */
+    for (int bucket = 0; bucket < bucket_count; ++bucket) {
+        uint64_t first, last;
+        lagr_reduction_bucket_bounds(rows, bucket_count, bucket, &first, &last);
+        double sum = 0.0;
+        uint64_t nonzero = 0;
+        for (uint64_t row = first; row < last; ++row) {
+            double value = slack[row];
+            sum += value * value;
+            if (value != 0.0) ++nonzero;
+        }
+        partials[bucket] = sum;
+        nonzero_partials[bucket] = nonzero;
+    }
+
+    double sum_s2 = 0.0;
+    uint64_t nonzero_rows = 0;
+    for (int i = 0; i < bucket_count; ++i) {
+        sum_s2 += partials[i];
+        nonzero_rows += nonzero_partials[i];
+    }
+    if (nonzero_rows_out) *nonzero_rows_out = (int)nonzero_rows;
+    return sum_s2;
 }
 
 /*
@@ -539,9 +630,10 @@ Returns:
 -1 on out of memory.
 */
 
-static int build_adjacency(
+static int build_adjacency_with_threads(
     const PIChartView *chart,
     int rows, int cols,
+    int threads,
     int ***rowsCovered,
     int **rowsCoveredCount,
     int ***colsCovering,
@@ -551,7 +643,6 @@ static int build_adjacency(
     int **cr = NULL, *crc = NULL;
     int *thread_row_count = NULL;
     int *thread_row_write = NULL;
-    int threads = ccubes_thread_count();
 
     if (!chart || !chart->bits || rows <= 0 || cols <= 0 ||
         chart->rows != rows || chart->cols != cols || chart->words <= 0 ||
@@ -559,16 +650,21 @@ static int build_adjacency(
         return -1;
     }
     if (threads > cols) threads = cols;
-    /*
-     * Adjacency construction is a one-time, bandwidth-bound pass.  More
-     * physical workers than the fixed reduction bucket count only multiply
-     * the rows-per-worker counting scratch; they do not expose more logical
-     * solver work.  Keep that scratch bounded on very high-core machines.
-     */
-    if (threads > LAGRANGIAN_REDUCTION_BUCKET_LIMIT) {
-        threads = LAGRANGIAN_REDUCTION_BUCKET_LIMIT;
-    }
+    /* Count/write scratch has its own byte allowance, independent of the
+       floating-point reduction grouping. Failed allocations still shrink
+       the team below. */
+    const uint64_t scratch_bytes = UINT64_C(32) * 1024 * 1024;
+    uint64_t memory_threads = scratch_bytes / ((uint64_t)rows * 2 * sizeof(int));
+    if ((uint64_t)threads > memory_threads) threads = (int)memory_threads;
     if (threads < 1) threads = 1;
+
+    static _Thread_local ccubes_adaptive_team teams[65];
+    uint64_t work = (uint64_t)cols * (uint64_t)chart->words + (uint64_t)rows;
+    unsigned key = 0;
+    for (uint64_t value = work; value; value >>= 1) ++key;
+    threads = ccubes_adaptive_team_choose(&teams[key], (uint64_t)cols, work, threads);
+    bool measure = !teams[key].settled;
+    uint64_t started = measure ? ccubes_monotonic_nanoseconds() : 0;
 
     rcc = (int*)calloc((size_t)cols, sizeof(int));
     crc = (int*)calloc((size_t)rows, sizeof(int));
@@ -670,6 +766,10 @@ static int build_adjacency(
     *rowsCoveredCount = rcc;
     *colsCovering = cr;
     *colsCoveringCount = crc;
+    if (measure) {
+        uint64_t finished = ccubes_monotonic_nanoseconds();
+        ccubes_adaptive_team_observe(&teams[key], finished > started ? finished - started : 0);
+    }
     return 0;
 
 oom: // out of memory
@@ -680,6 +780,20 @@ oom: // out of memory
     free(rcc);
     free(crc);
     return -1;
+}
+
+static int build_adjacency(
+    const PIChartView *chart,
+    int rows, int cols,
+    int ***rowsCovered,
+    int **rowsCoveredCount,
+    int ***colsCovering,
+    int **colsCoveringCount
+) {
+    return build_adjacency_with_threads(
+        chart, rows, cols, ccubes_thread_count(),
+        rowsCovered, rowsCoveredCount, colsCovering, colsCoveringCount
+    );
 }
 
 static void free_adjacency(
@@ -696,6 +810,71 @@ static void free_adjacency(
     free(rowsCoveredCount);
     free(colsCovering);
     free(colsCoveringCount);
+}
+
+typedef struct {
+    int words;
+    uint64_t tail_mask;
+    const uint64_t *bits;
+    int **rows_covered;
+    const int *row_counts;
+    int **cols_covering;
+    const int *col_counts;
+    const double *weights;
+    int *first_dominator;
+} LagrangianDominanceScan;
+
+static int lagr_rarest_row(const LagrangianDominanceScan *scan, int column) {
+    int row = -1;
+    for (int k = 0; k < scan->row_counts[column]; ++k) {
+        const int candidate = scan->rows_covered[column][k];
+        if (row < 0 || scan->col_counts[candidate] < scan->col_counts[row]) {
+            row = candidate;
+        }
+    }
+    return row;
+}
+
+static int lagr_find_dominator(
+    const LagrangianDominanceScan *scan,
+    int column, int row, int start, const unsigned char *active
+) {
+    const int count = scan->row_counts[column];
+    const double weight = scan->weights ? scan->weights[column] : 0.0;
+    const uint64_t *bits = scan->bits + (size_t)column * scan->words;
+    for (int k = start; k < scan->col_counts[row]; ++k) {
+        const int other = scan->cols_covering[row][k];
+        if (other == column || (active && !active[other])) continue;
+        if (scan->row_counts[other] < count) continue;
+
+        const double other_weight = scan->weights ? scan->weights[other] : 0.0;
+        if (other_weight + EPS < weight) continue;
+        if (scan->row_counts[other] == count &&
+            fabs(other_weight - weight) <= EPS && other > column) continue;
+
+        const uint64_t *other_bits = scan->bits + (size_t)other * scan->words;
+        int word = 0;
+        for (; word < scan->words; ++word) {
+            const uint64_t mask = word == scan->words - 1 ? scan->tail_mask : UINT64_MAX;
+            if (bits[word] & ~other_bits[word] & mask) break;
+        }
+        if (word == scan->words) return k;
+    }
+    return -1;
+}
+
+static void lagr_scan_dominators(
+    uint64_t start, uint64_t end, uint64_t stride,
+    int worker_id, int worker_count, void *data
+) {
+    (void)worker_id;
+    (void)worker_count;
+    LagrangianDominanceScan *scan = data;
+    for (uint64_t c = start; c < end; c += stride) {
+        const int row = lagr_rarest_row(scan, (int)c);
+        scan->first_dominator[c] = row < 0 ? -1 :
+            lagr_find_dominator(scan, (int)c, row, 0, NULL);
+    }
 }
 
 /*
@@ -717,9 +896,18 @@ static int presolve_dominated_columns(
     int *rowsCoveredCount,
     int **colsCovering,
     int *colsCoveringCount,
-    const double *weights
+    const double *weights,
+    int threads
 ) {
     if (rows <= 0 || cols <= 1) return 0;
+
+    static _Thread_local ccubes_adaptive_team teams[65];
+    uint64_t work = (uint64_t)cols * ((uint64_t)rows + 63) / 64;
+    unsigned key = 0;
+    for (uint64_t value = work; value; value >>= 1) ++key;
+    threads = ccubes_adaptive_team_choose(&teams[key], (uint64_t)cols, work, threads);
+    bool measure = !teams[key].settled;
+    uint64_t started = measure ? ccubes_monotonic_nanoseconds() : 0;
 
     int words = (rows + 63) / 64;
     uint64_t *owned_bits = NULL;
@@ -747,57 +935,43 @@ static int presolve_dominated_columns(
             }
         }
     }
-    const uint64_t tail_mask = rows % 64
-        ? (UINT64_C(1) << (rows % 64)) - 1 : UINT64_MAX;
+    LagrangianDominanceScan scan = {
+        .words = words,
+        .tail_mask = rows % 64 ? (UINT64_C(1) << (rows % 64)) - 1 : UINT64_MAX,
+        .bits = bits,
+        .rows_covered = rowsCovered,
+        .row_counts = rowsCoveredCount,
+        .cols_covering = colsCovering,
+        .col_counts = colsCoveringCount,
+        .weights = weights
+    };
+    if (threads > 1) {
+        scan.first_dominator = malloc((size_t)cols * sizeof(int));
+        if (scan.first_dominator &&
+            !ccubes_parallel_for(0, (uint64_t)cols, threads, true,
+                                 lagr_scan_dominators, &scan)) {
+            free(scan.first_dominator);
+            scan.first_dominator = NULL;
+        }
+    }
 
     int removed = 0;
     for (int c = 0; c < cols; ++c) {
-        if (!active[c] || rowsCoveredCount[c] <= 0) continue;
+        const int start = scan.first_dominator ? scan.first_dominator[c] : 0;
+        if (start < 0) continue;
+        const int row = lagr_rarest_row(&scan, c);
+        if (row < 0) continue;
 
-        /* rarest row covered by c: smallest candidate list to scan */
-        int rmin = -1;
-        int best = INT_MAX;
-        for (int k = 0; k < rowsCoveredCount[c]; ++k) {
-            int r = rowsCovered[c][k];
-            if (colsCoveringCount[r] < best) {
-                best = colsCoveringCount[r];
-                rmin = r;
-            }
-        }
-        if (rmin < 0) continue;
-
-        double wc = weights ? weights[c] : 0.0;
-        const uint64_t *bc = bits + (size_t)c * words;
-
-        for (int k = 0; k < colsCoveringCount[rmin]; ++k) {
-            int d = colsCovering[rmin][k];
-            if (d == c || !active[d]) continue;
-            if (rowsCoveredCount[d] < rowsCoveredCount[c]) continue;
-
-            double wd = weights ? weights[d] : 0.0;
-            if (wd + EPS < wc) continue; /* keep the heavier column for the tie-break */
-
-            if (rowsCoveredCount[d] == rowsCoveredCount[c] && fabs(wd - wc) <= EPS && d > c) {
-                continue; /* identical coverage and weight: keep the lower index */
-            }
-
-            const uint64_t *bd = bits + (size_t)d * words;
-            int subset = 1;
-            for (int w = 0; w < words; ++w) {
-                const uint64_t mask = w == words - 1 ? tail_mask : UINT64_MAX;
-                if (bc[w] & ~bd[w] & mask) {
-                    subset = 0;
-                    break;
-                }
-            }
-
-            if (subset) {
-                active[c] = 0;
-                ++removed;
-                break;
-            }
+        /* Keep the original removal order, including weight ties. A
+           precomputed dominator may have been removed by an earlier column. */
+        const int dominator = scan.first_dominator && active[colsCovering[row][start]]
+            ? start : lagr_find_dominator(&scan, c, row, start, active);
+        if (dominator >= 0) {
+            active[c] = 0;
+            ++removed;
         }
     }
+    free(scan.first_dominator);
 
     if (removed > 0) {
         for (int c = 0; c < cols; ++c) {
@@ -818,6 +992,10 @@ static int presolve_dominated_columns(
 
     free(owned_bits);
     free(active);
+    if (measure) {
+        uint64_t finished = ccubes_monotonic_nanoseconds();
+        ccubes_adaptive_team_observe(&teams[key], finished > started ? finished - started : 0);
+    }
     return removed;
 }
 
@@ -1148,13 +1326,13 @@ static double compute_reduced_and_lb(
     const double *t,
     const double *col_costs, // can be NULL
     double *ls, /* out */
-    unsigned char *x /* optional sign flags for subgradient */
+    unsigned char *x, /* optional sign flags for subgradient */
+    int threads
 ) {
     double ZLB = 0.0;
     double ZLB_rows = 0.0;
     double ZLB_neg = 0.0;
 
-    int threads = ccubes_thread_count();
     const int bucket_count = lagr_reduction_bucket_count(cols);
     double partials[LAGRANGIAN_REDUCTION_BUCKET_LIMIT];
 
@@ -1171,15 +1349,19 @@ static double compute_reduced_and_lb(
         .cols = cols,
         .bucket_count = bucket_count
     };
-    if (!ccubes_parallel_for(
-        0,
-        (uint64_t)bucket_count,
-        threads,
-        false,
-        lagr_reduced_worker,
-        &reduced_ctx
-    )) {
-        return 0.0;
+    static _Thread_local ccubes_adaptive_team teams[65];
+    unsigned key = 0;
+    for (uint64_t work = lagr_incidence_work + (uint64_t)cols; work; work >>= 1) ++key;
+    int workers = lagr_run_reduction(cols, threads, lagr_reduced_worker, &reduced_ctx, &teams[key]);
+    lagr_record_team(lagr_calibration_stats ? &lagr_calibration_stats->reduced_cost_teams
+        : &lagr_last_stats.reduced_cost_teams, workers);
+    for (int bucket = 0; bucket < bucket_count; ++bucket) {
+        uint64_t first, last;
+        lagr_reduction_bucket_bounds(cols, bucket_count, bucket, &first, &last);
+        double neg = 0.0;
+        for (uint64_t col = first; col < last; ++col)
+            if (ls[col] < 0.0) neg += ls[col];
+        partials[bucket] = neg;
     }
     for (int i = 0; i < bucket_count; ++i) {
         ZLB_neg += partials[i];
@@ -1228,45 +1410,15 @@ static int subgradient_update(
     double step_contract,
     double stabilization_beta,
     int *nonzero_rows_out,
-    LagrangianWorkspace *workspace
+    LagrangianWorkspace *workspace,
+    int threads
 ) {
-    int threads = ccubes_thread_count();
-    const int bucket_count = lagr_reduction_bucket_count(rows);
     if (!x) return 0;
 
     double *slack = workspace->slack;
-
-    double sum_s2 = 0.0;
-
-    double partials[LAGRANGIAN_REDUCTION_BUCKET_LIMIT];
-    uint64_t nonzero_partials[LAGRANGIAN_REDUCTION_BUCKET_LIMIT];
-
-    lagr_slack_context slack_ctx = {
-        .colsCovering = colsCovering,
-        .colsCoveringCount = colsCoveringCount,
-        .x = x,
-        .slack = slack,
-        .partials = partials,
-        .nonzero_partials = nonzero_partials,
-        .rows = rows,
-        .bucket_count = bucket_count
-    };
-    if (!ccubes_parallel_for(
-        0,
-        (uint64_t)bucket_count,
-        threads,
-        false,
-        lagr_slack_worker,
-        &slack_ctx
-    )) {
-        return 0;
-    }
-    uint64_t nonzero_rows = 0;
-    for (int i = 0; i < bucket_count; ++i) {
-        sum_s2 += partials[i];
-        nonzero_rows += nonzero_partials[i];
-    }
-    if (nonzero_rows_out) *nonzero_rows_out = (int)nonzero_rows;
+    double sum_s2 = lagr_compute_slacks(
+        rows, colsCovering, colsCoveringCount, x, slack, nonzero_rows_out, threads
+    );
 
     if (deflection_alpha > 0.0 && prev_direction) {
         sum_s2 = 0.0;
@@ -1386,66 +1538,19 @@ static int bundle_update(
     double ZLB,
     double *t,
     LagrangianBundleState *bs,
-    int *nonzero_rows_out
+    int *nonzero_rows_out,
+    int threads
 ) {
     if (!x || !bs || bs->memory <= 0 || !bs->center_t || !bs->cut_alpha || !bs->cut_slacks) {
         return 0;
     }
 
-    int threads = ccubes_thread_count();
-    const int bucket_count = lagr_reduction_bucket_count(rows);
-
     double *slack = (double*)malloc((size_t)rows * sizeof(double));
     if (!slack) return 0;
 
-    double *partials = (double*)calloc(
-        (size_t)bucket_count,
-        sizeof(double)
+    double sum_s2 = lagr_compute_slacks(
+        rows, colsCovering, colsCoveringCount, x, slack, nonzero_rows_out, threads
     );
-    uint64_t *nonzero_partials = (uint64_t*)calloc(
-        (size_t)bucket_count,
-        sizeof(uint64_t)
-    );
-    if (!partials || !nonzero_partials) {
-        free(slack);
-        free(partials);
-        free(nonzero_partials);
-        return 0;
-    }
-
-    lagr_slack_context slack_ctx = {
-        .colsCovering = colsCovering,
-        .colsCoveringCount = colsCoveringCount,
-        .x = x,
-        .slack = slack,
-        .partials = partials,
-        .nonzero_partials = nonzero_partials,
-        .rows = rows,
-        .bucket_count = bucket_count
-    };
-    if (!ccubes_parallel_for(
-        0,
-        (uint64_t)bucket_count,
-        threads,
-        false,
-        lagr_slack_worker,
-        &slack_ctx
-    )) {
-        free(slack);
-        free(partials);
-        free(nonzero_partials);
-        return 0;
-    }
-
-    double sum_s2 = 0.0;
-    uint64_t nonzero_rows = 0;
-    for (int i = 0; i < bucket_count; ++i) {
-        sum_s2 += partials[i];
-        nonzero_rows += nonzero_partials[i];
-    }
-    free(partials);
-    free(nonzero_partials);
-    if (nonzero_rows_out) *nonzero_rows_out = (int)nonzero_rows;
 
     if (sum_s2 <= 1e-15 || UB - ZLB <= 0.0) {
         free(slack);
@@ -1866,16 +1971,16 @@ static void lagr_initialize_multipliers(
 typedef struct {
     int row;
     int covering_columns;
-} LagrangianPricingRow;
+} LagrangianRowDegree;
 
-static int lagr_compare_pricing_rows(
+static int lagr_compare_row_degree(
     const void *left,
     const void *right
 ) {
-    const LagrangianPricingRow *a =
-        (const LagrangianPricingRow *)left;
-    const LagrangianPricingRow *b =
-        (const LagrangianPricingRow *)right;
+    const LagrangianRowDegree *a =
+        (const LagrangianRowDegree *)left;
+    const LagrangianRowDegree *b =
+        (const LagrangianRowDegree *)right;
     if (a->covering_columns != b->covering_columns) {
         return (a->covering_columns > b->covering_columns) -
             (a->covering_columns < b->covering_columns);
@@ -1921,9 +2026,9 @@ static void lagr_initialize_pricing_multipliers(
     double *residual = (double *)malloc(
         (size_t)cols * sizeof(double)
     );
-    LagrangianPricingRow *order =
-        (LagrangianPricingRow *)malloc(
-            (size_t)rows * sizeof(LagrangianPricingRow)
+    LagrangianRowDegree *order =
+        (LagrangianRowDegree *)malloc(
+            (size_t)rows * sizeof(LagrangianRowDegree)
         );
     if (!ascent || !residual || !order) {
         free(ascent);
@@ -1935,7 +2040,7 @@ static void lagr_initialize_pricing_multipliers(
         residual[column] = 1.0;
     }
     for (int row = 0; row < rows; ++row) {
-        order[row] = (LagrangianPricingRow){
+        order[row] = (LagrangianRowDegree){
             .row = row,
             .covering_columns = colsCoveringCount[row]
         };
@@ -1943,8 +2048,8 @@ static void lagr_initialize_pricing_multipliers(
     qsort(
         order,
         (size_t)rows,
-        sizeof(LagrangianPricingRow),
-        lagr_compare_pricing_rows
+        sizeof(LagrangianRowDegree),
+        lagr_compare_row_degree
     );
 
     double ascent_value = 0.0;
@@ -2180,10 +2285,126 @@ static void local_search_drop1_repair(
     free(cand);
 }
 
-/* Local search: drop-2 + greedy repair + prune; accept only if shorter */
+/* A two-column drop only improves if at most one replacement is needed.
+   The first two owners suffice to identify rows left uncovered by a pair. */
+typedef struct {
+    int first;
+    int second;
+} LagrDropOwners;
+
+typedef struct {
+    int rows;
+    int size;
+    const int *solution;
+    const LagrDropOwners *owners;
+    int **rowsCovered;
+    const int *rowsCoveredCount;
+    int **colsCovering;
+    const int *colsCoveringCount;
+    const double *lagr_score;
+    const double *weights;
+    uint64_t deadline;
+    atomic_uint_fast64_t next;
+    atomic_uint_fast64_t winner;
+} LagrDrop2;
+
+static bool lagr_drop2_missing(LagrDropOwners owners, int i, int j) {
+    return (owners.first == i && (owners.second == -1 || owners.second == j)) ||
+        (owners.first == j && owners.second == -1);
+}
+
+/* -1: no improvement; -2: no replacement needed; otherwise the column ID. */
+static int lagr_drop2_replacement(const LagrDrop2 *search, int i, int j, bool rank) {
+    int missing = 0;
+    int first_row = search->rows;
+    int left = search->solution[i];
+    int right = search->solution[j];
+    for (int k = 0; k < search->rowsCoveredCount[left]; ++k) {
+        const int row = search->rowsCovered[left][k];
+        if (!lagr_drop2_missing(search->owners[row], i, j)) continue;
+        ++missing;
+        if (row < first_row) first_row = row;
+    }
+    for (int k = 0; k < search->rowsCoveredCount[right]; ++k) {
+        const int row = search->rowsCovered[right][k];
+        LagrDropOwners owners = search->owners[row];
+        if (owners.first != j || owners.second != -1) continue;
+        ++missing;
+        if (row < first_row) first_row = row;
+    }
+    if (missing == 0) return -2;
+
+    int best = -1;
+    double best_score = DBL_MAX, best_weight = -DBL_MAX;
+    for (int k = 0; k < search->colsCoveringCount[first_row]; ++k) {
+        int column = search->colsCovering[first_row][k];
+        int degree = search->rowsCoveredCount[column];
+        if (degree < missing) continue;
+        int hits = 0;
+        for (int entry = 0; entry < degree; ++entry) {
+            int row = search->rowsCovered[column][entry];
+            hits += lagr_drop2_missing(search->owners[row], i, j);
+        }
+        if (hits != missing) continue;
+        if (!rank) return column;
+        const double score = search->lagr_score ? search->lagr_score[column] : 0.0;
+        const double weight = search->weights ? search->weights[column] : 0.0;
+        if (best < 0 || score < best_score ||
+            (fabs(score - best_score) <= EPS &&
+             (weight > best_weight || (fabs(weight - best_weight) <= EPS && column < best)))) {
+            best = column;
+            best_score = score;
+            best_weight = weight;
+        }
+    }
+    return best;
+}
+
+static uint64_t lagr_drop2_offset(int size, int i) {
+    return (uint64_t)i * (2 * (uint64_t)size - i - 1) / 2;
+}
+
+static int lagr_drop2_first(int size, uint64_t pair) {
+    int lo = 0, hi = size - 1;
+    while (hi - lo > 1) {
+        const int mid = lo + (hi - lo) / 2;
+        if (lagr_drop2_offset(size, mid) <= pair) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static void lagr_drop2_worker(
+    uint64_t start, uint64_t end, uint64_t stride, int id, int workers, void *data
+) {
+    (void)start; (void)end; (void)stride; (void)id; (void)workers;
+    LagrDrop2 *search = data;
+    const uint64_t chunk = 32;
+    for (;;) {
+        if (search->deadline && lagr_monotonic_nanoseconds() >= search->deadline) return;
+        uint64_t pair = atomic_fetch_add_explicit(&search->next, chunk, memory_order_relaxed);
+        if (pair >= atomic_load_explicit(&search->winner, memory_order_relaxed)) return;
+        const uint64_t limit = pair + chunk;
+        int i = lagr_drop2_first(search->size, pair);
+        int j = i + 1 + (int)(pair - lagr_drop2_offset(search->size, i));
+        for (; pair < limit; ++pair) {
+            uint_fast64_t winner = atomic_load_explicit(&search->winner, memory_order_relaxed);
+            if (pair >= winner) return;
+            if (lagr_drop2_replacement(search, i, j, false) != -1) {
+                /* All earlier chunks have already been claimed. They may
+                   still find an earlier move before the team joins. */
+                while (pair < winner && !atomic_compare_exchange_weak_explicit(
+                    &search->winner, &winner, pair, memory_order_relaxed, memory_order_relaxed
+                )) {}
+                return;
+            }
+            if (++j == search->size) j = ++i + 1;
+        }
+    }
+}
+
 static void local_search_drop2_repair(
     int rows,
-    int cols,
     int **rowsCovered,
     int *rowsCoveredCount,
     int **colsCovering,
@@ -2192,118 +2413,67 @@ static void local_search_drop2_repair(
     const double *weights,
     int *sol,
     int *sol_len,
-    int max_passes
+    int max_passes,
+    uint64_t deadline
 ) {
-    if (!sol || !sol_len || *sol_len <= 2) return;
-    if (max_passes <= 0) return;
+    if (!sol || !sol_len || *sol_len <= 2 || max_passes <= 0) return;
+    LagrDropOwners *owners = malloc((size_t)rows * sizeof(*owners));
+    if (!owners) return;
+    LagrDrop2 search = {
+        .rows = rows, .solution = sol, .owners = owners, .rowsCovered = rowsCovered,
+        .rowsCoveredCount = rowsCoveredCount, .colsCovering = colsCovering,
+        .colsCoveringCount = colsCoveringCount, .lagr_score = lagr_score, .weights = weights,
+        .deadline = deadline
+    };
+    atomic_init(&search.next, 0);
+    atomic_init(&search.winner, 0);
 
-    bool *rowCovered = (bool*)malloc((size_t)rows * sizeof(bool));
-    unsigned char *colSelected = (unsigned char*)calloc((size_t)cols, 1);
-    int *cand = (int*)malloc((size_t)cols * sizeof(int));
-    if (!rowCovered || !colSelected || !cand) {
-        free(rowCovered);
-        free(colSelected);
-        free(cand);
-        return;
-    }
-
-    for (int pass = 0; pass < max_passes; ++pass) {
-        int improved = 0;
-
-        for (int drop_i = 0; drop_i < *sol_len; ++drop_i) {
-            for (int drop_j = drop_i + 1; drop_j < *sol_len; ++drop_j) {
-                int cand_len = 0;
-                memset(colSelected, 0, (size_t)cols);
-
-                for (int i = 0; i < *sol_len; ++i) {
-                    if (i == drop_i || i == drop_j) continue;
-                    int c = sol[i];
-                    cand[cand_len++] = c;
-                    colSelected[c] = 1;
-                }
-
-                memset(rowCovered, 0, (size_t)rows * sizeof(bool));
-                int covered = 0;
-                for (int i = 0; i < cand_len; ++i) {
-                    int c = cand[i];
-                    for (int k = 0; k < rowsCoveredCount[c]; ++k) {
-                        int r = rowsCovered[c][k];
-                        if (!rowCovered[r]) { rowCovered[r] = true; covered++; }
-                    }
-                }
-
-                while (covered < rows) {
-                    int r0 = -1;
-                    for (int r = 0; r < rows; ++r) {
-                        if (!rowCovered[r]) { r0 = r; break; }
-                    }
-                    if (r0 < 0) break;
-
-                    int best = -1, bestNew = -1;
-                    double bestLS = DBL_MAX, bestW = -DBL_MAX;
-
-                    for (int kk = 0; kk < colsCoveringCount[r0]; ++kk) {
-                        int c = colsCovering[r0][kk];
-                        if (colSelected[c]) continue;
-
-                        int newCover = 0;
-                        for (int k = 0; k < rowsCoveredCount[c]; ++k) {
-                            int rr = rowsCovered[c][k];
-                            if (!rowCovered[rr]) newCover++;
-                        }
-                        if (newCover <= 0) continue;
-
-                        double ls = lagr_score ? lagr_score[c] : 0.0;
-                        double w  = weights ? weights[c] : 0.0;
-
-                        bool better = false;
-                        if (newCover > bestNew) better = true;
-                        else if (newCover == bestNew) {
-                            if (ls < bestLS) better = true;
-                            else if (fabs(ls - bestLS) <= EPS) {
-                                if (w > bestW) better = true;
-                                else if (fabs(w - bestW) <= EPS) {
-                                    if (best == -1 || c < best) better = true;
-                                }
-                            }
-                        }
-
-                        if (better) {
-                            best = c; bestNew = newCover; bestLS = ls; bestW = w;
-                        }
-                    }
-
-                    if (best < 0) { cand_len = -1; break; }
-
-                    colSelected[best] = 1;
-                    cand[cand_len++] = best;
-                    for (int k = 0; k < rowsCoveredCount[best]; ++k) {
-                        int rr = rowsCovered[best][k];
-                        if (!rowCovered[rr]) { rowCovered[rr] = true; covered++; }
-                    }
-                }
-
-                if (cand_len <= 0 || cand_len >= *sol_len) continue;
-
-                prune_redundancy(rows, rowsCovered, rowsCoveredCount, cand, &cand_len);
-
-                if (cand_len > 0 && cand_len < *sol_len) {
-                    memcpy(sol, cand, (size_t)cand_len * sizeof(int));
-                    *sol_len = cand_len;
-                    improved = 1;
-                    break; /* restart after improvement */
-                }
+    for (int pass = 0; pass < max_passes && *sol_len > 1; ++pass) {
+        if (deadline && lagr_monotonic_nanoseconds() >= deadline) break;
+        int size = *sol_len;
+        for (int row = 0; row < rows; ++row) owners[row] = (LagrDropOwners){-1, -1};
+        for (int i = 0; i < size; ++i) {
+            const int col = sol[i];
+            for (int k = 0; k < rowsCoveredCount[col]; ++k) {
+                LagrDropOwners *row = &owners[rowsCovered[col][k]];
+                if (row->first == -1) row->first = i;
+                else if (row->second == -1) row->second = i;
+                else row->first = -2; /* at least three owners */
             }
-
-            if (improved) break;
         }
 
-        if (!improved) break;
+        search.size = size;
+        uint64_t pairs = lagr_drop2_offset(size, size - 1);
+        atomic_store_explicit(&search.next, 0, memory_order_relaxed);
+        atomic_store_explicit(&search.winner, pairs, memory_order_relaxed);
+        static _Thread_local ccubes_adaptive_team teams[65];
+        unsigned key = 0;
+        uint64_t work = pairs;
+        for (int i = 0; i < size; ++i) work += (uint64_t)rowsCoveredCount[sol[i]];
+        for (uint64_t value = work; value; value >>= 1) ++key;
+        int threads = ccubes_adaptive_team_choose(&teams[key], pairs, work, ccubes_thread_count());
+        uint64_t started = ccubes_monotonic_nanoseconds();
+        if (threads <= 1 || !ccubes_parallel_for(0, (uint64_t)threads, threads, false, lagr_drop2_worker, &search)) {
+            lagr_drop2_worker(0, 1, 1, 0, 1, &search);
+        }
+        uint64_t finished = ccubes_monotonic_nanoseconds();
+        /* Deadline-truncated samples cannot justify a faster team. */
+        if (!deadline || finished < deadline)
+            ccubes_adaptive_team_observe(&teams[key], finished > started ? finished - started : 0);
+        uint64_t winner = atomic_load_explicit(&search.winner, memory_order_relaxed);
+        if (winner == pairs) break;
+        int i = lagr_drop2_first(size, winner);
+        int j = i + 1 + (int)(winner - lagr_drop2_offset(size, i));
+        int replacement = lagr_drop2_replacement(&search, i, j, true);
+        int count = 0;
+        for (int k = 0; k < size; ++k) {
+            if (k != i && k != j) sol[count++] = sol[k];
+        }
+        if (replacement >= 0) sol[count++] = replacement;
+        prune_redundancy(rows, rowsCovered, rowsCoveredCount, sol, &count);
+        *sol_len = count;
     }
-
-    free(rowCovered);
-    free(colSelected);
-    free(cand);
+    free(owners);
 }
 
 /*
@@ -2313,13 +2483,43 @@ static void local_search_drop2_repair(
  * each call computes its own covered mask and hands it down.
  */
 #define POLISH_MASK_WORDS 4
+#define POLISH_PARALLEL_SCRATCH_BYTES (32u * 1024u * 1024u)
+#define POLISH_NODE_BATCH 256
+/* Worker stacks can be smaller than the stack of the calling thread. */
+#define POLISH_PARALLEL_MAX_DEPTH 512
 typedef struct {
     uint64_t w[POLISH_MASK_WORDS];
 } PolishMask;
 
 typedef struct {
+    atomic_bool stop;             /* a cover was accepted or the deadline expired */
+    atomic_int queued;
+    atomic_int idle;               /* workers waiting for another subtree */
+#if defined(HAVE_PTHREAD)
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+#else
+    ccubes_mutex mutex;
+#endif
+    long remaining_nodes;        /* unreserved nodes, under the mutex */
+    int reservations;
+    int budget_waiters;
+    int active;                  /* root assignment plus running subtrees, under the mutex */
+    int capacity;
+    int *task_depths;
+    int *task_paths;
+    int path_stride;
+    const int *root_candidates;
+    int root_count;
+    int root_child_row_start;
+    int base_depth;
+    int base_covered;
+    PolishMask base_mask;
+    struct PolishSearch *workers;
+} PolishParallel;
+
+typedef struct PolishSearch {
     int rows;
-    int cols;
     int **rowsCovered;
     int *rowsCoveredCount;
     int **colsCovering;
@@ -2333,23 +2533,27 @@ typedef struct {
     int out_stride;               /* forced_len + target */
     long node_limit;
     long nodes;
-    int aborted;                  /* node budget exhausted */
+    int aborted;                  /* node budget or deadline reached */
     uint64_t deadline_nanoseconds;/* zero means no wall deadline */
     int want;                     /* number of distinct covers to collect */
     int found;                    /* covers collected so far */
     int *coverCount;
-    unsigned char *colSelected;
     int *chosen;
     int *out;                     /* want * out_stride ints */
     int *out_lens;                /* want ints */
-    int *scratch;                 /* 2 * out_stride ints, for dedup */
-    PolishCandidate *cand_buf;    /* target * max_row_degree entries */
+    int *scratch;                 /* out_stride ints, for dedup */
+    const LagrangianRowDegree *row_order;  /* shared, by increasing core degree */
+    int *cand_buf;                /* ordered column IDs at each open depth */
+    PolishCandidate *rank_buf;    /* scores are needed only while sorting one node */
     int max_row_degree;
     int max_cover_static;         /* max rows covered by any usable column */
     /* bitset fast path (rows <= 64 * POLISH_MASK_WORDS) */
     const uint64_t *col_mask;     /* per-column row coverage, mask_words each, or NULL */
     PolishMask full_mask;         /* all rows covered */
     int mask_words;               /* words of col_mask/full_mask actually in use */
+    int threads;
+    int node_credit;              /* unused nodes in the worker's reservation, or -1 */
+    PolishParallel *parallel;    /* shared budget and result for parallel decision search */
 } PolishSearch;
 
 static int polish_new_cover(
@@ -2367,36 +2571,22 @@ static int polish_new_cover(
 static int polish_choose_row(
     const PolishSearch *search,
     int uncovered,
-    int slots_left
+    int slots_left,
+    int *row_start
 ) {
     /* bound: every column adds at most max_cover_static newly covered rows */
-    if (uncovered > slots_left * search->max_cover_static) return -1;
+    if (uncovered > (int64_t)slots_left * search->max_cover_static) return -1;
 
-    int best_row = -1;
-    int best_count = INT_MAX;
-
-    for (int row = 0; row < search->rows; ++row) {
-        if (search->coverCount[row] > 0) continue;
-
-        /* any unselected usable column covering this (uncovered) row
-           necessarily has new_cover >= 1, so a plain count suffices */
-        int viable = 0;
-        for (int i = 0; i < search->colsCoveringCount[row]; ++i) {
-            int col = search->colsCovering[row][i];
-            if (search->colSelected[col]) continue;
-            if (search->allowed && !search->allowed[col]) continue;
-            ++viable;
-            if (viable >= best_count) break; /* cannot become the minimum */
-        }
-
-        if (viable == 0) return -1;
-        if (viable < best_count) {
-            best_count = viable;
-            best_row = row;
+    /* An uncovered row has no selected covering column, so its viable
+       degree stays fixed for the whole search. */
+    for (int i = *row_start; i < search->rows; ++i) {
+        const LagrangianRowDegree *entry = &search->row_order[i];
+        if (search->coverCount[entry->row] == 0) {
+            *row_start = i + 1;
+            return entry->covering_columns > 0 ? entry->row : -1;
         }
     }
-
-    return best_row;
+    return -1;
 }
 
 static int pool_cmp_int_asc(const void *a, const void *b);
@@ -2409,67 +2599,75 @@ static int pool_add_if_new(
     int len
 );
 
-static bool polish_search_rec(
-    PolishSearch *search,
-    int depth,
-    int covered
-) {
-    if (covered >= search->rows) {
-        int len = search->forced_len + depth;
-        int *norm = search->scratch;
-
-        for (int i = 0; i < search->forced_len; ++i) norm[i] = search->forced[i];
-        memcpy(norm + search->forced_len, search->chosen, (size_t)depth * sizeof(int));
-        qsort(norm, (size_t)len, sizeof(int), pool_cmp_int_asc);
-
-        for (int s = 0; s < search->found; ++s) {
-            if (
-                search->out_lens[s] == len &&
-                memcmp(search->out + (size_t)s * search->out_stride, norm, (size_t)len * sizeof(int)) == 0
-            ) {
-                return false; /* duplicate cover: keep searching */
-            }
-        }
-
-        memcpy(search->out + (size_t)search->found * search->out_stride, norm, (size_t)len * sizeof(int));
-        search->out_lens[search->found] = len;
-        search->found++;
-        return search->found >= search->want;
-    }
-
-    if (depth >= search->target) return false;
-    if (
-        search->deadline_nanoseconds > 0 &&
-        (search->nodes & 255L) == 0 &&
-        lagr_monotonic_nanoseconds() >= search->deadline_nanoseconds
-    ) {
-        search->aborted = 1;
+static bool polish_record_cover(PolishSearch *search, int depth) {
+    /* The first worker gets the output buffer. The caller reads it after join. */
+    if (search->parallel &&
+        atomic_exchange_explicit(&search->parallel->stop, true, memory_order_relaxed)) {
         return true;
     }
-    if (search->nodes >= search->node_limit) {
-        search->aborted = 1;
-        return true; /* unwind immediately */
+
+    int len = search->forced_len + depth;
+    int *norm = search->scratch;
+    for (int i = 0; i < search->forced_len; ++i) norm[i] = search->forced[i];
+    memcpy(norm + search->forced_len, search->chosen, (size_t)depth * sizeof(int));
+    qsort(norm, (size_t)len, sizeof(int), pool_cmp_int_asc);
+
+    for (int s = 0; s < search->found; ++s) {
+        if (
+            search->out_lens[s] == len &&
+            memcmp(search->out + (size_t)s * search->out_stride, norm, (size_t)len * sizeof(int)) == 0
+        ) {
+            return false; /* duplicate cover: keep searching */
+        }
     }
 
+    memcpy(search->out + (size_t)search->found * search->out_stride, norm, (size_t)len * sizeof(int));
+    search->out_lens[search->found++] = len;
+    return search->found >= search->want;
+}
+
+static bool polish_deadline_reached(PolishSearch *search) {
+    if (!search->deadline_nanoseconds ||
+        lagr_monotonic_nanoseconds() < search->deadline_nanoseconds) return false;
+    search->aborted = 1;
+    if (search->parallel) atomic_store_explicit(&search->parallel->stop, true, memory_order_relaxed);
+    return true;
+}
+
+static bool polish_claim_node(PolishSearch *search);
+
+static bool polish_visit_node(PolishSearch *search) {
+    if (
+        ((search->nodes & 255L) == 0 && polish_deadline_reached(search)) ||
+        search->nodes >= search->node_limit ||
+        (search->parallel && !polish_claim_node(search))
+    ) {
+        search->aborted = 1;
+        return false;
+    }
     ++search->nodes;
-    int slots_left = search->target - depth;
-    int uncovered = search->rows - covered;
-    int row = polish_choose_row(search, uncovered, slots_left);
-    if (row < 0) return false;
+    return true;
+}
 
-    int raw_count = search->colsCoveringCount[row];
-    PolishCandidate *candidates = search->cand_buf + (size_t)depth * (size_t)search->max_row_degree;
+static int polish_candidates(
+    const PolishSearch *search,
+    int slots_left,
+    int covered,
+    PolishCandidate *candidates,
+    int *row_start
+) {
+    int row = polish_choose_row(search, search->rows - covered, slots_left, row_start);
+    if (row < 0) return 0;
 
-    int candidate_count = 0;
-    for (int i = 0; i < raw_count; ++i) {
+    int count = 0;
+    for (int i = 0; i < search->colsCoveringCount[row]; ++i) {
         int col = search->colsCovering[row][i];
-        if (search->colSelected[col]) continue;
         if (search->allowed && !search->allowed[col]) continue;
 
         int new_cover = polish_new_cover(search, col);
         if (new_cover <= 0) continue;
 
-        candidates[candidate_count++] = (PolishCandidate){
+        candidates[count++] = (PolishCandidate){
             .col = col,
             .new_cover = new_cover,
             .cover_count = search->rowsCoveredCount[col],
@@ -2477,127 +2675,42 @@ static bool polish_search_rec(
             .weight = search->weights ? search->weights[col] : 0.0
         };
     }
-
-    polish_sort_candidates(candidates, candidate_count);
-
-    for (int i = 0; i < candidate_count; ++i) {
-        int col = candidates[i].col;
-        int added = 0;
-
-        search->colSelected[col] = 1;
-        search->chosen[depth] = col;
-
-        for (int j = 0; j < search->rowsCoveredCount[col]; ++j) {
-            int covered_row = search->rowsCovered[col][j];
-            if (search->coverCount[covered_row] == 0) ++added;
-            ++search->coverCount[covered_row];
-        }
-
-        bool stop = polish_search_rec(search, depth + 1, covered + added);
-
-        for (int j = 0; j < search->rowsCoveredCount[col]; ++j) {
-            int covered_row = search->rowsCovered[col][j];
-            --search->coverCount[covered_row];
-        }
-
-        search->colSelected[col] = 0;
-
-        if (stop) return true;
-    }
-
-    return false;
+    return count;
 }
 
-/* Bitset variant of polish_search_rec for rows <= 64 * POLISH_MASK_WORDS:
-   coverage is a small fixed-width word array, new-cover checks are
-   popcounts, undo restores the saved mask (no explicit backtrack needed --
-   each call holds its own covered_mask copy). */
-static bool polish_search_rec_bits(
-    PolishSearch *search,
-    int depth,
-    PolishMask covered_mask
+static int polish_candidates_bits(
+    const PolishSearch *search,
+    int slots_left,
+    PolishMask covered_mask,
+    PolishCandidate *candidates,
+    int *row_start
 ) {
     const int words = search->mask_words;
-
-    bool fully_covered = true;
-    for (int w = 0; w < words; ++w) {
-        if (covered_mask.w[w] != search->full_mask.w[w]) { fully_covered = false; break; }
-    }
-    if (fully_covered) {
-        int len = search->forced_len + depth;
-        int *norm = search->scratch;
-
-        for (int i = 0; i < search->forced_len; ++i) norm[i] = search->forced[i];
-        memcpy(norm + search->forced_len, search->chosen, (size_t)depth * sizeof(int));
-        qsort(norm, (size_t)len, sizeof(int), pool_cmp_int_asc);
-
-        for (int s = 0; s < search->found; ++s) {
-            if (
-                search->out_lens[s] == len &&
-                memcmp(search->out + (size_t)s * search->out_stride, norm, (size_t)len * sizeof(int)) == 0
-            ) {
-                return false;
-            }
-        }
-
-        memcpy(search->out + (size_t)search->found * search->out_stride, norm, (size_t)len * sizeof(int));
-        search->out_lens[search->found] = len;
-        search->found++;
-        return search->found >= search->want;
-    }
-
-    if (depth >= search->target) return false;
-    if (
-        search->deadline_nanoseconds > 0 &&
-        (search->nodes & 255L) == 0 &&
-        lagr_monotonic_nanoseconds() >= search->deadline_nanoseconds
-    ) {
-        search->aborted = 1;
-        return true;
-    }
-    if (search->nodes >= search->node_limit) {
-        search->aborted = 1;
-        return true;
-    }
-
-    ++search->nodes;
     PolishMask uncovered_mask;
     int uncovered = 0;
     for (int w = 0; w < words; ++w) {
         uncovered_mask.w[w] = search->full_mask.w[w] & ~covered_mask.w[w];
         uncovered += lagr_popcount64(uncovered_mask.w[w]);
     }
-    int slots_left = search->target - depth;
 
-    if (uncovered > slots_left * search->max_cover_static) return false;
+    if (uncovered > (int64_t)slots_left * search->max_cover_static) return 0;
 
-    /* MRV row choice: fewest unselected candidates */
     int best_row = -1;
-    int best_count = INT_MAX;
-    for (int w = 0; w < words; ++w) {
-        for (uint64_t m = uncovered_mask.w[w]; m; m &= m - 1) {
-            int row = w * 64 + __builtin_ctzll(m);
-            int viable = 0;
-            for (int i = 0; i < search->colsCoveringCount[row]; ++i) {
-                int col = search->colsCovering[row][i];
-                if (search->colSelected[col]) continue;
-                ++viable;
-                if (viable >= best_count) break;
-            }
-            if (viable == 0) return false;
-            if (viable < best_count) {
-                best_count = viable;
-                best_row = row;
-            }
+    for (int i = *row_start; i < search->rows; ++i) {
+        const LagrangianRowDegree *entry = &search->row_order[i];
+        const int row = entry->row;
+        if (uncovered_mask.w[row / 64] & (UINT64_C(1) << (row % 64))) {
+            if (entry->covering_columns == 0) return 0;
+            best_row = row;
+            *row_start = i + 1;
+            break;
         }
     }
-    if (best_row < 0) return false;
+    if (best_row < 0) return 0;
 
-    PolishCandidate *candidates = search->cand_buf + (size_t)depth * (size_t)search->max_row_degree;
-    int candidate_count = 0;
+    int count = 0;
     for (int i = 0; i < search->colsCoveringCount[best_row]; ++i) {
         int col = search->colsCovering[best_row][i];
-        if (search->colSelected[col]) continue;
 
         const uint64_t *cmask = &search->col_mask[(size_t)col * (size_t)words];
         int new_cover = 0;
@@ -2606,7 +2719,7 @@ static bool polish_search_rec_bits(
         }
         if (new_cover <= 0) continue;
 
-        candidates[candidate_count++] = (PolishCandidate){
+        candidates[count++] = (PolishCandidate){
             .col = col,
             .new_cover = new_cover,
             .cover_count = search->rowsCoveredCount[col],
@@ -2614,31 +2727,441 @@ static bool polish_search_rec_bits(
             .weight = search->weights ? search->weights[col] : 0.0
         };
     }
+    return count;
+}
 
-    polish_sort_candidates(candidates, candidate_count);
+static bool polish_search_rec(
+    PolishSearch *search, int depth, int covered, PolishMask covered_mask, int row_start
+);
 
-    for (int i = 0; i < candidate_count; ++i) {
-        int col = candidates[i].col;
+static void polish_select_column(
+    PolishSearch *search,
+    int depth,
+    int col,
+    int *covered,
+    PolishMask *covered_mask
+) {
+    search->chosen[depth] = col;
 
-        search->colSelected[col] = 1;
-        search->chosen[depth] = col;
+    if (search->mask_words) {
+        const uint64_t *mask = &search->col_mask[(size_t)col * (size_t)search->mask_words];
+        for (int w = 0; w < search->mask_words; ++w) covered_mask->w[w] |= mask[w];
+    } else {
+        for (int j = 0; j < search->rowsCoveredCount[col]; ++j) {
+            int row = search->rowsCovered[col][j];
+            if (search->coverCount[row]++ == 0) ++*covered;
+        }
+    }
+}
 
-        const uint64_t *cmask = &search->col_mask[(size_t)col * (size_t)words];
-        PolishMask next_mask;
-        for (int w = 0; w < words; ++w) next_mask.w[w] = covered_mask.w[w] | cmask[w];
+static void polish_unselect_column(PolishSearch *search, int col) {
+    if (!search->mask_words) {
+        for (int j = 0; j < search->rowsCoveredCount[col]; ++j) {
+            --search->coverCount[search->rowsCovered[col][j]];
+        }
+    }
+}
 
-        bool stop = polish_search_rec_bits(
-            search,
-            depth + 1,
-            next_mask
-        );
+static bool polish_search_branch(
+    PolishSearch *search,
+    int depth,
+    int col,
+    int covered,
+    PolishMask covered_mask,
+    int row_start
+) {
+    polish_select_column(search, depth, col, &covered, &covered_mask);
+    bool stop = polish_search_rec(search, depth + 1, covered, covered_mask, row_start);
+    polish_unselect_column(search, col);
+    return stop;
+}
 
-        search->colSelected[col] = 0;
+static bool polish_alloc_scratch(PolishSearch *search) {
+    size_t slots = search->target > 0 ? (size_t)search->target : 1;
+    search->coverCount = calloc((size_t)search->rows, sizeof(int));
+    search->chosen = malloc(slots * sizeof(int));
+    search->scratch = malloc((size_t)search->out_stride * sizeof(int));
+    search->cand_buf = slots <= SIZE_MAX / sizeof(int) / (size_t)search->max_row_degree
+        ? malloc(slots * (size_t)search->max_row_degree * sizeof(int))
+        : NULL;
+    search->rank_buf = SIZE_MAX / (size_t)search->max_row_degree >= sizeof(PolishCandidate)
+        ? malloc((size_t)search->max_row_degree * sizeof(PolishCandidate))
+        : NULL;
+    return search->coverCount && search->chosen && search->scratch &&
+        search->cand_buf && search->rank_buf;
+}
 
-        if (stop) return true;
+static void polish_free_scratch(PolishSearch *search) {
+    free(search->coverCount);
+    free(search->chosen);
+    free(search->scratch);
+    free(search->cand_buf);
+    free(search->rank_buf);
+}
+
+static bool polish_queue_init(PolishParallel *parallel) {
+#if defined(HAVE_PTHREAD)
+    if (pthread_mutex_init(&parallel->mutex, NULL) != 0) return false;
+    if (pthread_cond_init(&parallel->changed, NULL) != 0) {
+        pthread_mutex_destroy(&parallel->mutex);
+        return false;
+    }
+    return true;
+#else
+    return ccubes_mutex_init(&parallel->mutex);
+#endif
+}
+
+static void polish_queue_destroy(PolishParallel *parallel) {
+#if defined(HAVE_PTHREAD)
+    pthread_cond_destroy(&parallel->changed);
+    pthread_mutex_destroy(&parallel->mutex);
+#else
+    ccubes_mutex_destroy(&parallel->mutex);
+#endif
+}
+
+static void polish_queue_lock(PolishParallel *parallel) {
+#if defined(HAVE_PTHREAD)
+    pthread_mutex_lock(&parallel->mutex);
+#else
+    ccubes_mutex_lock(&parallel->mutex);
+#endif
+}
+
+static void polish_queue_unlock(PolishParallel *parallel) {
+#if defined(HAVE_PTHREAD)
+    pthread_mutex_unlock(&parallel->mutex);
+#else
+    ccubes_mutex_unlock(&parallel->mutex);
+#endif
+}
+
+static void polish_queue_wait(PolishParallel *parallel) {
+#if defined(HAVE_PTHREAD)
+    pthread_cond_wait(&parallel->changed, &parallel->mutex);
+#else
+    /* An OpenMP-only build has no condition variable. Release the lock
+       while waiting so a busy worker can publish work or finish. */
+    polish_queue_unlock(parallel);
+#if defined(HAVE_OPENMP) && defined(_WIN32)
+    Sleep(1);
+#elif defined(HAVE_OPENMP)
+    nanosleep(&(struct timespec){.tv_nsec = 100000}, NULL);
+#endif
+    polish_queue_lock(parallel);
+#endif
+}
+
+static void polish_queue_wake(PolishParallel *parallel) {
+#if defined(HAVE_PTHREAD)
+    pthread_cond_broadcast(&parallel->changed);
+#else
+    (void)parallel;
+#endif
+}
+
+/* A worker returns unused credit when its task ends. A worker waiting for
+   credit has released its own reservation, so another worker can always
+   make progress while any reservations remain. */
+static void polish_return_node_credit(PolishSearch *search) {
+    if (search->node_credit < 0) return;
+    PolishParallel *parallel = search->parallel;
+    parallel->remaining_nodes += search->node_credit;
+    --parallel->reservations;
+    search->node_credit = -1;
+    if (parallel->budget_waiters && (parallel->remaining_nodes || !parallel->reservations)) {
+        polish_queue_wake(parallel);
+    }
+}
+
+static bool polish_claim_node(PolishSearch *search) {
+    if (search->node_credit > 0) {
+        --search->node_credit;
+        return true;
+    }
+    PolishParallel *parallel = search->parallel;
+    polish_queue_lock(parallel);
+    polish_return_node_credit(search);
+    while (!parallel->remaining_nodes && parallel->reservations &&
+           !atomic_load_explicit(&parallel->stop, memory_order_relaxed)) {
+        ++parallel->budget_waiters;
+        polish_queue_wait(parallel);
+        --parallel->budget_waiters;
+    }
+    bool granted = parallel->remaining_nodes > 0 &&
+        !atomic_load_explicit(&parallel->stop, memory_order_relaxed) &&
+        !polish_deadline_reached(search);
+    if (granted) {
+        long grant = parallel->remaining_nodes < POLISH_NODE_BATCH
+            ? parallel->remaining_nodes : POLISH_NODE_BATCH;
+        parallel->remaining_nodes -= grant;
+        ++parallel->reservations;
+        search->node_credit = (int)grant - 1;
+    }
+    polish_queue_unlock(parallel);
+    return granted;
+}
+
+/* Publish unvisited siblings, keeping the current best candidate local.
+   Only the chosen-column prefix travels with each branch. */
+static int polish_offer_siblings(
+    PolishSearch *search, int depth, const int *siblings, int count
+) {
+    PolishParallel *parallel = search->parallel;
+    if (!parallel || count == 0 || depth + 1 >= search->target) return 0;
+
+    /* Seed the queue at the split. Deeper nodes only donate to workers
+       that need work, avoiding a lock and path copy for tiny subtrees
+       while the team is busy. */
+    const bool initial_split = depth == parallel->base_depth;
+    const int demand = initial_split ? parallel->capacity :
+        atomic_load_explicit(&parallel->idle, memory_order_relaxed);
+    if (atomic_load_explicit(&parallel->queued, memory_order_relaxed) >= demand) return 0;
+
+    int offered = 0;
+    polish_queue_lock(parallel);
+    if (!atomic_load_explicit(&parallel->stop, memory_order_relaxed)) {
+        int queued = atomic_load_explicit(&parallel->queued, memory_order_relaxed);
+        const int limit = initial_split ? parallel->capacity :
+            atomic_load_explicit(&parallel->idle, memory_order_relaxed);
+        const int open = limit - queued;
+        offered = open <= 0 ? 0 : count < open ? count : open;
+        int prefix = depth - parallel->base_depth;
+        /* Push in reverse priority so the next available worker gets the
+           highest-ranked sibling first. */
+        for (int i = offered - 1; i >= 0; --i, ++queued) {
+            int *path = parallel->task_paths + (size_t)queued * parallel->path_stride;
+            memcpy(path, search->chosen + parallel->base_depth, (size_t)prefix * sizeof(int));
+            path[prefix] = siblings[i];
+            parallel->task_depths[queued] = depth + 1;
+        }
+        if (offered) {
+            atomic_store_explicit(&parallel->queued, queued, memory_order_relaxed);
+            polish_queue_wake(parallel);
+        }
+    }
+    polish_queue_unlock(parallel);
+    return offered;
+}
+
+static bool polish_search_children(
+    PolishSearch *search, int depth, int covered, PolishMask covered_mask,
+    const int *candidates, int count, int row_start
+) {
+    for (int i = 0; i < count;) {
+        int offered = polish_offer_siblings(search, depth, candidates + i + 1, count - i - 1);
+        if (polish_search_branch(search, depth, candidates[i], covered, covered_mask, row_start)) return true;
+        i += 1 + offered;
+    }
+    return false;
+}
+
+static void polish_run_task(PolishSearch *search, int depth) {
+    PolishParallel *parallel = search->parallel;
+    if (polish_deadline_reached(search)) return;
+    int covered = parallel->base_covered;
+    PolishMask mask = parallel->base_mask;
+    /* Restore the task path without charging its already-expanded ancestors.
+       The worker retains the common prefix for its next task. */
+    int i = parallel->base_depth;
+    for (; i < depth; ++i) {
+        if ((i & 63) == 63 && (polish_deadline_reached(search) ||
+            atomic_load_explicit(&parallel->stop, memory_order_relaxed))) break;
+        polish_select_column(search, i, search->chosen[i], &covered, &mask);
+    }
+    if (i == depth) polish_search_rec(search, depth, covered, mask, 0);
+    while (i > parallel->base_depth) {
+        --i;
+        polish_unselect_column(search, search->chosen[i]);
+    }
+}
+
+static void polish_branch_worker(
+    uint64_t start,
+    uint64_t end,
+    uint64_t stride,
+    int worker_id,
+    int worker_count,
+    void *data
+) {
+    (void)start;
+    (void)end;
+    (void)stride;
+    (void)worker_count;
+    PolishParallel *parallel = data;
+    PolishSearch *search = &parallel->workers[worker_id];
+
+    /* Worker zero owns the already-expanded node that started the team. */
+    bool root = worker_id == 0;
+    polish_queue_lock(parallel);
+    while (!atomic_load_explicit(&parallel->stop, memory_order_relaxed)) {
+        int queued = atomic_load_explicit(&parallel->queued, memory_order_relaxed);
+        if (!root && !queued) {
+            if (!parallel->active) break;
+            atomic_fetch_add_explicit(&parallel->idle, 1, memory_order_relaxed);
+            polish_queue_wait(parallel);
+            atomic_fetch_sub_explicit(&parallel->idle, 1, memory_order_relaxed);
+            continue;
+        }
+        int depth = parallel->base_depth;
+        if (!root) {
+            --queued;
+            depth = parallel->task_depths[queued];
+            int *path = parallel->task_paths + (size_t)queued * parallel->path_stride;
+            memcpy(search->chosen + parallel->base_depth, path,
+                   (size_t)(depth - parallel->base_depth) * sizeof(int));
+            atomic_store_explicit(&parallel->queued, queued, memory_order_relaxed);
+            ++parallel->active;
+        }
+        polish_queue_unlock(parallel);
+
+        if (root) {
+            if (!polish_deadline_reached(search)) {
+                polish_search_children(search, depth, parallel->base_covered, parallel->base_mask,
+                                       parallel->root_candidates, parallel->root_count,
+                                       parallel->root_child_row_start);
+            }
+            root = false;
+        } else {
+            polish_run_task(search, depth);
+        }
+
+        polish_queue_lock(parallel);
+        polish_return_node_credit(search);
+        --parallel->active;
+        if (!parallel->active || atomic_load_explicit(&parallel->stop, memory_order_relaxed)) {
+            polish_queue_wake(parallel);
+        }
+    }
+    polish_queue_unlock(parallel);
+}
+
+static bool polish_parallel_branches(
+    PolishSearch *search,
+    int depth,
+    int covered,
+    PolishMask covered_mask,
+    const int *candidates,
+    int count,
+    int row_start
+) {
+    int threads = search->threads;
+    int path_stride = search->target - depth;
+    if (threads < 2 || count < 2 || path_stride <= 1) return false;
+
+    /* Bound worker scratch and allow one queued path per additional worker. */
+    uint64_t candidate_entries = (uint64_t)search->target * search->max_row_degree;
+    search->threads = 1;
+    uint64_t worker_bytes = candidate_entries * sizeof(int)
+        + (uint64_t)search->max_row_degree * sizeof(PolishCandidate)
+        + ((uint64_t)search->rows + search->target + search->out_stride + path_stride + 1) * sizeof(int)
+        + sizeof(PolishSearch);
+    uint64_t scratch_threads = POLISH_PARALLEL_SCRATCH_BYTES / worker_bytes;
+    if ((uint64_t)threads > scratch_threads) threads = (int)scratch_threads;
+    if (threads < 2) return false;
+
+    PolishParallel parallel = {
+        .remaining_nodes = search->node_limit - search->nodes,
+        .active = 1,
+        .path_stride = path_stride,
+        .root_candidates = candidates,
+        .root_count = count,
+        .root_child_row_start = row_start,
+        .base_depth = depth,
+        .base_covered = covered,
+        .base_mask = covered_mask,
+        .workers = malloc((size_t)threads * sizeof(PolishSearch))
+    };
+    if (!parallel.workers) return false;
+    atomic_init(&parallel.queued, 0);
+    atomic_init(&parallel.idle, 0);
+    atomic_init(&parallel.stop, false);
+
+    int allocated = 0;
+    while (allocated < threads) {
+        PolishSearch *worker = &parallel.workers[allocated];
+        *worker = *search;
+        worker->parallel = &parallel;
+        worker->nodes = 0;
+        worker->node_credit = -1;
+        if (!polish_alloc_scratch(worker)) {
+            polish_free_scratch(worker);
+            break;
+        }
+        memcpy(worker->coverCount, search->coverCount, (size_t)search->rows * sizeof(int));
+        memcpy(worker->chosen, search->chosen, (size_t)depth * sizeof(int));
+        ++allocated;
     }
 
-    return false;
+    bool ran = false;
+    if (allocated >= 2) {
+        parallel.capacity = allocated - 1;
+        parallel.task_depths = malloc((size_t)parallel.capacity * sizeof(int));
+        parallel.task_paths = malloc((size_t)parallel.capacity * path_stride * sizeof(int));
+        if (parallel.task_depths && parallel.task_paths && polish_queue_init(&parallel)) {
+            ran = ccubes_parallel_for(
+                0, (uint64_t)allocated, allocated, false, polish_branch_worker, &parallel
+            );
+            polish_queue_destroy(&parallel);
+        }
+        free(parallel.task_paths);
+        free(parallel.task_depths);
+    }
+
+    for (int i = 0; i < allocated; ++i) {
+        PolishSearch *worker = &parallel.workers[i];
+        search->nodes += worker->nodes;
+        search->found += worker->found;
+        search->aborted |= worker->aborted;
+        polish_free_scratch(worker);
+    }
+    if (search->found) search->aborted = 0;
+    free(parallel.workers);
+    return ran;
+}
+
+static bool polish_search_rec(
+    PolishSearch *search,
+    int depth,
+    int covered,
+    PolishMask covered_mask,
+    int row_start
+) {
+    if (search->parallel &&
+        atomic_load_explicit(&search->parallel->stop, memory_order_relaxed)) return true;
+
+    bool fully_covered = covered >= search->rows;
+    if (search->mask_words) {
+        fully_covered = true;
+        for (int w = 0; w < search->mask_words; ++w) {
+            if (covered_mask.w[w] != search->full_mask.w[w]) {
+                fully_covered = false;
+                break;
+            }
+        }
+    }
+    if (fully_covered) return polish_record_cover(search, depth);
+    if (depth >= search->target) return false;
+    if (!polish_visit_node(search)) return true;
+
+    int slots_left = search->target - depth;
+    /* A child covers the branch row. Earlier rows in the shared order
+       will also stay covered for the rest of this path. */
+    PolishCandidate *rank = search->rank_buf;
+    int count = search->mask_words
+        ? polish_candidates_bits(search, slots_left, covered_mask, rank, &row_start)
+        : polish_candidates(search, slots_left, covered, rank, &row_start);
+    polish_sort_candidates(rank, count);
+    int *candidates = search->cand_buf + (size_t)depth * (size_t)search->max_row_degree;
+    for (int i = 0; i < count; ++i) candidates[i] = rank[i].col;
+
+    if (search->threads > 1 &&
+        polish_parallel_branches(search, depth, covered, covered_mask, candidates, count, row_start)) {
+        return search->found || search->aborted;
+    }
+
+    return polish_search_children(search, depth, covered, covered_mask, candidates, count, row_start);
 }
 
 /*
@@ -2647,8 +3170,9 @@ Bounded search for covers of size <= target_total.
 - forced/forced_len: columns fixed into every cover before the search starts
 - want: how many distinct covers to collect (enumeration for pool mode)
 - out: want * target_total ints; out_lens: length of each collected cover
-Returns the number of covers found; *aborted_out is set when the node budget
-was exhausted (in which case a "not found" answer is inconclusive).
+The single-cover search can share unvisited branches across workers.
+Returns the number of covers found; *aborted_out marks an incomplete search
+due to a resource limit.
 */
 static int lagr_bounded_cover_search(
     int rows,
@@ -2669,7 +3193,8 @@ static int lagr_bounded_cover_search(
     int *out_lens,
     int *aborted_out,
     long *nodes_out,
-    uint64_t deadline_nanoseconds
+    uint64_t deadline_nanoseconds,
+    int threads
 ) {
     if (aborted_out) *aborted_out = 0;
     if (nodes_out) *nodes_out = 0;
@@ -2678,48 +3203,70 @@ static int lagr_bounded_cover_search(
 
     int free_slots = target_total - forced_len;
 
+    LagrangianRowDegree *row_order = malloc((size_t)rows * sizeof(*row_order));
+    if (!row_order) {
+        if (aborted_out) *aborted_out = 1;
+        return 0;
+    }
     int max_row_degree = 1;
     int max_cover_static = 1;
     for (int r = 0; r < rows; ++r) {
-        if (colsCoveringCount[r] > max_row_degree) max_row_degree = colsCoveringCount[r];
+        int degree = 0;
         for (int i = 0; i < colsCoveringCount[r]; ++i) {
             int c = colsCovering[r][i];
+            if (allowed && !allowed[c]) continue;
+            ++degree;
             if (rowsCoveredCount[c] > max_cover_static) max_cover_static = rowsCoveredCount[c];
         }
+        row_order[r] = (LagrangianRowDegree){.row = r, .covering_columns = degree};
+        if (degree > max_row_degree) max_row_degree = degree;
     }
+    qsort(row_order, (size_t)rows, sizeof(*row_order), lagr_compare_row_degree);
 
-    int mask_words = (rows + 63) / 64;
-    int use_bits = (mask_words <= POLISH_MASK_WORDS && allowed == NULL);
-    if (!use_bits) mask_words = 0;
-
-    int *coverCount = (int*)calloc((size_t)rows, sizeof(int));
-    unsigned char *colSelected = (unsigned char*)calloc((size_t)cols, 1);
-    int *chosen = (int*)malloc((size_t)(free_slots > 0 ? free_slots : 1) * sizeof(int));
-    int *scratch = (int*)malloc((size_t)target_total * 2 * sizeof(int));
-    PolishCandidate *cand_buf = (PolishCandidate*)malloc(
-        (size_t)(free_slots > 0 ? free_slots : 1) * (size_t)max_row_degree * sizeof(PolishCandidate)
-    );
-    uint64_t *col_mask = use_bits
+    int mask_words = !allowed && rows <= 64 * POLISH_MASK_WORDS ? (rows + 63) / 64 : 0;
+    uint64_t *col_mask = mask_words
         ? (uint64_t*)calloc((size_t)cols * (size_t)mask_words, sizeof(uint64_t))
         : NULL;
-    unsigned char *mask_done = use_bits
+    unsigned char *mask_done = mask_words
         ? (unsigned char*)calloc((size_t)cols, 1)
         : NULL;
 
-    if (!coverCount || !colSelected || !chosen || !scratch || !cand_buf ||
-        (use_bits && (!col_mask || !mask_done))) {
-        free(coverCount);
-        free(colSelected);
-        free(chosen);
-        free(scratch);
-        free(cand_buf);
+    PolishSearch search = {
+        .rows = rows,
+        .rowsCovered = rowsCovered,
+        .rowsCoveredCount = rowsCoveredCount,
+        .colsCovering = colsCovering,
+        .colsCoveringCount = colsCoveringCount,
+        .lagr_score = lagr_score,
+        .weights = weights,
+        .allowed = allowed,
+        .forced = forced,
+        .forced_len = forced_len,
+        .target = free_slots,
+        .out_stride = target_total,
+        .node_limit = node_limit,
+        .deadline_nanoseconds = deadline_nanoseconds,
+        .want = want,
+        .out = out,
+        .out_lens = out_lens,
+        .row_order = row_order,
+        .max_row_degree = max_row_degree,
+        .max_cover_static = max_cover_static,
+        .col_mask = col_mask,
+        .mask_words = mask_words,
+        .threads = want == 1 && free_slots <= POLISH_PARALLEL_MAX_DEPTH
+            ? threads : 1
+    };
+    if (!polish_alloc_scratch(&search) || (mask_words && (!col_mask || !mask_done))) {
+        polish_free_scratch(&search);
         free(col_mask);
         free(mask_done);
+        free(row_order);
         if (aborted_out) *aborted_out = 1;
         return 0;
     }
 
-    if (use_bits) {
+    if (mask_words) {
         /* per-column coverage masks, filled once per core column */
         for (int r = 0; r < rows; ++r) {
             for (int i = 0; i < colsCoveringCount[r]; ++i) {
@@ -2738,78 +3285,32 @@ static int lagr_bounded_cover_search(
     }
 
     int covered = 0;
+    PolishMask covered_mask = {0};
     for (int i = 0; i < forced_len; ++i) {
         int c = forced[i];
-        colSelected[c] = 1;
         for (int j = 0; j < rowsCoveredCount[c]; ++j) {
             int r = rowsCovered[c][j];
-            if (coverCount[r] == 0) ++covered;
-            ++coverCount[r];
+            if (search.coverCount[r]++ == 0) ++covered;
         }
-    }
-
-    PolishSearch search = {
-        .rows = rows,
-        .cols = cols,
-        .rowsCovered = rowsCovered,
-        .rowsCoveredCount = rowsCoveredCount,
-        .colsCovering = colsCovering,
-        .colsCoveringCount = colsCoveringCount,
-        .lagr_score = lagr_score,
-        .weights = weights,
-        .allowed = allowed,
-        .forced = forced,
-        .forced_len = forced_len,
-        .target = free_slots,
-        .out_stride = target_total,
-        .node_limit = node_limit,
-        .nodes = 0,
-        .aborted = 0,
-        .deadline_nanoseconds = deadline_nanoseconds,
-        .want = want,
-        .found = 0,
-        .coverCount = coverCount,
-        .colSelected = colSelected,
-        .chosen = chosen,
-        .out = out,
-        .out_lens = out_lens,
-        .scratch = scratch,
-        .cand_buf = cand_buf,
-        .max_row_degree = max_row_degree,
-        .max_cover_static = max_cover_static,
-        .col_mask = col_mask,
-        .mask_words = mask_words
-    };
-    if (use_bits) {
         for (int w = 0; w < mask_words; ++w) {
-            int rows_left = rows - w * 64;
-            search.full_mask.w[w] = rows_left >= 64
-                ? UINT64_MAX
-                : (UINT64_C(1) << rows_left) - 1u;
+            covered_mask.w[w] |= col_mask[(size_t)c * (size_t)mask_words + w];
         }
     }
 
-    if (use_bits) {
-        PolishMask covered_mask;
-        memset(&covered_mask, 0, sizeof(covered_mask));
-        for (int i = 0; i < forced_len; ++i) {
-            const uint64_t *m = &col_mask[(size_t)forced[i] * (size_t)mask_words];
-            for (int w = 0; w < mask_words; ++w) covered_mask.w[w] |= m[w];
-        }
-        polish_search_rec_bits(&search, 0, covered_mask);
-    } else {
-        polish_search_rec(&search, 0, covered);
+    for (int w = 0; w < mask_words; ++w) {
+        int rows_left = rows - w * 64;
+        search.full_mask.w[w] = rows_left >= 64
+            ? UINT64_MAX
+            : (UINT64_C(1) << rows_left) - 1u;
     }
+    polish_search_rec(&search, 0, covered, covered_mask, 0);
 
     if (aborted_out) *aborted_out = search.aborted;
     if (nodes_out) *nodes_out = search.nodes;
 
-    free(coverCount);
-    free(colSelected);
-    free(chosen);
-    free(scratch);
-    free(cand_buf);
+    polish_free_scratch(&search);
     free(col_mask);
+    free(row_order);
 
     return search.found;
 }
@@ -2995,7 +3496,8 @@ static void lagr_bounded_finish(
     uint64_t deadline_nanoseconds,
     const PIChartView *polish_chart,
     size_t warm_memory,
-    unsigned warm_workers
+    unsigned warm_workers,
+    int bounded_workers
 ) {
     if (!solution || !solmin || *solmin <= 0) return;
 
@@ -3213,7 +3715,8 @@ static void lagr_bounded_finish(
                     one, &found_len_one,
                     &aborted,
                     &ordinary_nodes,
-                    deadline_nanoseconds
+                    deadline_nanoseconds,
+                    bounded_workers
                 );
                 visited_nodes += ordinary_nodes;
             } else if (!decided) {
@@ -3343,7 +3846,8 @@ static void lagr_bounded_finish(
                 found_buf, found_lens,
                 &aborted,
                 NULL,
-                deadline_nanoseconds
+                deadline_nanoseconds,
+                1
             );
 
             lagr_free_core(core_covering, core_counts, rows);
@@ -3508,6 +4012,7 @@ typedef struct {
     int stop_at_step_floor;
     int reset_on_continuous_improvement;
     const PIChartView *polish_chart;
+    int bounded_workers;
 } LagrangianConfig;
 
 #define LAGR_PORTFOLIO_PROFILE_COUNT 6
@@ -3558,6 +4063,7 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     cfg->stop_at_step_floor = 1;
     cfg->reset_on_continuous_improvement = 0;
     cfg->polish_chart = NULL;
+    cfg->bounded_workers = 1;
 
     if (effort_level == 1) {
         cfg->max_iter = 1000;
@@ -3883,6 +4389,9 @@ bool lagrangian_calibrate_multipliers(
     );
     if (adjacency_status != 0) return false;
 
+    const LagrangianLoopThreads loop_threads = lagr_loop_threads(
+        chart->rows, chart->cols, rowsCoveredCount
+    );
     LagrangianWorkspace workspace = {0};
     /* Calibration only uses the subgradient workspace. */
     workspace.slack = (double *)malloc((size_t)chart->rows * sizeof(double));
@@ -3954,6 +4463,8 @@ bool lagrangian_calibrate_multipliers(
         multipliers
     );
 
+    LagrangianCalibrationStats *previous_calibration_stats = lagr_calibration_stats;
+    lagr_calibration_stats = stats;
     double initial_zlb = compute_reduced_and_lb(
         chart->rows,
         chart->cols,
@@ -3962,7 +4473,8 @@ bool lagrangian_calibrate_multipliers(
         multipliers,
         column_costs,
         reduced_costs,
-        dual_selection
+        dual_selection,
+        loop_threads.columns
     );
     double best_zlb = initial_zlb;
     double last_zlb = initial_zlb;
@@ -3996,7 +4508,8 @@ bool lagrangian_calibrate_multipliers(
             multipliers,
             column_costs,
             reduced_costs,
-            dual_selection
+            dual_selection,
+            loop_threads.columns
         );
         last_zlb = zlb;
 
@@ -4057,7 +4570,8 @@ bool lagrangian_calibrate_multipliers(
             options->contraction,
             options->stabilization_beta,
             NULL,
-            &workspace
+            &workspace,
+            loop_threads.rows
         );
         if (step_coefficient < step_before - EPS) {
             contractions++;
@@ -4091,6 +4605,7 @@ bool lagrangian_calibrate_multipliers(
     stats->last_zlb = last_zlb;
     stats->final_step_coefficient = step_coefficient;
     stats->stop_reason = stop_reason;
+    lagr_calibration_stats = previous_calibration_stats;
 
     free(multipliers);
     free(best_multipliers);
@@ -4156,6 +4671,7 @@ static void solve_scp_lagrangian_config(
             LAGR_POLISH_DISABLED;
     }
 
+    const LagrangianLoopThreads loop_threads = lagr_loop_threads(rows, cols, rowsCoveredCount);
     LagrangianWorkspace workspace = {0};
     const bool workspace_ready = lagr_workspace_init(&workspace, rows, cols);
     double *t = (double*)calloc((size_t)rows, sizeof(double));
@@ -4429,7 +4945,8 @@ static void solve_scp_lagrangian_config(
         t,
         col_costs,
         ls,
-        dual_x
+        dual_x,
+        loop_threads.columns
     );
     lagr_last_stats.reduced_cost_nanoseconds +=
         lagr_monotonic_nanoseconds() - component_started;
@@ -4455,6 +4972,7 @@ static void solve_scp_lagrangian_config(
         &workspace
     );
 
+    const uint64_t greedy_started = lagr_monotonic_nanoseconds();
     greedy_from_lagr_scores(
         rows,
         cols,
@@ -4468,9 +4986,12 @@ static void solve_scp_lagrangian_config(
         &sol_size2,
         &workspace
     );
+    const uint64_t greedy_finished = lagr_monotonic_nanoseconds();
+    lagr_last_stats.heuristic_row_min_nanoseconds += greedy_started - component_started;
+    lagr_last_stats.heuristic_greedy_nanoseconds += greedy_finished - greedy_started;
 
     /* Optional deeper search: disabled by default */
-    if (local_passes > 0) {
+    if (local_passes > 0 && (sol_size > 0 || sol_size2 > 0)) {
         if (sol_size > 0) {
             local_search_drop1_repair(
                 rows,
@@ -4488,7 +5009,6 @@ static void solve_scp_lagrangian_config(
 
             local_search_drop2_repair(
                 rows,
-                cols,
                 rowsCovered,
                 rowsCoveredCount,
                 colsCovering,
@@ -4497,7 +5017,8 @@ static void solve_scp_lagrangian_config(
                 weights,
                 sol_tmp,
                 &sol_size,
-                local_passes
+                local_passes,
+                deadline_nanoseconds
             );
 
         }
@@ -4519,7 +5040,6 @@ static void solve_scp_lagrangian_config(
 
             local_search_drop2_repair(
                 rows,
-                cols,
                 rowsCovered,
                 rowsCoveredCount,
                 colsCovering,
@@ -4528,9 +5048,12 @@ static void solve_scp_lagrangian_config(
                 weights,
                 sol_tmp2,
                 &sol_size2,
-                local_passes
+                local_passes,
+                deadline_nanoseconds
             );
         }
+        lagr_last_stats.heuristic_repair_nanoseconds +=
+            lagr_monotonic_nanoseconds() - greedy_finished;
     }
     lagr_last_stats.heuristic_nanoseconds +=
         lagr_monotonic_nanoseconds() - component_started;
@@ -4622,7 +5145,8 @@ static void solve_scp_lagrangian_config(
             t,
             col_costs,
             ls,
-            dual_x
+            dual_x,
+            loop_threads.columns
         );
         lagr_last_stats.reduced_cost_nanoseconds +=
             lagr_monotonic_nanoseconds() - component_started;
@@ -4686,6 +5210,7 @@ static void solve_scp_lagrangian_config(
                 &workspace
             );
 
+            const uint64_t greedy_started = lagr_monotonic_nanoseconds();
             greedy_from_lagr_scores(
                 rows,
                 cols,
@@ -4699,6 +5224,9 @@ static void solve_scp_lagrangian_config(
                 &sol_size2,
                 &workspace
             );
+            const uint64_t greedy_finished = lagr_monotonic_nanoseconds();
+            lagr_last_stats.heuristic_row_min_nanoseconds += greedy_started - component_started;
+            lagr_last_stats.heuristic_greedy_nanoseconds += greedy_finished - greedy_started;
 
             bool found_new_best = false;
             double candW1 = (sol_size != -1) ? solution_total_weight(sol_tmp, sol_size, weights) : -DBL_MAX;
@@ -4740,6 +5268,7 @@ static void solve_scp_lagrangian_config(
             }
 
             if (found_new_best && local_passes > 0) {
+                const uint64_t repair_started = lagr_monotonic_nanoseconds();
                 int current_sol_size = best_sol_size;
                 int *current_sol = (int*)malloc((size_t)cols * sizeof(int));
                 if (current_sol) {
@@ -4762,7 +5291,6 @@ static void solve_scp_lagrangian_config(
                     if (cfg->drop2_enabled) {
                         local_search_drop2_repair(
                             rows,
-                            cols,
                             rowsCovered,
                             rowsCoveredCount,
                             colsCovering,
@@ -4771,7 +5299,8 @@ static void solve_scp_lagrangian_config(
                             weights,
                             current_sol,
                             &current_sol_size,
-                            local_passes
+                            local_passes,
+                            deadline_nanoseconds
                         );
                     }
 
@@ -4790,6 +5319,8 @@ static void solve_scp_lagrangian_config(
                     }
                     free(current_sol);
                 }
+                lagr_last_stats.heuristic_repair_nanoseconds +=
+                    lagr_monotonic_nanoseconds() - repair_started;
             }
             lagr_last_stats.heuristic_nanoseconds +=
                 lagr_monotonic_nanoseconds() - component_started;
@@ -4834,7 +5365,8 @@ static void solve_scp_lagrangian_config(
                 ZLB,
                 t,
                 &bundle_state,
-                &nonzero_subgradient_rows
+                &nonzero_subgradient_rows,
+                loop_threads.rows
             );
             lagr_last_stats.bundle_nanoseconds +=
                 lagr_monotonic_nanoseconds() - component_started;
@@ -4861,7 +5393,8 @@ static void solve_scp_lagrangian_config(
                 step_contract,
                 stabilization_beta,
                 &nonzero_subgradient_rows,
-                &workspace
+                &workspace,
+                loop_threads.rows
             );
             lagr_last_stats.subgradient_nanoseconds +=
                 lagr_monotonic_nanoseconds() - component_started;
@@ -4990,7 +5523,6 @@ static void solve_scp_lagrangian_config(
                     if (cfg->drop2_enabled) {
                         local_search_drop2_repair(
                             rows,
-                            cols,
                             rowsCovered,
                             rowsCoveredCount,
                             colsCovering,
@@ -4999,7 +5531,8 @@ static void solve_scp_lagrangian_config(
                             weights,
                             current_sol,
                             &current_sol_size,
-                            local_passes
+                            local_passes,
+                            deadline_nanoseconds
                         );
                     }
 
@@ -5086,7 +5619,8 @@ static void solve_scp_lagrangian_config(
             t_best,
             col_costs,
             ls,
-            dual_x
+            dual_x,
+            loop_threads.columns
         );
 
         int proved = 0;
@@ -5110,7 +5644,8 @@ static void solve_scp_lagrangian_config(
             deadline_nanoseconds,
             cfg->polish_chart,
             (size_t)(cfg->polish_node_limit <= 80000 ? 32 : 128) * 1024 * 1024,
-            (unsigned)ccubes_thread_count()
+            (unsigned)ccubes_thread_count(),
+            cfg->bounded_workers
         );
 
         if ((double)best_sol_size < bestUB - EPS) {
@@ -5136,7 +5671,8 @@ static void solve_scp_lagrangian_config(
             t_best,
             col_costs,
             ls_out,
-            dual_x
+            dual_x,
+            loop_threads.columns
         );
         lagr_last_stats.reduced_cost_nanoseconds +=
             lagr_monotonic_nanoseconds() - component_started;
@@ -5188,7 +5724,8 @@ static void solve_scp_lagrangian_with_deadline(
     int polish_incumbent_cardinality,
     const double *initial_multipliers,
     uint64_t deadline_nanoseconds,
-    bool native_ipc
+    bool native_ipc,
+    int bounded_workers
 ) {
     if (solmin) *solmin = -1;
     const int foundPI = chart ? chart->cols : 0;
@@ -5263,10 +5800,17 @@ static void solve_scp_lagrangian_with_deadline(
     int **rowsCovered = NULL, *rowsCoveredCount = NULL;
     int **colsCovering = NULL, *colsCoveringCount = NULL;
 
-    int rc_ad = build_adjacency(
+    /* A compact repair chart cannot amortize launching the full IPC
+       team for each of the two adjacency passes. Bounded search still
+       receives its own worker allowance. */
+    const int repair_team = lagr_reduction_threads(
+        foundPI, (uint64_t)foundPI * (unsigned)chart->words, bounded_workers
+    );
+    int rc_ad = build_adjacency_with_threads(
         chart,
         ON_minterms,
         foundPI,
+        bounded_workers > 1 ? repair_team : ccubes_thread_count(),
         &rowsCovered,
         &rowsCoveredCount,
         &colsCovering,
@@ -5320,11 +5864,13 @@ static void solve_scp_lagrangian_with_deadline(
         rowsCoveredCount,
         colsCovering,
         colsCoveringCount,
-        weights
+        weights,
+        repair_team
     );
 
     LagrangianConfig baseline;
     lagr_config_for_effort(&baseline, effort_level);
+    baseline.bounded_workers = bounded_workers;
     if (native_ipc) baseline.polish_chart = chart;
     lagr_apply_certification_policy(
         &baseline,
@@ -5435,10 +5981,18 @@ static void solve_scp_lagrangian_with_deadline(
                 candidate_stats->reduced_cost_nanoseconds;
             merged_stats.heuristic_nanoseconds +=
                 candidate_stats->heuristic_nanoseconds;
+            merged_stats.heuristic_row_min_nanoseconds +=
+                candidate_stats->heuristic_row_min_nanoseconds;
+            merged_stats.heuristic_greedy_nanoseconds +=
+                candidate_stats->heuristic_greedy_nanoseconds;
+            merged_stats.heuristic_repair_nanoseconds +=
+                candidate_stats->heuristic_repair_nanoseconds;
             merged_stats.bundle_nanoseconds +=
                 candidate_stats->bundle_nanoseconds;
             merged_stats.subgradient_nanoseconds +=
                 candidate_stats->subgradient_nanoseconds;
+            lagr_merge_teams(&merged_stats.reduced_cost_teams, &candidate_stats->reduced_cost_teams);
+            lagr_merge_teams(&merged_stats.slack_teams, &candidate_stats->slack_teams);
             merged_stats.nonzero_subgradient_rows +=
                 candidate_stats->nonzero_subgradient_rows;
             merged_stats.reduced_cost_calls +=
@@ -5682,10 +6236,18 @@ static void solve_scp_lagrangian_with_deadline(
             merged_stats.reduced_cost_nanoseconds;
         lagr_last_stats.heuristic_nanoseconds =
             merged_stats.heuristic_nanoseconds;
+        lagr_last_stats.heuristic_row_min_nanoseconds =
+            merged_stats.heuristic_row_min_nanoseconds;
+        lagr_last_stats.heuristic_greedy_nanoseconds =
+            merged_stats.heuristic_greedy_nanoseconds;
+        lagr_last_stats.heuristic_repair_nanoseconds =
+            merged_stats.heuristic_repair_nanoseconds;
         lagr_last_stats.bundle_nanoseconds =
             merged_stats.bundle_nanoseconds;
         lagr_last_stats.subgradient_nanoseconds =
             merged_stats.subgradient_nanoseconds;
+        lagr_last_stats.reduced_cost_teams = merged_stats.reduced_cost_teams;
+        lagr_last_stats.slack_teams = merged_stats.slack_teams;
         lagr_last_stats.nonzero_subgradient_rows =
             merged_stats.nonzero_subgradient_rows;
         lagr_last_stats.reduced_cost_calls =
@@ -5781,7 +6343,8 @@ void solve_scp_lagrangian_with_multipliers_and_polish_incumbent(
         polish_incumbent_cardinality,
         initial_multipliers,
         0,
-        true
+        true,
+        1
     );
 }
 
@@ -5813,7 +6376,8 @@ void solve_scp_lagrangian_with_multipliers(
         0,
         initial_multipliers,
         0,
-        false
+        false,
+        1
     );
 }
 
@@ -5868,7 +6432,8 @@ void solve_scp_lagrangian_until(
         0,
         NULL,
         deadline_nanoseconds,
-        false
+        false,
+        ccubes_thread_count()
     );
 }
 
@@ -5929,6 +6494,7 @@ void solve_scp_lagrangian_pool(
     }
 
     int rows = ON_minterms, cols = foundPI;
+    const LagrangianLoopThreads loop_threads = lagr_loop_threads(rows, cols, rowsCoveredCount);
     int warm_start_requested =
         initial_solution != NULL && initial_solmin > 0;
     int warm_start_accepted =
@@ -6077,7 +6643,8 @@ void solve_scp_lagrangian_pool(
         t,
         col_costs,
         rc,
-        dual_x
+        dual_x,
+        loop_threads.columns
     );
     bestZLB = initialZLB;
     lastZLB = initialZLB;
@@ -6131,7 +6698,6 @@ void solve_scp_lagrangian_pool(
 
             local_search_drop2_repair(
                 rows,
-                cols,
                 rowsCovered,
                 rowsCoveredCount,
                 colsCovering,
@@ -6140,7 +6706,8 @@ void solve_scp_lagrangian_pool(
                 weights,
                 sol_tmp,
                 &sol_size,
-                local_passes
+                local_passes,
+                0
             );
         }
 
@@ -6161,7 +6728,6 @@ void solve_scp_lagrangian_pool(
 
             local_search_drop2_repair(
                 rows,
-                cols,
                 rowsCovered,
                 rowsCoveredCount,
                 colsCovering,
@@ -6170,7 +6736,8 @@ void solve_scp_lagrangian_pool(
                 weights,
                 sol_tmp2,
                 &sol_size2,
-                local_passes
+                local_passes,
+                0
             );
         }
     }
@@ -6337,7 +6904,8 @@ void solve_scp_lagrangian_pool(
             t,
             col_costs,
             rc,
-            dual_x
+            dual_x,
+            loop_threads.columns
         );
         lastZLB = ZLB;
         if (ZLB > bestZLB + EPS) {
@@ -6404,7 +6972,6 @@ void solve_scp_lagrangian_pool(
                 if (cfg.drop2_enabled) {
                     local_search_drop2_repair(
                         rows,
-                        cols,
                         rowsCovered,
                         rowsCoveredCount,
                         colsCovering,
@@ -6413,7 +6980,8 @@ void solve_scp_lagrangian_pool(
                         weights,
                         sol_tmp,
                         &sol_size,
-                        local_passes
+                        local_passes,
+                        0
                     );
                 }
             }
@@ -6435,7 +7003,6 @@ void solve_scp_lagrangian_pool(
                 if (cfg.drop2_enabled) {
                     local_search_drop2_repair(
                         rows,
-                        cols,
                         rowsCovered,
                         rowsCoveredCount,
                         colsCovering,
@@ -6444,7 +7011,8 @@ void solve_scp_lagrangian_pool(
                         weights,
                         sol_tmp2,
                         &sol_size2,
-                        local_passes
+                        local_passes,
+                        0
                     );
                 }
             }
@@ -6572,7 +7140,8 @@ void solve_scp_lagrangian_pool(
                 ZLB,
                 t,
                 &bundle_state,
-                NULL
+                NULL,
+                loop_threads.rows
             );
         }
 
@@ -6595,7 +7164,8 @@ void solve_scp_lagrangian_pool(
                 cfg.step_contract,
                 cfg.stabilization_beta,
                 NULL,
-                &workspace
+                &workspace,
+                loop_threads.rows
             );
             used_subgradient_update = 1;
             if (step_coef < step_before - EPS) {
@@ -6658,7 +7228,6 @@ void solve_scp_lagrangian_pool(
                 if (cfg.drop2_enabled) {
                     local_search_drop2_repair(
                         rows,
-                        cols,
                         rowsCovered,
                         rowsCoveredCount,
                         colsCovering,
@@ -6667,7 +7236,8 @@ void solve_scp_lagrangian_pool(
                         weights,
                         sol_tmp,
                         &sol_size,
-                        local_passes
+                        local_passes,
+                        0
                     );
                 }
             }
@@ -6689,7 +7259,6 @@ void solve_scp_lagrangian_pool(
                 if (cfg.drop2_enabled) {
                     local_search_drop2_repair(
                         rows,
-                        cols,
                         rowsCovered,
                         rowsCoveredCount,
                         colsCovering,
@@ -6698,7 +7267,8 @@ void solve_scp_lagrangian_pool(
                         weights,
                         sol_tmp2,
                         &sol_size2,
-                        local_passes
+                        local_passes,
+                        0
                     );
                 }
             }
@@ -6816,7 +7386,8 @@ void solve_scp_lagrangian_pool(
             t_best,
             col_costs,
             rc,
-            dual_x
+            dual_x,
+            loop_threads.columns
         );
 
         int proved = (stop_reason == LAGR_STOP_OPTIMAL);
@@ -6843,7 +7414,7 @@ void solve_scp_lagrangian_pool(
             &pool_count,
             &pool_min_len,
             norm,
-            0, NULL, 0, 0
+            0, NULL, 0, 0, 1
         );
 
         if (*solmin < solmin_before) {

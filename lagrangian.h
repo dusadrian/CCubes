@@ -57,6 +57,18 @@ typedef enum {
 } LagrangianPolishStopReason;
 
 typedef struct {
+    int min_workers;
+    int max_workers;
+    uint64_t calls;
+    uint64_t serial_calls;
+    uint64_t worker_sum;
+} LagrangianTeamStats;
+
+static inline double lagrangian_mean_workers(const LagrangianTeamStats *stats) {
+    return stats->calls ? (double)stats->worker_sum / (double)stats->calls : 0.0;
+}
+
+typedef struct {
     int rows;
     int cols;
     int iterations;
@@ -107,8 +119,13 @@ typedef struct {
     LagrangianPolishStopReason polish_stop_reason;
     uint64_t reduced_cost_nanoseconds;
     uint64_t heuristic_nanoseconds;
+    uint64_t heuristic_row_min_nanoseconds;
+    uint64_t heuristic_greedy_nanoseconds;
+    uint64_t heuristic_repair_nanoseconds;
     uint64_t bundle_nanoseconds;
     uint64_t subgradient_nanoseconds;
+    LagrangianTeamStats reduced_cost_teams;
+    LagrangianTeamStats slack_teams;
     uint64_t nonzero_subgradient_rows;
     int reduced_cost_calls;
     int heuristic_calls;
@@ -165,6 +182,8 @@ typedef struct {
     double last_zlb;
     double final_step_coefficient;
     LagrangianStopReason stop_reason;
+    LagrangianTeamStats reduced_cost_teams;
+    LagrangianTeamStats slack_teams;
 } LagrangianCalibrationStats;
 
 void lagrangian_reset_stats(void);
@@ -203,8 +222,9 @@ void solve_scp_lagrangian(
 );
 
 /*
- * Deadline-aware variant used by optional subsolves. The deadline is an
- * absolute CLOCK_MONOTONIC timestamp in nanoseconds, or zero for no limit.
+ * Variant used by native repair. Its bounded finish can share one search
+ * budget across the configured workers. The deadline is an absolute
+ * CLOCK_MONOTONIC timestamp in nanoseconds, or zero for no limit.
  * A feasible incumbent found before the deadline is returned normally.
  */
 void solve_scp_lagrangian_until(

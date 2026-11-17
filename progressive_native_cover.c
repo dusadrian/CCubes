@@ -1104,6 +1104,8 @@ static ProgressiveCoverStatus solve_native_master_mode(
         "step=%.9g/%.9g/%.9g contract=%.9g contractions=%d "
         "stabilization=%.9g deflection=%.9g "
         "rc_seconds=%.6f/%d heuristic_seconds=%.6f/%d "
+        "heuristic_row_min_seconds=%.6f heuristic_greedy_seconds=%.6f "
+        "heuristic_repair_seconds=%.6f "
         "primal_ub_cadence=%d "
         "primal_ub_supplied=%d primal_ub_loop_start=%d "
         "primal_ub_loop_final=%d "
@@ -1114,6 +1116,8 @@ static ProgressiveCoverStatus solve_native_master_mode(
         "primal_ub_last_improvement=%d "
         "primal_ub_longest_gap=%d "
         "bundle_seconds=%.6f/%d subgradient_seconds=%.6f/%d "
+        "rc_workers=%d/%.2f/%d rc_serial_calls=%" PRIu64 "/%" PRIu64 " "
+        "slack_workers=%d/%.2f/%d slack_serial_calls=%" PRIu64 "/%" PRIu64 " "
         "nonzero_subgradient=%d/%.1f/%d density=%.6f samples=%d "
         "dual_call=%d dual_seconds=%.6f dual_total_seconds=%.6f\n",
         master->count,
@@ -1156,6 +1160,9 @@ static ProgressiveCoverStatus solve_native_master_mode(
         stats->reduced_cost_calls,
         (double)stats->heuristic_nanoseconds / 1e9,
         stats->heuristic_calls,
+        (double)stats->heuristic_row_min_nanoseconds / 1e9,
+        (double)stats->heuristic_greedy_nanoseconds / 1e9,
+        (double)stats->heuristic_repair_nanoseconds / 1e9,
         stats->primal_ub_cadence,
         stats->primal_ub_supplied,
         stats->primal_ub_loop_start,
@@ -1170,6 +1177,16 @@ static ProgressiveCoverStatus solve_native_master_mode(
         stats->bundle_calls,
         (double)stats->subgradient_nanoseconds / 1e9,
         stats->subgradient_calls,
+        stats->reduced_cost_teams.min_workers,
+        lagrangian_mean_workers(&stats->reduced_cost_teams),
+        stats->reduced_cost_teams.max_workers,
+        stats->reduced_cost_teams.serial_calls,
+        stats->reduced_cost_teams.calls,
+        stats->slack_teams.min_workers,
+        lagrangian_mean_workers(&stats->slack_teams),
+        stats->slack_teams.max_workers,
+        stats->slack_teams.serial_calls,
+        stats->slack_teams.calls,
         stats->subgradient_samples > 0
             ? stats->nonzero_subgradient_minimum
             : 0,
@@ -1848,10 +1865,12 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
         "CCUBES_PROGRESSIVE_NATIVE_FEASIBILITY_JUMP "
         "status=%s columns=%d cover=%d->%d targets=%d/%d "
         "threads=%d logical_states=%d families=%" PRIu64 " "
+        "family_plan=%d/%d/%d family_steps=%" PRIu64 "/%" PRIu64 " "
         "weight_reuses=%" PRIu64 " "
         "work_epochs=%" PRIu64 "/%" PRIu64 " "
         "adaptive_rounds=%" PRIu64 " restarts=%" PRIu64 " "
-        "iterations=%" PRIu64 " moves=%" PRIu64 "/%" PRIu64 " "
+        "iterations=%" PRIu64 " scheduled_iterations=%" PRIu64 " "
+        "moves=%" PRIu64 "/%" PRIu64 " "
         "penalties=%" PRIu64 " soft_pressure=%" PRIu64 " "
         "max_selected=%d "
         "best_uncovered=%d last_failed_uncovered=%d "
@@ -1879,12 +1898,18 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
         jump_stats.threads_used,
         jump_stats.logical_family_states,
         jump_stats.restart_families,
+        jump_stats.proposed_family_states,
+        jump_stats.work_admitted_family_states,
+        jump_stats.logical_family_states,
+        jump_stats.family_steps_min,
+        jump_stats.family_steps_max,
         jump_stats.weight_reuses,
         jump_stats.work_epochs,
         jump_stats.productive_epoch_extensions,
         jump_stats.adaptive_rounds,
         jump_stats.restarts,
         jump_stats.iterations,
+        jump_stats.scheduled_iterations,
         jump_stats.add_moves,
         jump_stats.remove_moves,
         jump_stats.penalty_updates,

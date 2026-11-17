@@ -15,7 +15,7 @@
 #include <time.h>
 
 #define NATIVE_MEMORY_LIMIT (128u * 1024u * 1024u)
-#define SYSTEMATIC_MAX_WORKERS 12 /* At most 1.5 GiB of native query allocations. */
+#define SYSTEMATIC_MEMORY_LIMIT (UINT64_C(1536) * 1024 * 1024)
 
 static double monotonic_seconds(void)
 {
@@ -485,7 +485,9 @@ bool systematic_certify_outputs(PIstorage *pi, int inputs, int noutputs,
 {
     int requested = ccubes_effective_thread_count(threads);
     int count = requested;
-    if (count > SYSTEMATIC_MAX_WORKERS) count = SYSTEMATIC_MAX_WORKERS;
+    /* Admit complete per-query memory allowances under one batch envelope. */
+    uint64_t memory_workers = SYSTEMATIC_MEMORY_LIMIT / NATIVE_MEMORY_LIMIT;
+    if ((uint64_t)count > memory_workers) count = (int)memory_workers;
     if (count > noutputs) count = noutputs;
     CertificationBatch batch = {.outputs = pi, .inputs = inputs, .count = noutputs,
         .pricing_threads = noutputs == 1 ? requested : 1,

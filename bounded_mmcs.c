@@ -19,6 +19,9 @@
 #define WEIGHTED_MMCS_REDUCED_COST_TOL 1e-8
 #define WEIGHTED_MMCS_TIMEOUT_BOUND_WORK UINT64_C(1000000)
 
+typedef struct WeightedPriceWorker WeightedPriceWorker;
+typedef struct WeightedParallelContext WeightedParallelContext;
+
 typedef struct {
     int ninputs;
     int edge_count;
@@ -79,6 +82,7 @@ typedef struct {
     bool (*prune_bound)(double bound, void *data);
     void (*push_vertex)(int vertex, int depth, void *data);
     void *search_data;
+    WeightedPriceWorker *price_worker;
     BoundedMMCSStats *stats;
     WeightedMMCSPriceTelemetry *telemetry;
     uint64_t node_limit;
@@ -110,6 +114,18 @@ typedef struct {
 } CubeCollector;
 
 typedef struct {
+    int anchor;
+    atomic_int pending;
+} WeightedAnchorWork;
+
+typedef struct {
+    WeightedAnchorWork *anchor;
+    int depth;
+    int *vertices;
+    unsigned char *forbidden;
+} WeightedPriceSubtree;
+
+typedef struct {
     const PIstorage *pi;
     int ninputs;
     const int *anchor;
@@ -130,7 +146,17 @@ typedef struct {
     double *compatible_bounds;
 } WeightedPriceContext;
 
-typedef struct {
+typedef struct WeightedPriceFrame {
+    struct WeightedPriceFrame *parent;
+    const int *vertices;
+    const double *bounds;
+    const unsigned char *forbidden;
+    int depth;
+    int first;
+    int *count;
+} WeightedPriceFrame;
+
+struct WeightedPriceWorker {
     const PIstorage *pi;
     int ninputs;
     int max_level;
@@ -169,16 +195,27 @@ typedef struct {
     WeightedPriceContext price;
     WeightedMMCSPriceStatus status;
     int anchors_completed;
-    int first_incomplete_anchor;
-} WeightedPriceWorker;
+    WeightedParallelContext *parallel;
+    WeightedAnchorWork root_work;
+    WeightedAnchorWork *current_work;
+    WeightedPriceSubtree subtree;
+    WeightedPriceFrame *frames; /* owner thread only */
+    unsigned char *frame_forbidden;
+    bool waiting; /* protected by parallel->work_changed */
+};
 
-typedef struct {
+struct WeightedParallelContext {
     WeightedPriceWorker *workers;
     atomic_int next_anchor;
-    atomic_bool limit_reached;
+    atomic_int stop_status;
+    atomic_int completed_anchors;
+    atomic_int waiting_workers;
     int anchor_count;
+    int worker_count;
     uint64_t deadline_nanoseconds;
-} WeightedParallelContext;
+    ccubes_condition work_changed;
+    bool share_subtrees;
+};
 
 static uint64_t monotonic_nanoseconds(void) {
     struct timespec now;
@@ -186,6 +223,10 @@ static uint64_t monotonic_nanoseconds(void) {
     return
         (uint64_t)now.tv_sec * UINT64_C(1000000000) +
         (uint64_t)now.tv_nsec;
+}
+
+static bool weighted_price_expired(uint64_t deadline) {
+    return deadline != 0 && monotonic_nanoseconds() >= deadline;
 }
 
 static void add_price_telemetry(
@@ -223,6 +264,7 @@ static void add_price_telemetry(
         source->candidate_collection_nanoseconds;
     target->merge_nanoseconds += source->merge_nanoseconds;
     target->pricing_call_nanoseconds += source->pricing_call_nanoseconds;
+    target->subtrees_searched += source->subtrees_searched;
 }
 
 static uint64_t low_bits_mask(int count) {
@@ -595,6 +637,63 @@ static int choose_uncovered_edge(
     return best_edge;
 }
 
+static int weighted_share_branches(
+    const MMCSState *state, const int *vertices, const double *bounds, int first, int count,
+    int depth, const unsigned char *forbidden
+) {
+    WeightedPriceWorker *owner = state->price_worker;
+    WeightedParallelContext *parallel = owner->parallel;
+    ccubes_condition_lock(&parallel->work_changed);
+    bool offered = false;
+    for (int i = 0; i < parallel->worker_count && count > first + 1; ++i) {
+        if (atomic_load_explicit(&parallel->stop_status, memory_order_relaxed) != WEIGHTED_MMCS_PRICE_OK)
+            break;
+        WeightedPriceWorker *receiver = &parallel->workers[i];
+        if (!receiver->waiting) continue;
+
+        /* Keep the next branch local. A donated sibling inherits every
+         * earlier exclusion from this pivot, including siblings still local. */
+        while (count > first + 1 &&
+               state->prune_bound(bounds[count - 1], state->search_data)) {
+            --count;
+        }
+        if (count <= first + 1) break;
+        --count;
+        WeightedPriceSubtree *task = &receiver->subtree;
+        memcpy(task->vertices, state->selected_vertices, (size_t)depth * sizeof(int));
+        task->vertices[depth] = vertices[count];
+        task->depth = depth + 1;
+        memcpy(task->forbidden, forbidden, (size_t)state->ninputs);
+        for (int earlier = 0; earlier < count; ++earlier) {
+            task->forbidden[vertices[earlier]] = 1;
+        }
+        atomic_fetch_add_explicit(&owner->current_work->pending, 1, memory_order_relaxed);
+        task->anchor = owner->current_work;
+        receiver->waiting = false;
+        atomic_fetch_sub_explicit(&parallel->waiting_workers, 1, memory_order_relaxed);
+        offered = true;
+    }
+    if (offered) ccubes_condition_broadcast(&parallel->work_changed);
+    ccubes_condition_unlock(&parallel->work_changed);
+    return count;
+}
+
+/* Donate from the oldest live pivot, even while its owner is inside a
+ * costly descendant. The saved exclusions belong to that pivot, not to the
+ * descendant's narrower search. Only the owner edits these stack frames. */
+static void weighted_share_ancestor(const MMCSState *state) {
+    WeightedPriceFrame *oldest = NULL;
+    for (WeightedPriceFrame *frame = state->price_worker->frames; frame; frame = frame->parent) {
+        if (*frame->count > frame->first + 1) oldest = frame;
+    }
+    if (oldest) {
+        *oldest->count = weighted_share_branches(
+            state, oldest->vertices, oldest->bounds, oldest->first, *oldest->count,
+            oldest->depth, oldest->forbidden
+        );
+    }
+}
+
 static void mmcs_search(
     MMCSState *state
 ) {
@@ -615,6 +714,11 @@ static void mmcs_search(
         return;
     }
     state->stats->search_nodes++;
+    if (state->price_worker && (state->stats->search_nodes & UINT64_C(31)) == 0 &&
+        atomic_load_explicit(&state->price_worker->parallel->waiting_workers,
+                             memory_order_relaxed) > 0) {
+        weighted_share_ancestor(state);
+    }
 
     if (
         state->prune &&
@@ -724,17 +828,37 @@ static void mmcs_search(
         }
     }
 
+    WeightedPriceFrame frame = {0};
+    if (state->price_worker) {
+        unsigned char *saved = state->price_worker->frame_forbidden +
+            (size_t)state->selected_count * (size_t)state->ninputs;
+        memcpy(saved, state->forbidden, (size_t)state->ninputs);
+        frame = (WeightedPriceFrame){
+            .parent = state->price_worker->frames, .vertices = branch_vertices,
+            .bounds = priorities, .forbidden = saved, .depth = state->selected_count,
+            .count = &branch_count
+        };
+        state->price_worker->frames = &frame;
+    }
     int forbidden_count = 0;
     for (
         int i = 0;
         i < branch_count && !state->failed && !state->limit_reached;
         ++i
     ) {
+        frame.first = i;
         /* These sorted priorities bound every descendant of the branch.
          * Use precisely the same tolerance and tie policy as node pruning;
          * in particular a full witness batch must keep equal-weight ties. */
         if (state->branch_priority && state->prune_bound &&
             state->prune_bound(priorities[i], state->search_data)) break;
+        if (state->price_worker && branch_count > i + 1 &&
+            state->selected_count + 1 < state->target_size &&
+            atomic_load_explicit(&state->price_worker->parallel->waiting_workers,
+                                 memory_order_relaxed) > 0) {
+            branch_count = weighted_share_branches(state, branch_vertices, priorities, i, branch_count,
+                frame.depth, frame.forbidden);
+        }
         int vertex = branch_vertices[i];
         bool minimal = add_vertex(state, vertex);
         if (minimal) {
@@ -753,6 +877,7 @@ static void mmcs_search(
         forbidden_count++;
     }
 
+    if (state->price_worker) state->price_worker->frames = frame.parent;
     for (int i = 0; i < forbidden_count; ++i) {
         unforbid_vertex(state, branch_vertices[i]);
     }
@@ -1038,18 +1163,32 @@ static bool weighted_merge_local_batches(
                 &workers[best_worker].local_batch;
             int candidate = cursor[worker];
             int incumbent = cursor[best_worker];
+            const uint64_t *candidate_coverage =
+                &local->coverage[(size_t)candidate * (size_t)coverage_words];
+            const uint64_t *incumbent_coverage =
+                &best->coverage[(size_t)incumbent * (size_t)coverage_words];
             if (weighted_batch_candidate_precedes(
                 local->weights[candidate],
                 local->anchors[candidate],
-                &local->coverage[
-                    (size_t)candidate * (size_t)coverage_words
-                ],
+                candidate_coverage,
                 best->weights[incumbent],
                 best->anchors[incumbent],
-                &best->coverage[
-                    (size_t)incumbent * (size_t)coverage_words
-                ],
+                incumbent_coverage,
                 coverage_words
+            ) || (
+                /* Siblings may produce the same coverage in different
+                 * batches. Resolve its geometry before it can fill the
+                 * final slot and end the merge. */
+                local->weights[candidate] == best->weights[incumbent] &&
+                local->anchors[candidate] == best->anchors[incumbent] &&
+                memcmp(candidate_coverage, incumbent_coverage,
+                       (size_t)coverage_words * sizeof(uint64_t)) == 0 &&
+                weighted_geometry_precedes(
+                    local->anchors[candidate], local->support_sizes[candidate],
+                    &local->vertices[(size_t)candidate * (size_t)ninputs],
+                    best->anchors[incumbent], best->support_sizes[incumbent],
+                    &best->vertices[(size_t)incumbent * (size_t)ninputs], ninputs
+                )
             )) {
                 best_worker = worker;
             }
@@ -1139,11 +1278,14 @@ static bool weighted_price_prune_bound(
     if (!isfinite(context->best_weight)) return false;
 
     double threshold = context->best_weight;
-    bool prune_equal = true;
+    /* A donated branch can revisit the same anchor or an earlier anchor.
+     * Keep ties that can still replace the incumbent in canonical order. */
+    bool prune_equal = context->anchor_index > context->best_anchor;
     WeightedMMCSPriceBatch *local = context->local_batch;
     if (local && local->count > 0) {
         if (local->count < local->capacity) {
             threshold = 1.0;
+            prune_equal = true;
         } else {
             threshold = local->weights[local->count - 1];
             prune_equal = false;
@@ -2155,7 +2297,8 @@ static bool weighted_price_worker_init(
     worker->cache_edge_words = cache_edge_words && max_level > 1;
     worker->disable_cover_bound = disable_cover_bound;
     worker->status = WEIGHTED_MMCS_PRICE_OK;
-    worker->first_incomplete_anchor = -1;
+    worker->root_work.anchor = -1;
+    atomic_init(&worker->root_work.pending, 0);
     int ninputs = prepared->ninputs;
 
     if (use_materialized_backend || worker->cache_edge_words) {
@@ -2333,13 +2476,9 @@ typedef struct {
     const uint64_t *packed_values;
 } WeightedAnchorPlan;
 
-static bool weighted_price_anchor_precheck(
-    WeightedPriceWorker *worker,
-    int on,
-    WeightedAnchorPlan *anchor
-) {
+static WeightedAnchorPlan weighted_anchor_plan(const WeightedPriceWorker *worker, int on) {
     const PIstorage *pi = worker->pi;
-    *anchor = (WeightedAnchorPlan){
+    return (WeightedAnchorPlan){
         .index = on,
         .edge_count = pi->OFF_minterms + on,
         .values = &pi->ON_set[
@@ -2349,6 +2488,13 @@ static bool weighted_price_anchor_precheck(
             (size_t)on * (size_t)worker->edge_words
         ]
     };
+}
+
+static bool weighted_price_anchor_precheck(
+    WeightedPriceWorker *worker,
+    const WeightedAnchorPlan *anchor
+) {
+    int on = anchor->index;
     WeightedMMCSPriceTelemetry *telemetry = &worker->telemetry;
     telemetry->anchors_presented++;
     if (
@@ -2372,7 +2518,8 @@ static bool weighted_price_anchor_precheck(
 
 static bool weighted_price_anchor_prepare(
     WeightedPriceWorker *worker,
-    const WeightedAnchorPlan *anchor
+    const WeightedAnchorPlan *anchor,
+    bool initial
 ) {
     const PIstorage *pi = worker->pi;
     int ninputs = worker->ninputs;
@@ -2382,12 +2529,13 @@ static bool weighted_price_anchor_prepare(
     const uint64_t *packed_anchor = anchor->packed_values;
     WeightedMMCSPriceTelemetry *telemetry = &worker->telemetry;
 
-    telemetry->anchors_constructed++;
-    if (worker->edges) {
-        telemetry->edges_constructed += (uint64_t)edge_count;
+    /* Keep the anchor counters per root. Time spent rebuilding donated
+     * subtrees is included in the preparation timers. */
+    if (initial) {
+        telemetry->anchors_constructed++;
+        if (worker->edges) telemetry->edges_constructed += (uint64_t)edge_count;
+        telemetry->xor_words += (uint64_t)edge_count * (uint64_t)edge_words;
     }
-    telemetry->xor_words +=
-        (uint64_t)edge_count * (uint64_t)edge_words;
 
     uint64_t edge_started = worker->collect_timing
         ? monotonic_nanoseconds()
@@ -2461,7 +2609,7 @@ static bool weighted_price_anchor_prepare(
             }
             incidence_entries += (size_t)size;
         }
-        telemetry->incidences_counted += (uint64_t)incidence_entries;
+        if (initial) telemetry->incidences_counted += (uint64_t)incidence_entries;
         if (count_started > 0) {
             telemetry->incidence_count_nanoseconds +=
                 monotonic_nanoseconds() - count_started;
@@ -2504,7 +2652,7 @@ static bool weighted_price_anchor_prepare(
                 }
             }
         }
-        telemetry->incidences_written += (uint64_t)incidence_entries;
+        if (initial) telemetry->incidences_written += (uint64_t)incidence_entries;
         if (fill_started > 0) {
             telemetry->incidence_fill_nanoseconds +=
                 monotonic_nanoseconds() - fill_started;
@@ -2537,10 +2685,33 @@ static bool weighted_price_anchor_prepare(
     return true;
 }
 
+static bool weighted_restore_subtree(MMCSState *state, const WeightedPriceSubtree *task) {
+    /* Exclusions change the available literals, not which edges are hit.
+     * Restore them before replaying the original ordered selection. */
+    for (int vertex = 0; vertex < state->ninputs; ++vertex) {
+        if (!task->forbidden[vertex]) continue;
+        if (weighted_price_expired(state->deadline_nanoseconds)) {
+            state->limit_reached = true;
+            return false;
+        }
+        forbid_vertex(state, vertex);
+    }
+    for (int i = 0; i < task->depth; ++i) {
+        if (weighted_price_expired(state->deadline_nanoseconds)) {
+            state->limit_reached = true;
+            return false;
+        }
+        if (!add_vertex(state, task->vertices[i])) return false;
+        weighted_push_vertex(task->vertices[i], state->selected_count, state->search_data);
+    }
+    return true;
+}
+
 static void weighted_price_anchor_search(
     WeightedPriceWorker *worker,
     const WeightedAnchorPlan *anchor,
-    uint64_t deadline_nanoseconds
+    uint64_t deadline_nanoseconds,
+    const WeightedPriceSubtree *task
 ) {
     const PIstorage *pi = worker->pi;
     WeightedMMCSPriceTelemetry *telemetry = &worker->telemetry;
@@ -2593,6 +2764,7 @@ static void weighted_price_anchor_search(
         .prune_bound = weighted_price_prune_bound,
         .push_vertex = weighted_push_vertex,
         .search_data = &worker->price,
+        .price_worker = worker->parallel->share_subtrees ? worker : NULL,
         .stats = &worker->search_stats,
         .telemetry = worker->collect_timing ? telemetry : NULL,
         .node_limit = 0,
@@ -2604,7 +2776,16 @@ static void weighted_price_anchor_search(
     uint64_t search_started = worker->collect_timing
         ? monotonic_nanoseconds()
         : 0;
-    mmcs_search(&state);
+    if (weighted_price_expired(deadline_nanoseconds)) {
+        state.limit_reached = true;
+    } else if (!task || weighted_restore_subtree(&state, task)) {
+        if (task && weighted_price_expired(deadline_nanoseconds)) {
+            state.limit_reached = true;
+        } else {
+            if (task) worker->telemetry.subtrees_searched++;
+            mmcs_search(&state);
+        }
+    }
     if (search_started > 0) {
         telemetry->search_nanoseconds +=
             monotonic_nanoseconds() - search_started;
@@ -2613,24 +2794,74 @@ static void weighted_price_anchor_search(
         worker->status = WEIGHTED_MMCS_PRICE_INVALID;
     } else if (state.limit_reached) {
         worker->status = WEIGHTED_MMCS_PRICE_LIMIT_REACHED;
-        worker->first_incomplete_anchor = anchor->index;
-    } else {
-        worker->anchors_completed++;
     }
 }
 
 static void weighted_price_search_anchor(
     WeightedPriceWorker *worker,
     int on,
-    uint64_t deadline_nanoseconds
+    uint64_t deadline_nanoseconds,
+    const WeightedPriceSubtree *task
 ) {
-    WeightedAnchorPlan anchor;
-    if (!weighted_price_anchor_precheck(worker, on, &anchor)) {
-        worker->anchors_completed++;
-        return;
+    WeightedAnchorPlan anchor = weighted_anchor_plan(worker, on);
+    if (!task && !weighted_price_anchor_precheck(worker, &anchor)) return;
+    if (!weighted_price_anchor_prepare(worker, &anchor, task == NULL)) return;
+    weighted_price_anchor_search(worker, &anchor, deadline_nanoseconds, task);
+}
+
+static void weighted_price_wake_workers(WeightedParallelContext *parallel) {
+    if (!parallel->share_subtrees) return;
+    ccubes_condition_lock(&parallel->work_changed);
+    ccubes_condition_broadcast(&parallel->work_changed);
+    ccubes_condition_unlock(&parallel->work_changed);
+}
+
+static void weighted_price_stop(WeightedParallelContext *parallel, WeightedMMCSPriceStatus status) {
+    int expected = WEIGHTED_MMCS_PRICE_OK;
+    if (atomic_compare_exchange_strong_explicit(&parallel->stop_status, &expected, status,
+                                                memory_order_relaxed, memory_order_relaxed)) {
+        weighted_price_wake_workers(parallel);
     }
-    if (!weighted_price_anchor_prepare(worker, &anchor)) return;
-    weighted_price_anchor_search(worker, &anchor, deadline_nanoseconds);
+}
+
+static void weighted_price_run_work(
+    WeightedPriceWorker *worker, WeightedAnchorWork *work, const WeightedPriceSubtree *task
+) {
+    WeightedParallelContext *parallel = worker->parallel;
+    worker->current_work = work;
+    if (weighted_price_expired(parallel->deadline_nanoseconds)) {
+        worker->status = WEIGHTED_MMCS_PRICE_LIMIT_REACHED;
+    } else {
+        weighted_price_search_anchor(worker, work->anchor, parallel->deadline_nanoseconds, task);
+    }
+    if (worker->status != WEIGHTED_MMCS_PRICE_OK) {
+        /* Keep this piece outstanding so the entire anchor retains its bound. */
+        weighted_price_stop(parallel, worker->status);
+    } else if (atomic_fetch_sub_explicit(&work->pending, 1, memory_order_relaxed) == 1) {
+        ++worker->anchors_completed;
+        int completed = atomic_fetch_add_explicit(&parallel->completed_anchors, 1, memory_order_relaxed);
+        if (completed + 1 == parallel->anchor_count) weighted_price_wake_workers(parallel);
+    }
+}
+
+static bool weighted_price_wait_for_subtree(WeightedPriceWorker *worker) {
+    WeightedParallelContext *parallel = worker->parallel;
+    ccubes_condition_lock(&parallel->work_changed);
+    worker->waiting = true;
+    atomic_fetch_add_explicit(&parallel->waiting_workers, 1, memory_order_relaxed);
+    while (!worker->subtree.anchor &&
+           atomic_load_explicit(&parallel->completed_anchors, memory_order_relaxed) != parallel->anchor_count &&
+           atomic_load_explicit(&parallel->stop_status, memory_order_relaxed) == WEIGHTED_MMCS_PRICE_OK) {
+        ccubes_condition_wait(&parallel->work_changed);
+    }
+    if (worker->waiting) {
+        worker->waiting = false;
+        atomic_fetch_sub_explicit(&parallel->waiting_workers, 1, memory_order_relaxed);
+    }
+    bool assigned = worker->subtree.anchor &&
+        atomic_load_explicit(&parallel->stop_status, memory_order_relaxed) == WEIGHTED_MMCS_PRICE_OK;
+    ccubes_condition_unlock(&parallel->work_changed);
+    return assigned;
 }
 
 static void weighted_price_worker_range(
@@ -2645,64 +2876,27 @@ static void weighted_price_worker_range(
     (void)end;
     (void)stride;
     (void)worker_count;
-    WeightedParallelContext *parallel =
-        (WeightedParallelContext *)data;
+    WeightedParallelContext *parallel = data;
     WeightedPriceWorker *worker = &parallel->workers[worker_id];
-    while (worker->status == WEIGHTED_MMCS_PRICE_OK) {
-        if (atomic_load_explicit(
-            &parallel->limit_reached,
-            memory_order_acquire
-        )) {
+    worker->parallel = parallel;
+    while (atomic_load_explicit(&parallel->stop_status, memory_order_relaxed) == WEIGHTED_MMCS_PRICE_OK &&
+           atomic_load_explicit(&parallel->next_anchor, memory_order_relaxed) < parallel->anchor_count) {
+        if (weighted_price_expired(parallel->deadline_nanoseconds)) {
+            weighted_price_stop(parallel, WEIGHTED_MMCS_PRICE_LIMIT_REACHED);
             break;
         }
-        if (
-            parallel->deadline_nanoseconds > 0 &&
-            monotonic_nanoseconds() >= parallel->deadline_nanoseconds &&
-            atomic_load_explicit(
-                &parallel->next_anchor,
-                memory_order_relaxed
-            ) < parallel->anchor_count
-        ) {
-            atomic_store_explicit(
-                &parallel->limit_reached,
-                true,
-                memory_order_release
-            );
-            break;
-        }
-        int on = atomic_fetch_add_explicit(
-            &parallel->next_anchor,
-            1,
-            memory_order_relaxed
-        );
+        int on = atomic_fetch_add_explicit(&parallel->next_anchor, 1, memory_order_relaxed);
         if (on >= parallel->anchor_count) break;
-        weighted_price_search_anchor(
-            worker,
-            on,
-            parallel->deadline_nanoseconds
-        );
-        if (worker->status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED) {
-            atomic_store_explicit(
-                &parallel->limit_reached,
-                true,
-                memory_order_release
-            );
-            break;
-        }
-        if (
-            parallel->deadline_nanoseconds > 0 &&
-            monotonic_nanoseconds() >= parallel->deadline_nanoseconds &&
-            atomic_load_explicit(
-                &parallel->next_anchor,
-                memory_order_relaxed
-            ) < parallel->anchor_count
-        ) {
-            atomic_store_explicit(
-                &parallel->limit_reached,
-                true,
-                memory_order_release
-            );
-        }
+        worker->root_work.anchor = on;
+        atomic_store_explicit(&worker->root_work.pending, 1, memory_order_relaxed);
+        weighted_price_run_work(worker, &worker->root_work, NULL);
+    }
+
+    /* Every worker finishes claiming roots before it waits. A root may
+     * therefore share its counter without the owner overwriting it later. */
+    while (parallel->share_subtrees && weighted_price_wait_for_subtree(worker)) {
+        weighted_price_run_work(worker, worker->subtree.anchor, &worker->subtree);
+        worker->subtree.anchor = NULL;
     }
 }
 
@@ -2711,18 +2905,27 @@ static uint64_t weighted_worker_bytes_estimate(
     int ninputs,
     int max_level,
     bool use_materialized_backend,
-    bool cache_edge_words
+    bool cache_edge_words,
+    int batch_capacity
 ) {
     uint64_t edges =
         (uint64_t)pi->OFF_minterms + (uint64_t)pi->ON_minterms - 1u;
     uint64_t edge_words = ((uint64_t)ninputs + 63u) / 64u;
-    uint64_t bytes = 0;
+    uint64_t bytes = sizeof(WeightedPriceWorker);
+    uint64_t batch_entry = sizeof(double) + 2u * sizeof(int) +
+        (uint64_t)ninputs * sizeof(int) + (uint64_t)pi->pichart_words * sizeof(uint64_t);
+    if (batch_capacity > 0) {
+        if ((uint64_t)batch_capacity > (UINT64_MAX - bytes) / batch_entry) return UINT64_MAX;
+        bytes += (uint64_t)batch_capacity * batch_entry;
+    }
 
     if (use_materialized_backend || cache_edge_words) {
         if (edges > UINT64_MAX / edge_words / sizeof(uint64_t)) {
             return UINT64_MAX;
         }
-        bytes += edges * edge_words * sizeof(uint64_t);
+        uint64_t edge_bytes = edges * edge_words * sizeof(uint64_t);
+        if (edge_bytes > UINT64_MAX - bytes) return UINT64_MAX;
+        bytes += edge_bytes;
     }
 
     if (use_materialized_backend) {
@@ -2753,9 +2956,42 @@ static uint64_t weighted_worker_bytes_estimate(
     bytes += edge_arrays + input_arrays;
     uint64_t depths = (uint64_t)max_level + 1u;
     uint64_t depth_bytes = ((uint64_t)pi->ON_minterms + 63u) / 64u * sizeof(uint64_t)
-        + sizeof(double);
+        + sizeof(double) + sizeof(WeightedPriceFrame)
+        + (uint64_t)ninputs * (sizeof(int) + sizeof(double));
     if (depths > (UINT64_MAX - bytes) / depth_bytes) return UINT64_MAX;
     return bytes + depths * depth_bytes;
+}
+
+static void *weighted_price_init_sharing(
+    WeightedParallelContext *parallel, uint64_t worker_budget, uint64_t *worker_bytes
+) {
+    const WeightedPriceWorker *model = &parallel->workers[0];
+    const int threads = parallel->worker_count;
+    if (threads < 2 || model->max_level <= 1) return NULL;
+
+    uint64_t frame_bytes = (uint64_t)model->max_level * (uint64_t)model->ninputs;
+    uint64_t extra = (uint64_t)model->max_level * sizeof(int) + (uint64_t)model->ninputs + frame_bytes;
+    if (extra > SIZE_MAX / (size_t)threads || extra > UINT64_MAX - *worker_bytes ||
+        (worker_budget && *worker_bytes + extra > worker_budget / (uint64_t)threads)) {
+        return NULL;
+    }
+
+    int *prefixes = malloc((size_t)extra * (size_t)threads);
+    if (!prefixes) return NULL;
+    if (!ccubes_condition_init(&parallel->work_changed)) {
+        free(prefixes);
+        return NULL;
+    }
+    unsigned char *exclusions = (unsigned char *)(prefixes + (size_t)threads * model->max_level);
+    unsigned char *frames = exclusions + (size_t)threads * model->ninputs;
+    for (int i = 0; i < threads; ++i) {
+        parallel->workers[i].frame_forbidden = frames + (size_t)i * frame_bytes;
+        parallel->workers[i].subtree.vertices = prefixes + (size_t)i * model->max_level;
+        parallel->workers[i].subtree.forbidden = exclusions + (size_t)i * model->ninputs;
+    }
+    parallel->share_subtrees = true;
+    *worker_bytes += extra;
+    return prefixes;
 }
 
 typedef struct {
@@ -2899,7 +3135,11 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
         ? options->requested_threads
         : ccubes_thread_count();
     nthreads = ccubes_effective_thread_count(nthreads);
-    if (nthreads > anchor_count) nthreads = anchor_count;
+    /* Anchors are roots, not the limit on exposed work. A support search
+       can donate literal branches below each root. Bound eager admission
+       by that structural width as well as CPU and memory availability. */
+    uint64_t exposed = (uint64_t)anchor_count * (max_level > 1 ? (uint64_t)ninputs : 1);
+    if ((uint64_t)nthreads > exposed) nthreads = (int)exposed;
     if (nthreads < 1) nthreads = 1;
 
     bool apply_root_gate = options && options->enable_root_gate;
@@ -2913,24 +3153,25 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
         ninputs,
         max_level,
         use_materialized_backend,
-        cache_edge_words && max_level > 1
+        cache_edge_words && max_level > 1,
+        batch ? batch->capacity : 0
     );
     uint64_t worker_budget = options
         ? options->worker_memory_budget_bytes
         : 0;
+    uint64_t sharing_bytes = max_level > 1
+        ? (uint64_t)max_level * sizeof(int) + (uint64_t)ninputs +
+          (uint64_t)max_level * (uint64_t)ninputs : 0;
+    if (!estimated_worker_bytes || estimated_worker_bytes == UINT64_MAX ||
+        sharing_bytes > UINT64_MAX - estimated_worker_bytes)
+        return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
     if (worker_budget > 0) {
-        if (estimated_worker_bytes == 0 || estimated_worker_bytes == UINT64_MAX) {
-            return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
-        }
-        uint64_t memory_threads = worker_budget / estimated_worker_bytes;
-        if (memory_threads < 1u) {
-            return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
-        }
-        if ((uint64_t)nthreads > memory_threads) {
-            nthreads = memory_threads > (uint64_t)INT_MAX
-                ? INT_MAX
-                : (int)memory_threads;
-        }
+        if (worker_budget < estimated_worker_bytes) return WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
+        /* Reserve donation scratch before selecting the team. A smaller
+           sharing-capable team is preferable to filling memory with roots. */
+        uint64_t memory_threads = worker_budget / (estimated_worker_bytes + sharing_bytes);
+        if (memory_threads < 2) nthreads = 1;
+        else if ((uint64_t)nthreads > memory_threads) nthreads = (int)memory_threads;
     }
     result->effective_threads = nthreads;
     result->estimated_bytes_per_worker = estimated_worker_bytes;
@@ -2947,7 +3188,7 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     }
     double suffix = 0.0;
     for (int row = pi->ON_minterms - 1; row >= 0; --row) {
-        if (row_weights[row] > 0.0) suffix += row_weights[row];
+        if (row_weights[row] > 0.0) suffix = nextafter(suffix + row_weights[row], INFINITY);
         root_upper_bounds[row] = suffix;
     }
 
@@ -2992,12 +3233,18 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     WeightedParallelContext parallel = {
         .workers = workers,
         .anchor_count = anchor_count,
+        .worker_count = nthreads,
         .deadline_nanoseconds = options
             ? options->deadline_nanoseconds
             : 0
     };
     atomic_init(&parallel.next_anchor, 0);
-    atomic_init(&parallel.limit_reached, false);
+    atomic_init(&parallel.stop_status, WEIGHTED_MMCS_PRICE_OK);
+    atomic_init(&parallel.completed_anchors, 0);
+    atomic_init(&parallel.waiting_workers, 0);
+    void *subtree_storage = weighted_price_init_sharing(
+        &parallel, worker_budget, &result->estimated_bytes_per_worker
+    );
     WeightedMMCSPriceStatus status = WEIGHTED_MMCS_PRICE_OK;
     if (!ccubes_parallel_for(
         0,
@@ -3009,19 +3256,13 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     )) {
         status = WEIGHTED_MMCS_PRICE_OUT_OF_MEMORY;
     }
-    if (
-        status == WEIGHTED_MMCS_PRICE_OK &&
-        atomic_load_explicit(
-            &parallel.limit_reached,
-            memory_order_acquire
-        )
-    ) {
-        status = WEIGHTED_MMCS_PRICE_LIMIT_REACHED;
-        result->limit_reached = true;
+    if (parallel.share_subtrees) {
+        ccubes_condition_destroy(&parallel.work_changed);
+        free(subtree_storage);
     }
-    result->anchor_sweep_complete =
-        status == WEIGHTED_MMCS_PRICE_OK &&
-        anchor_count == pi->ON_minterms;
+    if (status == WEIGHTED_MMCS_PRICE_OK) {
+        status = (WeightedMMCSPriceStatus)atomic_load_explicit(&parallel.stop_status, memory_order_relaxed);
+    }
 
     int assigned_anchors = atomic_load_explicit(
         &parallel.next_anchor,
@@ -3045,12 +3286,10 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
         result->search_nodes +=
             workers[worker].search_stats.search_nodes;
         result->anchors_completed += workers[worker].anchors_completed;
-        if (
-            workers[worker].first_incomplete_anchor >= 0 &&
-            workers[worker].first_incomplete_anchor < earliest_unfinished
-        ) {
-            earliest_unfinished =
-                workers[worker].first_incomplete_anchor;
+        const WeightedAnchorWork *root = &workers[worker].root_work;
+        if (atomic_load_explicit(&root->pending, memory_order_relaxed) > 0 &&
+            root->anchor < earliest_unfinished) {
+            earliest_unfinished = root->anchor;
         }
         result->completed_transversals +=
             workers[worker].search_stats.completed_transversals;
@@ -3115,11 +3354,9 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
             ? workers[best_worker].price.best_weight
             : 0.0;
         /*
-         * Workers claim anchors monotonically. After joining, every claimed
-         * anchor either finished or is recorded as interrupted by its worker.
-         * Use the original suffix for unassigned anchors and tighten each
-         * interrupted anchor separately. Root-gated pricing retains its
-         * existing fallback.
+         * The original suffix still covers unassigned anchors. Each claimed
+         * anchor remains pending until its root and all donated descendants
+         * finish. Tighten each interrupted anchor once using its root bound.
          */
         if (
             status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED &&
@@ -3136,8 +3373,10 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
             );
             uint64_t work_left = WEIGHTED_MMCS_TIMEOUT_BOUND_WORK;
             for (int worker = 0; worker < nthreads; ++worker) {
-                int anchor = workers[worker].first_incomplete_anchor;
-                if (anchor < 0 || root_upper_bounds[anchor] <= upper) continue;
+                const WeightedAnchorWork *root = &workers[worker].root_work;
+                if (!atomic_load_explicit(&root->pending, memory_order_relaxed)) continue;
+                int anchor = root->anchor;
+                if (root_upper_bounds[anchor] <= upper) continue;
                 double unfinished = root_upper_bounds[anchor];
                 uint64_t work = (uint64_t)ninputs * (
                     (uint64_t)(pi->ON_minterms - anchor) +
@@ -3189,6 +3428,9 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     }
     free(workers);
     free(root_upper_bounds);
+    result->limit_reached = status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED;
+    result->anchor_sweep_complete = status == WEIGHTED_MMCS_PRICE_OK &&
+        anchor_count == pi->ON_minterms && result->anchors_completed == result->anchors_total;
     if (pricing_call_started > 0) {
         result->telemetry.pricing_call_nanoseconds +=
             monotonic_nanoseconds() - pricing_call_started;
