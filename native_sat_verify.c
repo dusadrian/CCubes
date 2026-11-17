@@ -1,24 +1,30 @@
 #include "native_sat_support.h"
 
 typedef struct {
+    NsatClauseId id;
     size_t count;
     bool target_bound;
     int lits[];
 } Clause;
 
-typedef struct {
-    NsatClauseId id;
-    Clause *clause;
-} ClauseEntry;
+/* Marks a hash slot whose derived clause was deleted. */
+static Clause deleted;
 
-/* id=0 is unused. A nonzero ID with a NULL clause is a tombstone. */
+/* Originals have the dense IDs 1..originals and are indexed directly.
+ * Derived clauses use the hash table, where a NULL slot was never used. */
 struct NsatVerifier {
     NsatBudget budget;
     int variables;
     NsatClauseId last_id, originals;
     enum { LOADING, SEALED, SAT_CONCLUDED, CONCLUDED } phase;
-    ClauseEntry *table;
-    size_t capacity, occupied, live;
+    Clause **loaded;
+    size_t loaded_capacity, loaded_literals;
+    Clause **table;
+    size_t capacity, derived;
+    union {
+        size_t original_words; /* Used until the first derived table is built. */
+        size_t occupied;
+    };
     signed char *values;
     int *assigned;
     size_t assigned_count;
@@ -33,27 +39,38 @@ static size_t hash(NsatClauseId id)
     return (size_t)(id ^ (id >> 33));
 }
 
-static ClauseEntry *lookup(const NsatVerifier *v, NsatClauseId id, NsatBudget *budget)
+static Clause **find_derived(const NsatVerifier *v, NsatClauseId id, NsatBudget *budget)
 {
-    if (!id || !v->capacity) return NULL;
+    if (id <= v->originals || !v->capacity) return NULL;
     size_t i = hash(id) & (v->capacity - 1);
     while (!budget || nsat_work(budget, 1)) {
-        ClauseEntry *e = &v->table[i];
-        if (!e->id) return NULL;
-        if (e->id == id) return e->clause ? e : NULL;
+        Clause **slot = &v->table[i];
+        if (!*slot) return NULL;
+        if (*slot != &deleted && (*slot)->id == id) return slot;
         i = (i + 1) & (v->capacity - 1);
     }
     return NULL;
 }
 
-static bool insert(NsatBudget *budget, ClauseEntry *table, size_t capacity,
-                   ClauseEntry entry, size_t *occupied)
+static Clause *lookup(const NsatVerifier *v, NsatClauseId id, NsatBudget *budget)
 {
-    size_t i = hash(entry.id) & (capacity - 1);
+    if (!id) return NULL;
+    if (id <= v->originals) {
+        if (budget && !nsat_work(budget, 1)) return NULL;
+        return v->loaded[id - 1];
+    }
+    Clause **slot = find_derived(v, id, budget);
+    return slot ? *slot : NULL;
+}
+
+static bool insert(NsatBudget *budget, Clause **table, size_t capacity,
+                   Clause *clause, size_t *occupied)
+{
+    size_t i = hash(clause->id) & (capacity - 1);
     while (nsat_work(budget, 1)) {
-        if (!table[i].clause) {
-            if (!table[i].id) ++*occupied;
-            table[i] = entry;
+        if (!table[i] || table[i] == &deleted) {
+            if (!table[i]) ++*occupied;
+            table[i] = clause;
             return true;
         }
         i = (i + 1) & (capacity - 1);
@@ -64,13 +81,14 @@ static bool insert(NsatBudget *budget, ClauseEntry *table, size_t capacity,
 static bool rebuild(NsatVerifier *v, size_t capacity)
 {
     NsatBudget *b = &v->budget;
-    ClauseEntry *table = nsat_alloc(b, capacity, sizeof(*table));
+    Clause **table = nsat_alloc(b, capacity, sizeof(*table));
     if (!table) return false;
     size_t occupied = 0;
     if (!nsat_copy(b, table, NULL, capacity * sizeof(*table))) goto fail;
     for (size_t i = 0; i < v->capacity; ++i) {
         if (!nsat_work(b, 1)) goto fail;
-        if (v->table[i].clause && !insert(b, table, capacity, v->table[i], &occupied))
+        Clause *clause = v->table[i];
+        if (clause && clause != &deleted && !insert(b, table, capacity, clause, &occupied))
             goto fail;
     }
     nsat_free(b, v->table, v->capacity * sizeof(*v->table));
@@ -84,31 +102,70 @@ fail:
     return false;
 }
 
+/* Make room for this many originals in one step. The count is a sizing
+ * hint: loading more only resumes the ordinary doubling. */
+static bool reserve_originals(NsatVerifier *v, size_t count)
+{
+    NsatBudget *b = &v->budget;
+    if (count <= v->loaded_capacity) return true;
+    Clause **loaded = nsat_alloc(b, count, sizeof(*loaded));
+    if (!loaded) return false;
+    if (!nsat_copy(b, loaded, v->loaded, (size_t)v->originals * sizeof(*loaded))) {
+        nsat_free(b, loaded, count * sizeof(*loaded));
+        return false;
+    }
+    nsat_free(b, v->loaded, v->loaded_capacity * sizeof(*loaded));
+    v->loaded = loaded;
+    v->loaded_capacity = count;
+    return true;
+}
+
+static bool reserve_derived(NsatVerifier *v)
+{
+    if (v->capacity && v->occupied < v->capacity / 2) return true;
+    size_t capacity = v->capacity ? v->capacity : 16;
+    if (v->derived >= capacity / 2) {
+        if (!nsat_mul(capacity, 2, &capacity))
+            return nsat_stop(&v->budget, NSAT_ERROR, NSAT_STOP_INPUT);
+    }
+    return rebuild(v, capacity);
+}
+
 static bool save(NsatVerifier *v, NsatClauseId id, const int *lits, size_t count)
 {
     NsatBudget *b = &v->budget;
-    if (!v->capacity || v->occupied >= v->capacity / 2) {
-        size_t capacity = v->capacity ? v->capacity : 16;
-        if (v->live >= capacity / 2) {
-            if (!nsat_mul(capacity, 2, &capacity))
+    const bool original = v->phase == LOADING;
+    if (original) {
+        if (v->originals == v->loaded_capacity) {
+            size_t capacity = 8;
+            if (v->loaded_capacity && !nsat_mul(v->loaded_capacity, 2, &capacity))
                 return nsat_stop(b, NSAT_ERROR, NSAT_STOP_INPUT);
+            if (!reserve_originals(v, capacity)) return false;
         }
-        if (!rebuild(v, capacity)) return false;
+    } else if (!reserve_derived(v)) {
+        return false;
     }
     if (count > (SIZE_MAX - sizeof(Clause)) / sizeof(int))
         return nsat_stop(b, NSAT_ERROR, NSAT_STOP_INPUT);
     size_t bytes = sizeof(Clause) + count * sizeof(int);
     Clause *clause = nsat_alloc(b, bytes, 1);
     if (!clause) return false;
+    clause->id = id;
     clause->count = count;
     clause->target_bound = false;
     if (!nsat_copy(b, clause->lits, lits, count * sizeof(int)) ||
         !nsat_poll(b) ||
-        !insert(b, v->table, v->capacity, (ClauseEntry){id, clause}, &v->occupied)) {
+        (!original && !insert(b, v->table, v->capacity, clause, &v->occupied))) {
         nsat_free(b, clause, bytes);
         return false;
     }
-    ++v->live;
+    if (original) {
+        v->loaded[id - 1] = clause;
+        v->loaded_literals += count;
+        v->original_words = nsat_clause_storage_capacity(v->original_words, v->loaded_literals);
+    } else {
+        ++v->derived;
+    }
     v->last_id = id;
     return true;
 }
@@ -205,16 +262,15 @@ NsatStatus nsat_verify_derive(NsatVerifier *v, NsatClauseId id,
     if (!v) return NSAT_ERROR;
     NsatBudget *b = &v->budget;
     if (!require_phase(v, SEALED)) return b->status;
-    if (id <= v->last_id || !hints || !hint_count || hint_count > v->live) {
+    if (id <= v->last_id || !hints || !hint_count || (hint_count > v->derived && hint_count - v->derived > v->originals)) {
         nsat_stop(b, NSAT_ERROR, NSAT_STOP_PROOF);
         return b->status;
     }
     if (!assume_false(v, lits, count)) return b->status;
 
     for (size_t h = 0; h < hint_count; ++h) {
-        ClauseEntry *entry = lookup(v, hints[h], b);
-        if (!entry) goto invalid;
-        const Clause *clause = entry->clause;
+        const Clause *clause = lookup(v, hints[h], b);
+        if (!clause) goto invalid;
         int unit = 0;
         for (size_t i = 0; i < clause->count; ++i) {
             if (!nsat_work(b, 1)) return b->status;
@@ -242,17 +298,17 @@ NsatStatus nsat_verify_delete(NsatVerifier *v, NsatClauseId id)
     if (!v) return NSAT_ERROR;
     NsatBudget *b = &v->budget;
     if (!require_phase(v, SEALED)) return b->status;
-    ClauseEntry *entry = id > v->originals ? lookup(v, id, b) : NULL;
-    if (!entry || entry->clause->target_bound) {
+    Clause **slot = find_derived(v, id, b);
+    if (!slot || (*slot)->target_bound) {
         nsat_stop(b, NSAT_ERROR, NSAT_STOP_PROOF);
         return b->status;
     }
     if (!nsat_poll(b)) return b->status;
-    nsat_free(b, entry->clause, sizeof(Clause) + entry->clause->count * sizeof(int));
-    entry->clause = NULL;
-    --v->live;
+    nsat_free(b, *slot, sizeof(Clause) + (*slot)->count * sizeof(int));
+    *slot = &deleted;
+    --v->derived;
     ++b->stats.clauses_deleted;
-    if (v->capacity > 16 && v->live <= v->capacity / 8)
+    if (v->capacity > 16 && v->derived <= v->capacity / 8)
         rebuild(v, v->capacity / 2);
     return b->status;
 }
@@ -261,8 +317,8 @@ NsatStatus nsat_verify_conclude_unsat(NsatVerifier *v, NsatClauseId id)
 {
     if (!v) return NSAT_ERROR;
     if (!require_phase(v, SEALED)) return v->budget.status;
-    ClauseEntry *entry = lookup(v, id, &v->budget);
-    if (!entry || entry->clause->count)
+    const Clause *clause = lookup(v, id, &v->budget);
+    if (!clause || clause->count)
         nsat_stop(&v->budget, NSAT_ERROR, NSAT_STOP_PROOF);
     if (!nsat_poll(&v->budget)) return v->budget.status;
     v->phase = CONCLUDED;
@@ -282,15 +338,17 @@ NsatStatus nsat_verify_conclude_sat(NsatVerifier *v, const int *model, size_t co
         if (!var || v->values[var]) goto invalid;
         assign(v, var, lit > 0 ? 1 : -1);
     }
-    for (size_t i = 0; i < v->capacity; ++i) {
+    /* Every original, then each target unit among the derived clauses. */
+    const size_t originals = (size_t)v->originals;
+    for (size_t i = 0; i < originals + v->capacity; ++i) {
         if (!nsat_work(b, 1)) return b->status;
-        ClauseEntry entry = v->table[i];
-        if (!entry.clause || (entry.id > v->originals && !entry.clause->target_bound))
+        const Clause *clause = i < originals ? v->loaded[i] : v->table[i - originals];
+        if (!clause || clause == &deleted || (i >= originals && !clause->target_bound))
             continue;
         bool satisfied = false;
-        for (size_t j = 0; j < entry.clause->count; ++j) {
+        for (size_t j = 0; j < clause->count; ++j) {
             if (!nsat_work(b, 1)) return b->status;
-            int lit = entry.clause->lits[j];
+            int lit = clause->lits[j];
             if ((lit > 0 ? v->values[lit] : -v->values[-lit]) > 0) {
                 satisfied = true;
                 break;
@@ -322,12 +380,12 @@ NsatStatus nsat_verify_tighten_cover(NsatVerifier *v, size_t target,
     int unit = -(v->variables - (int)v->cover_slots + 1 + (int)target);
     NsatClauseId next = v->last_id + 1;
     if (!save(v, next, &unit, 1)) return b->status;
-    ClauseEntry *entry = lookup(v, next, b);
-    if (!entry) {
+    Clause *clause = lookup(v, next, b);
+    if (!clause) {
         nsat_stop(b, NSAT_ERROR, NSAT_STOP_STATE);
         return b->status;
     }
-    entry->clause->target_bound = true;
+    clause->target_bound = true;
     v->cover_target = target;
     v->phase = SEALED;
     *id = next;
@@ -342,20 +400,33 @@ NsatStats nsat_verify_stats(const NsatVerifier *v) { return v->budget.stats; }
 int nsat_verify_variables(const NsatVerifier *v) { return v->variables; }
 NsatClauseId nsat_verify_original_count(const NsatVerifier *v) { return v->originals; }
 
+bool nsat_verify_original_storage(const NsatVerifier *v, size_t *clauses, size_t *words)
+{
+    if (!v || !clauses || !words || v->phase != SEALED || v->started ||
+        v->last_id != v->originals || v->budget.status != NSAT_OK) return false;
+    *clauses = (size_t)v->originals;
+    *words = v->original_words;
+    return true;
+}
+
 bool nsat_verify_clause(const NsatVerifier *v, NsatClauseId id, const int **lits,
                         size_t *count)
 {
-    ClauseEntry *entry = v->budget.status == NSAT_OK ? lookup(v, id, NULL) : NULL;
-    if (!entry || !lits || !count) return false;
-    *lits = entry->clause->lits;
-    *count = entry->clause->count;
+    const Clause *clause = v->budget.status == NSAT_OK ? lookup(v, id, NULL) : NULL;
+    if (!clause || !lits || !count) return false;
+    *lits = clause->lits;
+    *count = clause->count;
     return true;
 }
 
 void nsat_verify_destroy(NsatVerifier *v)
 {
     if (!v) return;
-    for (size_t i = 0; i < v->capacity; ++i) free(v->table[i].clause);
+    for (size_t i = 0; i < (size_t)v->originals; ++i) free(v->loaded[i]);
+    free(v->loaded);
+    for (size_t i = 0; i < v->capacity; ++i) {
+        if (v->table[i] != &deleted) free(v->table[i]);
+    }
     free(v->table);
     free(v->values);
     free(v->assigned);
@@ -409,6 +480,18 @@ invalid:
 done:
     nsat_free(b, table, capacity * sizeof(*table));
     return b->status == NSAT_OK;
+}
+
+/* Originals of a cover encoding: slots * (first + (rows - 1) * later + off),
+ * where the arguments count the clauses of one slot for the first ON row,
+ * for each later ON row, and for the OFF block. Zero when it does not fit. */
+static size_t cover_original_count(size_t first, size_t later, size_t rows,
+                                   size_t off, size_t slots) {
+    size_t count;
+    if (!nsat_mul(rows - 1, later, &count) || first > SIZE_MAX - count) return 0;
+    count += first;
+    if (off > SIZE_MAX - count || !nsat_mul(count + off, slots, &count)) return 0;
+    return count;
 }
 
 /* Encoding v1. Number selector pairs by slot/condition, then assignment
@@ -505,6 +588,9 @@ NsatStatus nsat_verify_init_cover(NsatVerifier **out, const int *on, const int *
         if (!nsat_copy(b, v->values, NULL, on_count)) return b->status;
     }
     if (!valid_care(v, on, off, n, on_count, off_count)) return b->status;
+    if (!reserve_originals(v, cover_original_count(n + 3, n + 4, on_count,
+                                                   n + off_count, target)))
+        return b->status;
     size_t width = n > target ? n : target;
     int *scratch = nsat_alloc(b, width, sizeof(*scratch));
     if (!scratch) return b->status;

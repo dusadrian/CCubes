@@ -85,6 +85,8 @@ size_t nsat_verify_cover_slots(const NsatVerifier *v);
 NsatStats nsat_verify_stats(const NsatVerifier *v);
 int nsat_verify_variables(const NsatVerifier *v);
 NsatClauseId nsat_verify_original_count(const NsatVerifier *v);
+/* Storage needed by a solver loading this sealed checker's originals. */
+bool nsat_verify_original_storage(const NsatVerifier *v, size_t *clauses, size_t *words);
 bool nsat_verify_clause(const NsatVerifier *v, NsatClauseId id,
                         const int **lits, size_t *count);
 void nsat_verify_destroy(NsatVerifier *v);

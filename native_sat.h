@@ -13,18 +13,24 @@ typedef struct {
     /* Optional consecutive variable IDs to branch on before other IDs.
      * They start with a positive decision phase. */
     int priority_first, priority_count;
+    /* Equal-width positive ON-row groups within the priority range.
+     * Zero leaves the ordinary decision order in place. */
+    int row_width;
 } NsatSearchOptions;
 
 typedef struct {
     uint64_t decisions, conflicts, binary_propagations, learned;
     uint64_t minimised_literals, restarts, nonchronological_backjumps;
     uint64_t reductions, deleted, compactions, words_reclaimed, moved;
+    uint64_t row_decisions, row_literal_checks;
 } NsatSearchStats;
 
 /* Initial clause loading and root propagation. A root fixed point carries
  * no SAT conclusion. The solver borrows a sealed checker for propagation.
  * Budget the solver and checker separately at this stage. */
 NsatStatus nsat_init(NsatSolver **out, int variables, NsatLimits limits);
+/* Reserve ordinary-growth capacity using the sealed checker. */
+NsatStatus nsat_reserve_originals(NsatSolver *s, const NsatVerifier *v);
 NsatStatus nsat_add_original(NsatSolver *s, const int *lits, size_t count);
 /* Submit a checked root-level strengthening before propagation or search. */
 NsatStatus nsat_add_root_rup(NsatSolver *s, NsatVerifier *v,

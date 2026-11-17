@@ -4,7 +4,7 @@
 #include "native_sat.h"
 
 #define NSAT_COVER_ENCODING_VERSION 1
-#define NSAT_WORK_VERSION 2
+#define NSAT_WORK_VERSION 3
 
 typedef struct {
     const int *on, *off;
@@ -14,7 +14,8 @@ typedef struct {
 } NsatCoverInput;
 
 typedef enum {
-    NSAT_COVER_BASELINE, NSAT_COVER_GROUPS, NSAT_COVER_ORDERING, NSAT_COVER_COMBINED
+    NSAT_COVER_BASELINE, NSAT_COVER_GROUPS, NSAT_COVER_ORDERING, NSAT_COVER_COMBINED,
+    NSAT_COVER_ANCHORED_ROWS
 } NsatCoverStrengthening;
 
 typedef struct {

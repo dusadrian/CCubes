@@ -17,6 +17,8 @@ typedef struct {
     unsigned random;
     uint64_t intersections;
     size_t order[MAX_ROWS];
+    uint64_t (*graph)[2];
+    bool anchored_rows, active_pairs;
 } Domain;
 
 static bool prepare_masks(const NsatCoverInput *q, Domain *d, uint64_t *masks, size_t words)
@@ -82,9 +84,10 @@ static bool precedes(int a, int b, const int *degree, const int *triangles)
     return triangles[a] > triangles[b];
 }
 
-static void choose_order(Domain *d, size_t p, const uint64_t graph[][2],
+static void choose_order(Domain *d, const NsatCoverInput *q, const uint64_t graph[][2],
                          const int *degree, const int *triangles)
 {
+    const size_t p = q->positives;
     bool taken[MAX_ROWS] = {0};
     uint64_t remaining[2] = {UINT64_MAX, UINT64_MAX};
     size_t anchors = 0;
@@ -103,14 +106,85 @@ static void choose_order(Domain *d, size_t p, const uint64_t graph[][2],
         remaining[1] &= graph[best][1];
     }
     d->stats->anchors = anchors;
+    /* Keep the clique unchanged. On a partial graph, missing edges leave
+     * slots eligible rather than asserting compatibility or incompatibility. */
+    bool rank_slots = d->anchored_rows && anchors > 1 && anchors <= q->target && anchors < p;
+    int compatible[MAX_ROWS];
+    if (rank_slots) {
+        for (size_t r = 0; r < p; ++r) {
+            if (taken[r]) continue;
+            compatible[r] = (int)anchors;
+            for (size_t a = 0; a < anchors; ++a) {
+                if (!nsat_work(&d->budget, 1)) return;
+                if (graph[d->order[a]][r / 64] & (UINT64_C(1) << (r % 64)))
+                    --compatible[r];
+            }
+        }
+    }
     for (size_t at = anchors; at < p; ++at) {
         int best = -1;
         for (size_t r = 0; r < p; ++r) {
             if (!nsat_work(&d->budget, 1)) return;
-            if (!taken[r] && precedes((int)r, best, degree, triangles)) best = (int)r;
+            if (taken[r]) continue;
+            if (best < 0) {
+                best = (int)r;
+            } else if (rank_slots && compatible[r] != compatible[best]) {
+                if (compatible[r] < compatible[best]) best = (int)r;
+            } else if (precedes((int)r, best, degree, triangles)) {
+                best = (int)r;
+            }
         }
         taken[best] = true;
         d->order[at] = (size_t)best;
+    }
+}
+
+/* Earlier anchors occupy their own slots by induction. Only exclude a later
+ * anchor from each earlier anchor's slot; clauses for other slots are not
+ * needed. The first target+1 anchors suffice when the clique exceeds target.
+ * Otherwise retain all known pairs for active-slot filtering. Reconstruct
+ * witnesses after ordering. At most 96*95/2 witnesses are retained. */
+static void retain_ordered_pairs(const NsatCoverInput *q, Domain *d,
+                                const uint64_t *masks, size_t words,
+                                const uint64_t graph[][2])
+{
+    size_t anchors = d->stats->anchors;
+    /* The clique alone already refutes this target. Preserve that small proof. */
+    if (anchors > q->target) d->active_pairs = false;
+    if (anchors > q->target + 1) anchors = q->target + 1;
+    if (anchors < 2) return;
+    d->capacity = anchors * (anchors - 1) / 2;
+    if (d->active_pairs) {
+        d->capacity = q->positives * (q->positives - 1) / 2;
+        d->graph = nsat_alloc(&d->budget, q->positives, sizeof(*d->graph));
+        if (!d->graph || !nsat_copy(&d->budget, d->graph, graph,
+            q->positives * sizeof(*d->graph))) return;
+    }
+    d->groups = nsat_alloc(&d->budget, d->capacity, sizeof(*d->groups));
+    if (!d->groups) return;
+    size_t later = d->active_pairs ? q->positives : anchors;
+    size_t earlier = d->active_pairs ? q->positives - 1 : anchors;
+    for (size_t a = 0; a < earlier; ++a) {
+        size_t first_row = d->order[a];
+        for (size_t b = a + 1; b < later; ++b) {
+            size_t second_row = d->order[b], z = 0;
+            if (b >= anchors) {
+                if (!nsat_work(&d->budget, 1)) return;
+                if (!(graph[first_row][second_row / 64] &
+                    (UINT64_C(1) << (second_row % 64)))) continue;
+            }
+            for (; z < q->negatives; ++z) {
+                if (!nsat_work(&d->budget, words)) return;
+                const uint64_t *first = masks + (first_row * q->negatives + z) * words;
+                const uint64_t *second = masks + (second_row * q->negatives + z) * words;
+                if (!has_common_difference(first, second, NULL, words)) break;
+            }
+            if (z == q->negatives) {
+                nsat_stop(&d->budget, NSAT_ERROR, NSAT_STOP_PROOF);
+                return;
+            }
+            d->groups[d->pairs++] = (ForbiddenGroup){{first_row, second_row}, 2, z};
+        }
     }
 }
 
@@ -172,7 +246,11 @@ static void discover(const NsatCoverInput *q, Domain *d, bool groups, bool order
         }
     }
 ordered:
-    if (ordering && d->budget.status == NSAT_OK) choose_order(d, p, graph, degree, triangles);
+    if (ordering && d->budget.status == NSAT_OK) {
+        choose_order(d, q, graph, degree, triangles);
+        if (d->anchored_rows && d->budget.status == NSAT_OK)
+            retain_ordered_pairs(q, d, masks, words, graph);
+    }
 done:
     nsat_free(&d->budget, masks, cells * sizeof(*masks));
 }
@@ -219,7 +297,37 @@ static NsatStatus add_groups(const NsatCoverInput *q, Domain *d, NsatSolver *s, 
         const int *off = q->off + group.off * q->inputs;
         size_t members[3];
         for (size_t j = 0; j < group.width; ++j) members[j] = position[group.rows[j]];
-        for (size_t t = 0; t < q->target; ++t) {
+        size_t first_slot = 0, slots = q->target;
+        bool non_anchor_pair = false;
+        if (d->anchored_rows) {
+            /* The earlier anchors occupy their own slots by induction.
+             * Non-anchor pairs need only exist in still-eligible slots. */
+            size_t first = members[0];
+            non_anchor_pair = d->active_pairs && first >= d->stats->anchors;
+            slots = first + 1;
+            if (non_anchor_pair) {
+                if (slots > q->target) slots = q->target;
+            } else {
+                first_slot = first;
+            }
+        }
+        for (size_t t = first_slot; t < slots; ++t) {
+            if (non_anchor_pair) {
+                if (!nsat_work(&d->budget, 1)) {
+                    status = d->budget.status;
+                    goto done;
+                }
+                if (t < d->stats->anchors) {
+                    const uint64_t *adjacent = d->graph[source_row(q, t)];
+                    unsigned r = group.rows[0], u = group.rows[1];
+                    if ((adjacent[r / 64] & (UINT64_C(1) << (r % 64))) ||
+                        (adjacent[u / 64] & (UINT64_C(1) << (u % 64)))) continue;
+                }
+                if (d->stats->pairs == MAX_LEMMAS) {
+                    d->stats->discovery_capped = true;
+                    goto done;
+                }
+            }
             int clause[3];
             for (size_t j = 0; j < group.width; ++j) clause[j] = -assigned(q, members[j], t);
             for (size_t i = 0; i < q->inputs; ++i) {
@@ -285,9 +393,11 @@ NsatStatus nsat_cover_solve(const NsatCoverInput *input, NsatCoverStrengthening 
     *stop = NSAT_STOP_NONE;
     *stats = (NsatCoverDomainStats){0};
     NsatCoverInput q = *input;
-    Domain d = {.stats = stats, .budget = {.limits = limits}};
+    const bool anchored_rows = mode == NSAT_COVER_ANCHORED_ROWS;
+    Domain d = {.stats = stats, .budget = {.limits = limits},
+                .anchored_rows = anchored_rows, .active_pairs = anchored_rows};
     bool groups = mode == NSAT_COVER_GROUPS || mode == NSAT_COVER_COMBINED;
-    bool ordering = mode == NSAT_COVER_ORDERING || mode == NSAT_COVER_COMBINED;
+    bool ordering = mode == NSAT_COVER_ORDERING || mode == NSAT_COVER_COMBINED || anchored_rows;
     const size_t max = (size_t)INT_MAX / 2;
     bool eligible = q.on && q.off && q.inputs &&
         q.positives && q.positives <= MAX_ROWS && q.negatives && q.negatives <= MAX_OFF &&
@@ -315,14 +425,17 @@ NsatStatus nsat_cover_solve(const NsatCoverInput *input, NsatCoverStrengthening 
         q.positives, q.negatives, q.target, q.row_order, q.order_count, limits);
     if (status == NSAT_OK) status = nsat_cover_load_solver(s, &q, *v, limits, stop);
     if (status == NSAT_OK && ordering && eligible) status = add_staircase(&q, &d, *s, *v);
-    if (status == NSAT_OK && groups && eligible) status = add_groups(&q, &d, *s, *v);
+    if (status == NSAT_OK && (groups || anchored_rows) && eligible)
+        status = add_groups(&q, &d, *s, *v);
     nsat_free(&d.budget, d.groups, d.capacity * sizeof(*d.groups));
+    nsat_free(&d.budget, d.graph, q.positives * sizeof(*d.graph));
     stats->prep_work = d.budget.stats.work;
     if (status == NSAT_OK) {
         NsatSearchOptions options = {0};
         if (ordering && eligible) {
             options.priority_first = assigned(&q, 0, 0);
             options.priority_count = (int)(q.positives * q.target);
+            if (anchored_rows) options.row_width = (int)q.target;
         }
         status = nsat_solve(*s, *v, options);
     }

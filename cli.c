@@ -68,7 +68,7 @@ static const Option option_table[] = {
     {"systematic-certification-work", NULL, true, SYSTEMATIC_WORK, "combined weighted and SAT work per output, including checking (0 disables the cap)"},
     {"systematic-weighted-work", NULL, true, SYSTEMATIC_WEIGHTED_WORK, "weighted stage work per output (0 disables the cap)"},
     {"systematic-verifier-work", NULL, true, SYSTEMATIC_VERIFIER_WORK, "separate weighted checking work per output; enables a one-second checker clock by default (0 disables the work cap)"},
-    {"systematic-strengthening", NULL, true, SYSTEMATIC_STRENGTHENING, "experimental cover SAT strengthening: none (default), groups, ordering, or combined"},
+    {"systematic-strengthening", NULL, true, SYSTEMATIC_STRENGTHENING, "cover SAT strengthening: anchored-rows (default), none, groups, ordering, or combined"},
     {"systematic-descent", NULL, true, SYSTEMATIC_DESCENT, "target descent: fresh (default) or experimental reuse"},
 };
 
@@ -188,6 +188,7 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
             else if (!strcmp(value, "groups")) o->systematic_strengthening = NSAT_COVER_GROUPS;
             else if (!strcmp(value, "ordering")) o->systematic_strengthening = NSAT_COVER_ORDERING;
             else if (!strcmp(value, "combined")) o->systematic_strengthening = NSAT_COVER_COMBINED;
+            else if (!strcmp(value, "anchored-rows")) o->systematic_strengthening = NSAT_COVER_ANCHORED_ROWS;
             else return false;
             o->systematic_strengthening_explicit = true;
             return true;
@@ -226,6 +227,7 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
 
 int cli_parse(int argc, char *const argv[], CliOptions *o, FILE *err) {
     *o = (CliOptions){.bits_per_word = 64, .weights = 1, .literal_polish = 1,
+                     .systematic_strengthening = NSAT_COVER_ANCHORED_ROWS,
                      .systematic_budget = {.weighted_seconds = 10.0, .sat_seconds = 2.0,
                                            .verifier_seconds = 1.0}};
     ccubes_options_reset();

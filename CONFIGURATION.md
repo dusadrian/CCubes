@@ -53,7 +53,7 @@ Use `--certify-systematic` to request a proof and `--certification-time-limit SE
 | `--systematic-weighted-work` | Caps weighted stage work. Zero disables the cap. |
 | `--systematic-verifier-seconds`, `--systematic-verifier-work` | Enable a separate checker budget and pause the weighted search clock while checking. The default checker time is one second when enabled. An explicit work limit of zero removes the checker-specific cap. Any combined work cap still applies. |
 | `--systematic-certification-work` | Caps combined weighted and SAT work. Zero disables the cap. With SAT enabled, the weighted stage gets at most half of the remaining work. |
-| `--systematic-strengthening`, `--systematic-descent` | Select experimental SAT profiles (`none`, `groups`, `ordering`, `combined`) and target descent modes (`fresh`, `reuse`). |
+| `--systematic-strengthening`, `--systematic-descent` | SAT profiles use `anchored-rows` by default. Other profiles are `none`, `groups`, `ordering`, and `combined`. Target descent uses `fresh` by default or `reuse`. |
 
 The individual stage time and work limits require stage timing. The combined work cap and the experimental SAT controls can accompany either timing mode.
 
