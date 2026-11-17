@@ -130,6 +130,9 @@ void lagrangian_reset_stats(void) {
     lagr_last_stats.polish_skipped_targets = 0;
     lagr_last_stats.polish_searches = 0;
     lagr_last_stats.polish_nodes = 0;
+    lagr_last_stats.polish_extra_nodes = 0;
+    lagr_last_stats.polish_workers = 0;
+    lagr_last_stats.polish_active_workers = 0;
     lagr_last_stats.polish_warm_nodes = 0;
     lagr_last_stats.polish_warm_work = 0;
     lagr_last_stats.polish_warm_peak_bytes = 0;
@@ -2516,6 +2519,8 @@ typedef struct {
     int base_covered;
     PolishMask base_mask;
     struct PolishSearch *workers;
+    struct PolishSearch *ordered;
+    bool incomplete, exhausted;
 } PolishParallel;
 
 typedef struct PolishSearch {
@@ -2552,6 +2557,10 @@ typedef struct PolishSearch {
     PolishMask full_mask;         /* all rows covered */
     int mask_words;               /* words of col_mask/full_mask actually in use */
     int threads;
+    int team_workers;
+    int active_workers;
+    long extra_limit, extra_nodes;
+    atomic_bool *cancel;         /* shared decision for the ordered worker */
     int node_credit;              /* unused nodes in the worker's reservation, or -1 */
     PolishParallel *parallel;    /* shared budget and result for parallel decision search */
 } PolishSearch;
@@ -2601,8 +2610,8 @@ static int pool_add_if_new(
 
 static bool polish_record_cover(PolishSearch *search, int depth) {
     /* The first worker gets the output buffer. The caller reads it after join. */
-    if (search->parallel &&
-        atomic_exchange_explicit(&search->parallel->stop, true, memory_order_relaxed)) {
+    atomic_bool *stop = search->parallel ? &search->parallel->stop : search->cancel;
+    if (stop && atomic_exchange_explicit(stop, true, memory_order_relaxed)) {
         return true;
     }
 
@@ -2990,9 +2999,28 @@ static void polish_branch_worker(
     (void)stride;
     (void)worker_count;
     PolishParallel *parallel = data;
+    /* The ordered worker runs the original DFS without donating subtrees.
+       Either search can end the other once it decides the target. */
+    if (parallel->ordered && worker_id == 0) {
+        PolishSearch *ordered = parallel->ordered;
+        if (!polish_deadline_reached(ordered)) {
+            polish_search_children(ordered, parallel->base_depth, parallel->base_covered,
+                                   parallel->base_mask, parallel->root_candidates,
+                                   parallel->root_count, parallel->root_child_row_start);
+        }
+        polish_queue_lock(parallel);
+        if (!ordered->aborted && !atomic_load_explicit(&parallel->stop, memory_order_relaxed)) {
+            parallel->exhausted = true;
+            atomic_store_explicit(&parallel->stop, true, memory_order_relaxed);
+        }
+        polish_queue_wake(parallel);
+        polish_queue_unlock(parallel);
+        return;
+    }
+    if (parallel->ordered) --worker_id;
     PolishSearch *search = &parallel->workers[worker_id];
 
-    /* Worker zero owns the already-expanded node that started the team. */
+    /* The first sharing worker owns the node that started the team. */
     bool root = worker_id == 0;
     polish_queue_lock(parallel);
     while (!atomic_load_explicit(&parallel->stop, memory_order_relaxed)) {
@@ -3030,6 +3058,13 @@ static void polish_branch_worker(
         polish_queue_lock(parallel);
         polish_return_node_credit(search);
         --parallel->active;
+        parallel->incomplete |= search->aborted;
+        if (parallel->ordered && !parallel->active && !parallel->incomplete &&
+            !atomic_load_explicit(&parallel->queued, memory_order_relaxed) &&
+            !atomic_load_explicit(&parallel->stop, memory_order_relaxed)) {
+            parallel->exhausted = true;
+            atomic_store_explicit(&parallel->stop, true, memory_order_relaxed);
+        }
         if (!parallel->active || atomic_load_explicit(&parallel->stop, memory_order_relaxed)) {
             polish_queue_wake(parallel);
         }
@@ -3046,9 +3081,11 @@ static bool polish_parallel_branches(
     int count,
     int row_start
 ) {
+    const bool preserve_order = search->extra_limit > 0;
     int threads = search->threads;
     int path_stride = search->target - depth;
-    if (threads < 2 || count < 2 || path_stride <= 1) return false;
+    const int ordered_workers = preserve_order ? 1 : 0;
+    if (threads < 2 + ordered_workers || count < 2 || path_stride <= 1) return false;
 
     /* Bound worker scratch and allow one queued path per additional worker. */
     uint64_t candidate_entries = (uint64_t)search->target * search->max_row_degree;
@@ -3059,10 +3096,10 @@ static bool polish_parallel_branches(
         + sizeof(PolishSearch);
     uint64_t scratch_threads = POLISH_PARALLEL_SCRATCH_BYTES / worker_bytes;
     if ((uint64_t)threads > scratch_threads) threads = (int)scratch_threads;
-    if (threads < 2) return false;
+    if (threads < 2 + ordered_workers) return false;
 
     PolishParallel parallel = {
-        .remaining_nodes = search->node_limit - search->nodes,
+        .remaining_nodes = preserve_order ? search->extra_limit : search->node_limit - search->nodes,
         .active = 1,
         .path_stride = path_stride,
         .root_candidates = candidates,
@@ -3071,38 +3108,47 @@ static bool polish_parallel_branches(
         .base_depth = depth,
         .base_covered = covered,
         .base_mask = covered_mask,
-        .workers = malloc((size_t)threads * sizeof(PolishSearch))
+        .workers = malloc((size_t)(threads - ordered_workers) * sizeof(PolishSearch))
     };
     if (!parallel.workers) return false;
     atomic_init(&parallel.queued, 0);
     atomic_init(&parallel.idle, 0);
     atomic_init(&parallel.stop, false);
 
+    PolishSearch ordered;
     int allocated = 0;
     while (allocated < threads) {
-        PolishSearch *worker = &parallel.workers[allocated];
+        const bool primary = preserve_order && allocated == 0;
+        PolishSearch *worker = primary ? &ordered : &parallel.workers[allocated - ordered_workers];
         *worker = *search;
-        worker->parallel = &parallel;
+        worker->parallel = primary ? NULL : &parallel;
+        worker->cancel = primary ? &parallel.stop : NULL;
         worker->nodes = 0;
         worker->node_credit = -1;
+        if (primary) worker->node_limit -= search->nodes;
+        else if (preserve_order) worker->node_limit = search->extra_limit;
         if (!polish_alloc_scratch(worker)) {
             polish_free_scratch(worker);
             break;
         }
         memcpy(worker->coverCount, search->coverCount, (size_t)search->rows * sizeof(int));
         memcpy(worker->chosen, search->chosen, (size_t)depth * sizeof(int));
+        if (primary) parallel.ordered = worker;
         ++allocated;
     }
 
     bool ran = false;
-    if (allocated >= 2) {
-        parallel.capacity = allocated - 1;
+    if (allocated >= 2 + ordered_workers) {
+        parallel.capacity = allocated - 1 - ordered_workers;
         parallel.task_depths = malloc((size_t)parallel.capacity * sizeof(int));
         parallel.task_paths = malloc((size_t)parallel.capacity * path_stride * sizeof(int));
         if (parallel.task_depths && parallel.task_paths && polish_queue_init(&parallel)) {
-            ran = ccubes_parallel_for(
-                0, (uint64_t)allocated, allocated, false, polish_branch_worker, &parallel
+            int actual_workers = 0;
+            ran = ccubes_parallel_for_counted(
+                0, (uint64_t)allocated, allocated, false, polish_branch_worker, &parallel,
+                &actual_workers
             );
+            if (ran) search->team_workers = actual_workers;
             polish_queue_destroy(&parallel);
         }
         free(parallel.task_paths);
@@ -3110,13 +3156,17 @@ static bool polish_parallel_branches(
     }
 
     for (int i = 0; i < allocated; ++i) {
-        PolishSearch *worker = &parallel.workers[i];
-        search->nodes += worker->nodes;
+        const bool primary = preserve_order && i == 0;
+        PolishSearch *worker = primary ? &ordered : &parallel.workers[i - ordered_workers];
+        if (preserve_order && !primary) search->extra_nodes += worker->nodes;
+        else search->nodes += worker->nodes;
+        if (worker->nodes || worker->found) ++search->active_workers;
         search->found += worker->found;
         search->aborted |= worker->aborted;
         polish_free_scratch(worker);
     }
-    if (search->found) search->aborted = 0;
+    if (ran && preserve_order) search->aborted = !parallel.exhausted && !search->found;
+    else if (search->found) search->aborted = 0;
     free(parallel.workers);
     return ran;
 }
@@ -3128,8 +3178,8 @@ static bool polish_search_rec(
     PolishMask covered_mask,
     int row_start
 ) {
-    if (search->parallel &&
-        atomic_load_explicit(&search->parallel->stop, memory_order_relaxed)) return true;
+    const atomic_bool *stop = search->parallel ? &search->parallel->stop : search->cancel;
+    if (stop && atomic_load_explicit(stop, memory_order_relaxed)) return true;
 
     bool fully_covered = covered >= search->rows;
     if (search->mask_words) {
@@ -3141,7 +3191,9 @@ static bool polish_search_rec(
             }
         }
     }
-    if (fully_covered) return polish_record_cover(search, depth);
+    if (fully_covered) {
+        return polish_deadline_reached(search) || polish_record_cover(search, depth);
+    }
     if (depth >= search->target) return false;
     if (!polish_visit_node(search)) return true;
 
@@ -3194,7 +3246,8 @@ static int lagr_bounded_cover_search(
     int *aborted_out,
     long *nodes_out,
     uint64_t deadline_nanoseconds,
-    int threads
+    int threads,
+    long extra_limit
 ) {
     if (aborted_out) *aborted_out = 0;
     if (nodes_out) *nodes_out = 0;
@@ -3254,6 +3307,7 @@ static int lagr_bounded_cover_search(
         .max_cover_static = max_cover_static,
         .col_mask = col_mask,
         .mask_words = mask_words,
+        .team_workers = 1,
         .threads = want == 1 && free_slots <= POLISH_PARALLEL_MAX_DEPTH
             ? threads : 1
     };
@@ -3303,7 +3357,37 @@ static int lagr_bounded_cover_search(
             ? UINT64_MAX
             : (UINT64_C(1) << rows_left) - 1u;
     }
+    /* Keep cheap targets serial. If the probe stops early, replay from the
+       root with the original allowance protected for one ordered worker.
+       The probe and the other workers use a separate shared allowance. */
+    const bool probe = extra_limit > 0 && search.threads >= 3 && free_slots > 1 &&
+        max_row_degree > 1 && node_limit > POLISH_NODE_BATCH &&
+        extra_limit / POLISH_NODE_BATCH >= 3;
+    if (extra_limit > 0) {
+        search.threads = 1;
+        if (probe) search.node_limit = POLISH_NODE_BATCH;
+    }
     polish_search_rec(&search, 0, covered, covered_mask, 0);
+    if (probe && search.aborted && search.nodes == POLISH_NODE_BATCH &&
+        !polish_deadline_reached(&search)) {
+        search.aborted = 0;
+        search.node_limit = node_limit;
+        search.extra_nodes = search.nodes;
+        search.extra_limit = extra_limit - search.nodes;
+        search.nodes = 0;
+        long team_limit = 1 + search.extra_limit / POLISH_NODE_BATCH;
+        search.threads = team_limit < threads ? (int)team_limit : threads;
+        polish_search_rec(&search, 0, covered, covered_mask, 0);
+    }
+
+    if (want == 1) {
+        lagr_last_stats.polish_extra_nodes += search.extra_nodes;
+        if (!search.active_workers && (search.nodes || search.found)) search.active_workers = 1;
+        if (search.team_workers > lagr_last_stats.polish_workers)
+            lagr_last_stats.polish_workers = search.team_workers;
+        if (search.active_workers > lagr_last_stats.polish_active_workers)
+            lagr_last_stats.polish_active_workers = search.active_workers;
+    }
 
     if (aborted_out) *aborted_out = search.aborted;
     if (nodes_out) *nodes_out = search.nodes;
@@ -3497,7 +3581,8 @@ static void lagr_bounded_finish(
     const PIChartView *polish_chart,
     size_t warm_memory,
     unsigned warm_workers,
-    int bounded_workers
+    int bounded_workers,
+    bool adaptive_finish
 ) {
     if (!solution || !solmin || *solmin <= 0) return;
 
@@ -3641,7 +3726,9 @@ static void lagr_bounded_finish(
             int aborted = 0;
             long visited_nodes = 0;
             long remaining_nodes = node_limit;
-            if (polish_chart) remaining_nodes -= lagr_last_stats.polish_nodes;
+            if (polish_chart || adaptive_finish) remaining_nodes -= lagr_last_stats.polish_nodes;
+            const long extra_nodes = adaptive_finish ?
+                node_limit - lagr_last_stats.polish_extra_nodes : 0;
             if (remaining_nodes <= 0) {
                 lagr_last_stats.polish_stop_reason = LAGR_POLISH_ABORTED;
                 lagr_free_core(core_covering, core_counts, rows);
@@ -3716,7 +3803,8 @@ static void lagr_bounded_finish(
                     &aborted,
                     &ordinary_nodes,
                     deadline_nanoseconds,
-                    bounded_workers
+                    adaptive_finish && extra_nodes <= 0 ? 1 : bounded_workers,
+                    extra_nodes
                 );
                 visited_nodes += ordinary_nodes;
             } else if (!decided) {
@@ -3847,7 +3935,8 @@ static void lagr_bounded_finish(
                 &aborted,
                 NULL,
                 deadline_nanoseconds,
-                1
+                1,
+                0
             );
 
             lagr_free_core(core_covering, core_counts, rows);
@@ -4013,6 +4102,7 @@ typedef struct {
     int reset_on_continuous_improvement;
     const PIChartView *polish_chart;
     int bounded_workers;
+    bool adaptive_finish;
 } LagrangianConfig;
 
 #define LAGR_PORTFOLIO_PROFILE_COUNT 6
@@ -4064,6 +4154,7 @@ static void lagr_config_for_effort(LagrangianConfig *cfg, int effort_level) {
     cfg->reset_on_continuous_improvement = 0;
     cfg->polish_chart = NULL;
     cfg->bounded_workers = 1;
+    cfg->adaptive_finish = effort_level == 2;
 
     if (effort_level == 1) {
         cfg->max_iter = 1000;
@@ -4208,6 +4299,11 @@ static void lagr_merge_polish_stats(
         additional->polish_skipped_targets;
     aggregate->polish_searches += additional->polish_searches;
     aggregate->polish_nodes += additional->polish_nodes;
+    aggregate->polish_extra_nodes += additional->polish_extra_nodes;
+    if (additional->polish_workers > aggregate->polish_workers)
+        aggregate->polish_workers = additional->polish_workers;
+    if (additional->polish_active_workers > aggregate->polish_active_workers)
+        aggregate->polish_active_workers = additional->polish_active_workers;
     aggregate->polish_warm_nodes += additional->polish_warm_nodes;
     aggregate->polish_warm_work += additional->polish_warm_work;
     aggregate->polish_warm_fallbacks += additional->polish_warm_fallbacks;
@@ -5645,7 +5741,8 @@ static void solve_scp_lagrangian_config(
             cfg->polish_chart,
             (size_t)(cfg->polish_node_limit <= 80000 ? 32 : 128) * 1024 * 1024,
             (unsigned)ccubes_thread_count(),
-            cfg->bounded_workers
+            cfg->bounded_workers,
+            cfg->adaptive_finish
         );
 
         if ((double)best_sol_size < bestUB - EPS) {
@@ -5870,7 +5967,8 @@ static void solve_scp_lagrangian_with_deadline(
 
     LagrangianConfig baseline;
     lagr_config_for_effort(&baseline, effort_level);
-    baseline.bounded_workers = bounded_workers;
+    baseline.adaptive_finish = baseline.adaptive_finish && !native_ipc;
+    baseline.bounded_workers = baseline.adaptive_finish ? ccubes_thread_count() : bounded_workers;
     if (native_ipc) baseline.polish_chart = chart;
     lagr_apply_certification_policy(
         &baseline,
@@ -6215,6 +6313,9 @@ static void solve_scp_lagrangian_with_deadline(
             merged_stats.polish_searches;
         lagr_last_stats.polish_nodes =
             merged_stats.polish_nodes;
+        lagr_last_stats.polish_extra_nodes = merged_stats.polish_extra_nodes;
+        lagr_last_stats.polish_workers = merged_stats.polish_workers;
+        lagr_last_stats.polish_active_workers = merged_stats.polish_active_workers;
         lagr_last_stats.polish_warm_nodes = merged_stats.polish_warm_nodes;
         lagr_last_stats.polish_warm_work = merged_stats.polish_warm_work;
         lagr_last_stats.polish_warm_peak_bytes = merged_stats.polish_warm_peak_bytes;
@@ -7414,7 +7515,9 @@ void solve_scp_lagrangian_pool(
             &pool_count,
             &pool_min_len,
             norm,
-            0, NULL, 0, 0, 1
+            0, NULL, 0, 0,
+            cfg.adaptive_finish ? ccubes_thread_count() : 1,
+            cfg.adaptive_finish
         );
 
         if (*solmin < solmin_before) {

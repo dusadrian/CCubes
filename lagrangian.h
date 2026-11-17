@@ -107,6 +107,9 @@ typedef struct {
     int polish_skipped_targets;
     int polish_searches;
     long polish_nodes;
+    long polish_extra_nodes;    /* Probe and additional team's nodes in adaptive e2. */
+    int polish_workers;         /* Peak team size for the unpriced bounded search. */
+    int polish_active_workers;  /* Peak number that searched nodes or found a cover. */
     uint64_t polish_warm_nodes, polish_warm_work;
     size_t polish_warm_peak_bytes;
     unsigned polish_warm_workers;

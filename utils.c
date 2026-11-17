@@ -197,7 +197,8 @@ void print_hybrid_stats(int output_index) {
             "requested_deflection=%.9g "
             "step=%.9g/%.9g/%.9g contract=%.9g contractions=%d "
             "stabilization=%.9g deflection=%.9g "
-            "restarts=%d\n",
+            "restarts=%d finish_nodes=%ld finish_extra_nodes=%ld finish_workers=%d finish_active_workers=%d "
+            "finish_seconds=%.6f finish_stop=%s\n",
             stats->best_zlb,
             stats->last_zlb,
             stats->iterations,
@@ -236,7 +237,13 @@ void print_hybrid_stats(int output_index) {
             stats->step_contractions,
             stats->stabilization_beta,
             stats->deflection_alpha,
-            stats->restarts
+            stats->restarts,
+            stats->polish_nodes,
+            stats->polish_extra_nodes,
+            stats->polish_workers,
+            stats->polish_active_workers,
+            stats->polish_seconds,
+            lagrangian_polish_stop_reason_name(stats->polish_stop_reason)
         );
     }
 }

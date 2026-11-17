@@ -41,6 +41,8 @@ The parser lives in `cli.c`/`cli.h`. One option registry supplies name matching,
 
 The writer uses checkpoint version 11. The reader accepts versions 8 through 11. When resuming version 8, CCubes replays the interrupted generation level from task zero. Resume restores the saved word width, weights, solver, and pool settings. Supply invocation-specific controls again as needed. Ordinary runs fall back to the bundled hybrid solver when Gurobi is unavailable.
 
+For the ordinary hybrid solver, effort 2 starts each smaller-cover search serially. For hard targets, one worker retains the original search order and node allowance while the others share a separate node allowance of the same size. Both allowances carry across successive targets within each profile. The team needs at least three workers and its size follows `--threads`, the remaining search budget, and worker scratch space. Equal-size pool enumeration runs separately. At debug level 1, `finish_nodes` and `finish_extra_nodes` report the work in the two allowances. `finish_workers` reports the largest team used and `finish_active_workers` counts workers that expanded a node or found a cover in a search. When multiple workers find valid covers, the first one accepted supplies the witness.
+
 ## Systematic certification
 
 Use `--certify-systematic` to request a proof and `--certification-time-limit SECONDS` to set a positive shared deadline for each output after minimization. The shared clock includes validation, pricing, search, and proof checking. Omitting the deadline uses separate stage clocks with defaults of 10 seconds for weighted search and checking and 2 seconds for SAT and checking.
