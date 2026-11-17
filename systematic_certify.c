@@ -195,21 +195,16 @@ static bool ipc_integer_bound(PIstorage *pi, int inputs, int output, int *lower,
                               NsatResources *resources)
 {
     double started = monotonic_seconds();
-    double seconds = budget->weighted_seconds;
+    double seconds = shared_deadline ? *shared_deadline - started : budget->weighted_seconds;
     uint64_t cap = budget->weighted_work;
-    if (shared_deadline) {
-        /* Preserve the default 10:2 split and let SAT use any unspent time. */
-        seconds = (*shared_deadline - started) * (5.0 / 6.0);
-    }
     if (seconds <= 0.0) return false;
     uint64_t shared_cap = 0;
     if (resources->work_limit) {
+        if (resources->work >= resources->work_limit) return false;
         shared_cap = resources->work_limit - resources->work;
-        if (shared_deadline || budget->sat_seconds > 0.0) shared_cap /= 2;
-        if (!shared_cap) return false;
         if (!cap || shared_cap < cap) cap = shared_cap;
     }
-    double integer_deadline = started + seconds;
+    double integer_deadline = shared_deadline ? *shared_deadline : started + seconds;
     NsatResources phase = {.work_limit = budget->separate_verifier ? shared_cap : cap,
         .memory_limit = resources->memory_limit};
     NsatLimits limits = {.shared = &phase};
@@ -407,7 +402,9 @@ static bool systematic_certify_cover(PIstorage *pi, int inputs, int output,
                                       shared ? &deadline : NULL, &resources);
         if (bound.lower > prior_lower) method = "ipc-weighted-integer";
     }
-    if (!certified && (shared ? !expired(&deadline) : budget->sat_seconds > 0.0)) {
+    const bool sat_time = shared ? !expired(&deadline) : budget->sat_seconds > 0.0;
+    const bool work_left = !resources.work_limit || resources.work < resources.work_limit;
+    if (!certified && sat_time && work_left) {
         if (!shared) deadline = monotonic_seconds() + budget->sat_seconds;
         resources.stop = NSAT_STOP_NONE;
         NsatLimits limits = {.poll = expired, .context = &deadline, .shared = &resources};
@@ -441,7 +438,12 @@ static bool systematic_certify_cover(PIstorage *pi, int inputs, int output,
     }
     if (decisive) snprintf(work, sizeof(work), "%" PRIu64, proof_work);
     if (budget->work) snprintf(limit, sizeof(limit), "%" PRIu64, budget->work);
-    const char *stop = !certified && shared && expired(&deadline) ? "deadline" : "na";
+    const char *stop = "na";
+    if (!certified) {
+        if (shared && expired(&deadline)) stop = "deadline";
+        else if ((resources.work_limit && resources.work >= resources.work_limit) ||
+                 resources.stop == NSAT_STOP_WORK) stop = "work-limit";
+    }
     fprintf(stderr, "CCUBES_SYSTEMATIC_CERTIFICATE output=%d scope=scalar cover=%d "
             "status=%s method=%s schema_ver=1 target_k=%s query_id=%s work_used=%s work_limit=%s"
             " lower=%d stop_reason=%s\n",

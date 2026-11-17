@@ -45,7 +45,7 @@ For the ordinary hybrid solver, effort 2 starts each smaller-cover search serial
 
 ## Systematic certification
 
-Use `--certify-systematic` to request a proof and `--certification-time-limit SECONDS` to set a positive shared deadline for each output after minimization. The shared clock includes validation, pricing, search, and proof checking. Omitting the deadline uses separate stage clocks with defaults of 10 seconds for weighted search and checking and 2 seconds for SAT and checking.
+Use `--certify-systematic` to request a proof and `--certification-time-limit SECONDS` to choose how long certification may run for each output after minimization. The shared deadline covers validation, pricing, search, and proof checking. Weighted certification can use all the time left after pricing. SAT runs if a gap, time, and work allowance all remain after weighted certification. With separate stage clocks, weighted search and checking default to 10 seconds and the SAT fallback defaults to 2 seconds per output.
 
 `--checkpoint-after` and `--checkpoint-every` act during ordinary projection. A save-and-exit pauses minimization before certification begins. Reapply the certification options when resuming a checkpoint.
 
@@ -54,7 +54,7 @@ Use `--certify-systematic` to request a proof and `--certification-time-limit SE
 | `--systematic-weighted-seconds`, `--systematic-native-sat-seconds` | Set individual stage times. Zero skips that stage. Setting both to zero runs initial validation and pricing only. |
 | `--systematic-weighted-work` | Caps weighted stage work. Zero disables the cap. |
 | `--systematic-verifier-seconds`, `--systematic-verifier-work` | Enable a separate checker budget and pause the weighted search clock while checking. The default checker time is one second when enabled. An explicit work limit of zero removes the checker-specific cap. Any combined work cap still applies. |
-| `--systematic-certification-work` | Caps combined weighted and SAT work. Zero disables the cap. With SAT enabled, the weighted stage gets at most half of the remaining work. |
+| `--systematic-certification-work` | Caps combined weighted and SAT work. Zero disables the cap. The weighted stage can use all remaining work, subject to any explicit weighted stage limit. |
 | `--systematic-strengthening`, `--systematic-descent` | SAT profiles use `anchored-rows` by default. Other profiles are `none`, `groups`, `ordering`, and `combined`. Target descent uses `fresh` by default or `reuse`. |
 
 The individual stage time and work limits require stage timing. The combined work cap and the experimental SAT controls can accompany either timing mode.
