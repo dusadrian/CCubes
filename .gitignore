@@ -22,13 +22,6 @@
 !examples/
 !examples/**
 
-!tests/
-!tests/*.c
-!tests/*.sh
-!tests/fixtures/
-!tests/fixtures/*.pla
-!tests/fixtures/*.txt
-
 !scripts/
 !scripts/pla_helpers.py
 !scripts/joint_cover.py
@@ -37,3 +30,5 @@
 
 temp/
 proofs/
+
+AGENTS.md
