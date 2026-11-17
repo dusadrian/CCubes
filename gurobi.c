@@ -6,11 +6,20 @@
     SPDX-License-Identifier: LicenseRef-ANCL-AdrianDusa
 */
 
+#include <math.h>
+
 #include "gurobi.h"
 #include "cover_validation.h"
 #include "debug.h"
 
 #ifdef HAVE_GUROBI
+
+/* Require an integer optimum for the cardinality objective. */
+static int require_exact_cardinality(GRBenv *env) {
+    int error = GRBsetdblparam(env, GRB_DBL_PAR_MIPGAP, 0.0);
+    if (error) return error;
+    return GRBsetdblparam(env, GRB_DBL_PAR_MIPGAPABS, 0.0);
+}
 
 /* Every Gurobi solve uses the same run log as the native backends. */
 int gurobi_start_environment(GRBenv **env) {
@@ -78,7 +87,7 @@ bool gurobi_license_is_valid(void) {
     }
 }
 
-void gurobi_multiobjective(
+bool gurobi_multiobjective(
     const PIChartView *chart,
     double weights[],        // the weights for each individual PI
     const int *initial_solution,
@@ -86,6 +95,7 @@ void gurobi_multiobjective(
     int *indices,            // IDs of the selected prime implicants
     int *solmin              // no. of PIs covering the ON_minterms
 ) {
+    int status = 0;
     const int foundPI = chart ? chart->cols : 0;
     const int ON_minterms = chart ? chart->rows : 0;
     int error = 0;
@@ -199,8 +209,17 @@ void gurobi_multiobjective(
 
     // GRBwrite(model, "debug_c_model.lp");
 
-    /* optimize */
+    /* Apply zero gap to the cardinality pass, before optimizing weights. */
+    GRBenv *cardinality_env = weights ? GRBgetmultiobjenv(model, 0) : GRBgetenv(model);
+    if (!cardinality_env) {
+        error = 1;
+        goto QUIT;
+    }
+    error = require_exact_cardinality(cardinality_env);
+    if (error) goto QUIT;
     error = GRBoptimize(model);
+    if (error) goto QUIT;
+    error = GRBgetintattr(model, GRB_INT_ATTR_STATUS, &status);
     if (error) goto QUIT;
 
     /* extract solution */
@@ -216,7 +235,7 @@ void gurobi_multiobjective(
             // printf("%d ", j+1);
         }
     }
-    *solmin = pos;
+    *solmin = cover_is_feasible(chart, indices, pos) ? pos : 0;
 
     QUIT:
 
@@ -230,10 +249,11 @@ void gurobi_multiobjective(
     }
     if (model) GRBfreemodel(model);
     if (env) GRBfreeenv(env);
+    return *solmin > 0 && status == GRB_OPTIMAL;
 }
 
 
-void gurobi_solution_pool(
+bool gurobi_solution_pool(
     const PIChartView *chart,
     const int max_pool,      // maximum number of solutions to collect
     double weights[],        // the weights for each individual PI
@@ -247,6 +267,9 @@ void gurobi_solution_pool(
     const int ON_minterms = chart ? chart->rows : 0;
     int error = 0;
     GRBenv      *env        = NULL;
+    int cardinality_status = 0;
+    int *idxbuf = NULL;
+    int stored = 0;
     GRBenv      *menv       = NULL; // model's env (for SolutionNumber)
     GRBmodel    *model      = NULL;
     int         *ind        = NULL;
@@ -265,7 +288,7 @@ void gurobi_solution_pool(
         !pool_solutions ||
         !solmin
     ) {
-        return;
+        return false;
     }
 
     ind  = malloc(foundPI * sizeof(int));
@@ -354,14 +377,27 @@ void gurobi_solution_pool(
     error = GRBupdatemodel(model); // ensure objective/constraints are in
     if (error) goto QUIT;
 
+    double relative_gap, absolute_gap;
+    error = GRBgetdblparam(menv, GRB_DBL_PAR_MIPGAP, &relative_gap);
+    if (error) goto QUIT;
+    error = GRBgetdblparam(menv, GRB_DBL_PAR_MIPGAPABS, &absolute_gap);
+    if (error) goto QUIT;
+    error = require_exact_cardinality(menv);
+    if (error) goto QUIT;
     error = GRBoptimize(model);
+    if (error) goto QUIT;
+    error = GRBgetintattr(model, GRB_INT_ATTR_STATUS, &cardinality_status);
+    if (error) goto QUIT;
+    error = GRBsetdblparam(menv, GRB_DBL_PAR_MIPGAP, relative_gap);
+    if (error) goto QUIT;
+    error = GRBsetdblparam(menv, GRB_DBL_PAR_MIPGAPABS, absolute_gap);
     if (error) goto QUIT;
 
     double objval = 0.0;
     error = GRBgetdblattr(model, GRB_DBL_ATTR_OBJVAL, &objval);
     if (error) goto QUIT;
 
-    *solmin = (int)(objval);
+    *solmin = (int)lround(objval);
     // printf("Solution minima: %.0f\n", *solmin);
 
     /* add cardinality constraint: sum x_j <= solmin */
@@ -409,14 +445,13 @@ void gurobi_solution_pool(
     // printf("Found %d solutions in pool (max 100)\n", pool_count);
 
     /* buffer to collect indices per solution */
-    int *idxbuf = (int*)malloc((size_t)ON_minterms * sizeof(int));
+    idxbuf = malloc((size_t)foundPI * sizeof(int));
     if (!idxbuf) {
         error = 1;
         goto QUIT;
     }
 
     /* loop over solutions in pool */
-    int stored = 0;
     for (int s = 0; s < *pool_count && stored < max_pool; s++) {
 
         // Use model's environment when selecting solution from pool
@@ -451,17 +486,12 @@ void gurobi_solution_pool(
         int pos = 0;
         for (int j = 0; j < len; j++) {
             if (gurobi_sol[j] > 0.99) {
-                if (pos < ON_minterms) {
-                    idxbuf[pos] = j;
-                    // printf(" %d", j + 1);
-                    pos++;
-                } else {
-                    break; // prevent overflow
-                }
+                idxbuf[pos++] = j;
             }
         }
         // printf("\n");
 
+        if (pos != *solmin || !cover_is_feasible(chart, idxbuf, pos)) continue;
         int *entry = (int*)malloc((size_t)(*solmin) * sizeof(int));
         if (!entry) {
             printf("ERROR: Failed to allocate memory for solution entry\n");
@@ -472,14 +502,17 @@ void gurobi_solution_pool(
     }
 
     QUIT:
+    *pool_count = stored;
+    free(idxbuf);
     if (ind) free(ind);
     if (coeffs) free(coeffs);
     if (gurobi_sol) free(gurobi_sol);
     if (error) {
-        printf("ERROR: %s\n", GRBgeterrormsg(env));
+        printf("ERROR: %s\n", env ? GRBgeterrormsg(env) : "Unknown error (no env)");
     }
     if (model) GRBfreemodel(model);
     if (env) GRBfreeenv(env);
+    return stored > 0 && cardinality_status == GRB_OPTIMAL;
 }
 
 #else
@@ -488,7 +521,7 @@ bool gurobi_license_is_valid(void) {
     return false;
 }
 
-void gurobi_multiobjective(
+bool gurobi_multiobjective(
     const PIChartView *chart,
     double weights[],
     const int *initial_solution,
@@ -502,9 +535,10 @@ void gurobi_multiobjective(
     (void)initial_solmin;
     (void)indices;
     if (solmin) *solmin = 0;
+    return false;
 }
 
-void gurobi_solution_pool(
+bool gurobi_solution_pool(
     const PIChartView *chart,
     const int max_pool,
     double weights[],
@@ -522,6 +556,7 @@ void gurobi_solution_pool(
     (void)pool_solutions;
     if (pool_count) *pool_count = 0;
     if (solmin) *solmin = 0;
+    return false;
 }
 
 #endif

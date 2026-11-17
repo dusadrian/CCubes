@@ -57,6 +57,7 @@ typedef struct {
     int solmin;
     int prevsolmin;
     bool stop_search;
+    bool pi_chart_optimal; /* Proof for the retained cover at its final chart. */
     bool ON_set_covered;
 
     // Input data

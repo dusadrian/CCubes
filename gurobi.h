@@ -14,7 +14,7 @@
 
 bool gurobi_license_is_valid(void);
 
-void gurobi_multiobjective(
+bool gurobi_multiobjective(
     const PIChartView *chart,
     double weights[],        // the weights for each individual PI
     const int *initial_solution, // optional validated incumbent column IDs
@@ -23,7 +23,7 @@ void gurobi_multiobjective(
     int *solmin              // no. of PIs covering the ON_minterms
 );
 
-void gurobi_solution_pool(
+bool gurobi_solution_pool(
     const PIChartView *chart,
     const int max_pool,      // maximum number of solutions to collect
     double weights[],        // the weights for each individual PI

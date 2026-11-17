@@ -746,6 +746,19 @@ static bool initialize_run_logging(const CliOptions *options, const char *source
     return true;
 }
 
+static bool cover_meets_cardinality_floor(const PIstorage *pi) {
+    return pi->solmin == (pi->ON_minterms > 0 ? 1 : 0);
+}
+
+static void report_cover_result(int output, const PIstorage *pi, bool global_minimum) {
+    const char *status = "feasible";
+    if (global_minimum) status = "global-minimum";
+    else if (pi->pi_chart_optimal) status = "pi-chart-optimal";
+
+    fprintf(stderr, "CCUBES_COVER_RESULT output=%d cover=%d status=%s\n",
+            output + 1, pi->solmin, status);
+}
+
 int main(int argc, char *argv[]) {
 
     if (argc < 2) {
@@ -1954,6 +1967,15 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         write_pla_file(DST_FILE, PInfo);
+        for (int o = 0; o < noutputs; ++o) {
+            const ProgressiveCoverResult *result = &progressive_results[o];
+            const bool global_minimum =
+                cover_meets_cardinality_floor(&PInfo[o]) ||
+                (result->global_bound_requested &&
+                 result->global_bound_status == PROGRESSIVE_GLOBAL_BOUND_OK &&
+                 result->global_bound.cardinality_lower_bound == PInfo[o].solmin);
+            report_cover_result(o, &PInfo[o], global_minimum);
+        }
         long long merged_products = written_pla_product_count(DST_FILE);
 
         clock_gettime(CLOCK_MONOTONIC, &end);
@@ -3084,7 +3106,7 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (*ON_set_covered && !PInfo[o].stop_search) {
-                    bool boundary_exact = SCP_TYPE == 1;
+                    bool boundary_exact = false;
                     DBG_TRACE_BLOCK {
                         fprintf(debug_out, "Output %d, found PIs: %d", o + 1, *foundPI);
                     }
@@ -3135,7 +3157,7 @@ int main(int argc, char *argv[]) {
                     }
 
                     if (SCP_TYPE == 1) { // Gurobi: blended multi-objective
-                        gurobi_multiobjective(
+                        boundary_exact = gurobi_multiobjective(
                             &chart,
                             weights,
                             *prevsolmin > 0 &&
@@ -3201,6 +3223,8 @@ int main(int argc, char *argv[]) {
                         // }
                     }
 
+                    boundary_exact &= *solmin <= *prevsolmin;
+                    PInfo[o].pi_chart_optimal = boundary_exact;
                     bool plateau_triggered = false;
                     if (*solmin < *prevsolmin) {
                         // either solmin is smaller than the previously found solmin,
@@ -3294,7 +3318,7 @@ int main(int argc, char *argv[]) {
 
             for (int o = 0; o < noutputs; o++) {
                 pool_execution_time[o] = 0.0;
-                pool_boundary_exact[o] = SCP_TYPE == 1;
+                pool_boundary_exact[o] = false;
 
                 int *foundPI = &PInfo[o].foundPI;
                 bool *ON_set_covered = &PInfo[o].ON_set_covered;
@@ -3400,7 +3424,7 @@ int main(int argc, char *argv[]) {
                     }
 
                     if (SCP_TYPE == 1) {
-                        gurobi_multiobjective(
+                        pool_boundary_exact[o] = gurobi_multiobjective(
                             &chart,
                             weights,
                             PInfo[o].prevsolmin > 0 &&
@@ -3414,7 +3438,6 @@ int main(int argc, char *argv[]) {
                             indices,
                             solmin
                         );
-                        pool_boundary_exact[o] = true;
                     }
 
                     if (*solmin <= 0 || *solmin > ON_minterms) {
@@ -3482,13 +3505,13 @@ int main(int argc, char *argv[]) {
                                 CERTIFIED_MODE
                             );
                             pool_boundary_exact[o] =
-                                baseline_exact ||
+                                (baseline_exact && *solmin == baseline_solmin) ||
                                 lagrangian_last_run_proved_optimal();
                             print_hybrid_stats(o);
                         }
 
                         if (SCP_TYPE == 1) {
-                            gurobi_solution_pool(
+                            pool_boundary_exact[o] = gurobi_solution_pool(
                                 &chart,
                                 pool_limit,
                                 weights,
@@ -3498,7 +3521,8 @@ int main(int argc, char *argv[]) {
                                 pool_solutions,
                                 solmin
                             );
-                            pool_boundary_exact[o] = true;
+                            pool_boundary_exact[o] |=
+                                baseline_exact && *solmin == baseline_solmin;
                         }
 
                         if (
@@ -3636,6 +3660,7 @@ int main(int argc, char *argv[]) {
                             }
                         } else {
                             /* A worse boundary incumbent cannot replace the previous one. */
+                            pool_boundary_exact[o] = false;
                             for (int i = 0; i < *prevsolmin; i++) {
                                 indices[i] = previndices[i];
                             }
@@ -3653,6 +3678,8 @@ int main(int argc, char *argv[]) {
 
                         plateau_triggered = stop_counter[o] >= STOP_AFTER_EQUALITY;
                     }
+
+                    PInfo[o].pi_chart_optimal = pool_boundary_exact[o];
 
                     PInfo[o].stop_search = certified_stop_policy_decision(
                         certified_states ? &certified_states[o] : NULL,
@@ -3957,6 +3984,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     write_pla_file(DST_FILE, PInfo);
+    for (int o = 0; o < noutputs; ++o) {
+        const bool global_minimum = CERTIFIED_MODE || CERTIFY_SYSTEMATIC ||
+            (binary_points_supported && cover_meets_cardinality_floor(&PInfo[o]));
+        report_cover_result(o, &PInfo[o], global_minimum);
+    }
 
     // Free allocated memory
     destroy_output_locks(output_locks, noutputs);

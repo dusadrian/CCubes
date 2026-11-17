@@ -8,15 +8,15 @@ The minimization process is extremely efficient with incompletely specified func
 
 It employs a bottom-up search strategy, starting from the simplest combinations of 1 input, 2 inputs etc. and gradually increases the complexity. After each such level, it solves the minterm matrix and evaluates whether deeper prime implicants can still change the result.
 
-For binary point inputs, ordinary automatic generation starts with a one-cube shortcut. It finds the conditions shared by all ON rows, checks the resulting cube against OFF, and drops redundant literals to obtain a prime. Each output solved this way skips PI generation. Other outputs stop at the first unchanged cover cardinality. Use `--certify` for a global certificate.
+For binary point inputs, ordinary automatic generation starts with a one-cube shortcut. It finds the conditions shared by all ON rows, checks the resulting cube against OFF, and drops redundant literals to obtain a prime. Each output solved this way skips PI generation. Other outputs stop at the first unchanged cover cardinality.
 
 Input-dash PLA pattern rows are accepted through a separate, explicitly announced heuristic path, with direct handling of constant outputs. That path uses the first plateau. Complete-prime certification requires binary point rows.
 
-Minimum covering of the PI chart is NP-hard. The `--solver=gurobi` option delegates this boundary problem to the Gurobi optimizer. For compilation, Gurobi's path is configured in the Makefile and may need to be adjusted for the local installation and operating system. At runtime, Gurobi searches for a valid license; academic licences are available from Gurobi.
+Finding a minimum cover of the PI chart is NP-hard. The `--solver=gurobi` option delegates this boundary problem to the Gurobi optimizer. For compilation, Gurobi's path is configured in the Makefile and may need to be adjusted for the local installation and operating system. At runtime, Gurobi searches for a valid license; academic licences are available from Gurobi.
 
 The default `--solver=hybrid` option selects CCubes's own bundled hybrid covering solver. It combines dominance presolve, Lagrangian bounds and reduced-cost fixing, and a bounded branch-and-bound search of the remaining core. The effort levels `--effort=0` to `--effort=2` trade time for stronger bounds within fixed search budgets. The hybrid solver may prove optimality when its lower and upper bounds meet, but exactness is not guaranteed on every run; use `--solver=gurobi` with Gurobi when a proven minimum boundary cover is required.
 
-If no weights are applied, the combination of prime implicants that cover the ON set minterms is the quickest exact method, roughly equivalent to `espresso -Dso` type of output, although it produces a much more efficient circuit especially with an exact optimization.
+Use `--weights none` to solve the chart using cube count alone.
 
 Two weighting options are available, for instance the default `--weights=complexity` for weight based on complexity levels (prime implicants with lower number of literals will be given more weight). The option `--weights=sharing` adds additional weight if a prime implicant is shared between multiple outputs.
 
@@ -148,6 +148,31 @@ Short options still work as deprecated aliases during migration. The four former
 
 The ordinary checkpoint and certification clocks can be set in the same command. If the run saves and exits, certification starts only after minimization completes on resume. Include the certification options again when resuming. Active checkpoints and systematic certification require ordinary minimization. IPC timing controls require the IPC route.
 
+## What the result proves
+
+Ordinary minimization usually stops at a cover-size plateau. Its PI chart contains the
+prime implicants generated up to that point. CCubes reports one
+`CCUBES_COVER_RESULT` line on stderr for each output of a completed run.
+`cover` is the number of cubes for that output.
+
+| Status | Meaning |
+| --- | --- |
+| `feasible` | The cover satisfies the ON and OFF rows. Optimality is unproved for the reported cover. |
+| `pi-chart-optimal` | The solver proved the minimum cube count among the prime implicants in the final chart for that output. A cube outside the chart could still allow a smaller cover. |
+| `global-minimum` | A matching global lower bound proves that no cover of the output uses fewer cubes. For example, a valid one-cube cover of a nonempty binary point ON set already meets this bound. |
+
+The bundled hybrid solver can prove a PI chart optimum when its lower bound
+meets the cover size. `--solver gurobi` delegates the chart to Gurobi, which
+can also take substantial time to prove an optimum. `--certify` generates the
+complete prime family and solves its chart. `--certify-systematic` is opt-in
+and searches for a global proof after ordinary minimization, with the option
+to set a proof budget. A certification run with an unproved output exits
+unsuccessfully and preserves the destination. The proofs concern scalar cube
+counts. Minimizing the number of distinct rows in the merged multi-output
+PLA is a separate objective. Checkpoints do not store PI chart proof status,
+so an output already finished at resume is reported as feasible unless
+there is a global proof for it.
+
 ## Systematic certification
 
 `--certify-systematic` certifies the ordinary solution at its normal stopping point on binary point inputs. It first uses IPC global pricing to lower-bound the cube count for each output. If a gap remains, a bounded integer search enumerates maximal legal sets of ON rows and uses exact integer weights to exclude sets that cannot belong to a cover at the target size. An independent checker reconstructs legal cubes from the care rows and verifies any stronger lower bound before it can affect certification. Input masks, ON-row sets and OFF-row storage are sized to the instance. The stage reports `method=ipc-weighted-integer` when its checked bound closes the gap.
@@ -166,7 +191,7 @@ The automatic weighted checker gets a cumulative work allowance up to the search
 
 Certification runs independent outputs concurrently using up to `--threads`, capped at 12 active outputs. Each active output gets its own solver, checker and budget. Multi-output runs give each pricing call one thread. For a single output, IPC pricing can use the requested threads while SAT runs on one thread. `CCUBES_SYSTEMATIC_BATCH` reports the worker count and elapsed certification time.
 
-Run `make test` to check the native solver, proof checker, weighted cover search and certification CLI.
+Run `make test` in the CCubesIPC development checkout to check the native solver, proof checker, weighted cover search and certification CLI.
 
 ## Native IPC
 
