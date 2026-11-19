@@ -362,7 +362,7 @@ typedef struct {
     int implicant_words;
 } PICanonicalSortContext;
 
-static PICanonicalSortContext pi_canonical_sort_ctx;
+static _Thread_local PICanonicalSortContext pi_canonical_sort_ctx;
 
 static int cmp_u64_words(
     const uint64_t *a,

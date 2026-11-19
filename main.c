@@ -2903,6 +2903,12 @@ int main(int argc, char *argv[]) {
         }
         destroy_pi_coverage_indices(coverage_indices, noutputs);
 
+        int finalization_failed = 0;
+#ifdef HAVE_OPENMP
+        /* Two concurrent sorts bound the number of temporary chart copies. */
+        #pragma omp parallel for if(!complete_mmcs_chart && noutputs > 1 && THREADS > 1) \
+            num_threads(2) schedule(dynamic, 1) reduction(|:finalization_failed)
+#endif
         for (int o = 0; o < noutputs; ++o) {
             if (!level_active[o]) continue;
             if (complete_mmcs_chart) {
@@ -2927,10 +2933,13 @@ int main(int argc, char *argv[]) {
                     "Error: failed to finalize PI level for output %d\n",
                     o + 1
                 );
-                destroy_output_locks(output_locks, noutputs);
-                cleanup(PInfo, buffer);
-                return 1;
+                finalization_failed = 1;
             }
+        }
+        if (finalization_failed) {
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            return 1;
         }
         clock_gettime(CLOCK_MONOTONIC, &endpi);
         double generation_slice_seconds =
