@@ -7,6 +7,7 @@
 */
 
 #include "lagrangian.h"
+#include "lagr_root_bound.h"
 #include "ccubes_threads.h"
 #include "cover_validation.h"
 #include "polish_order.h"
@@ -3401,7 +3402,7 @@ static int lagr_bounded_cover_search(
 
 /*
 Lagrangian bounded finish:
-1. Recompute reduced costs at the best multipliers found (caller passes ls_best/zlb_best).
+1. Verify the unit-cost bound and reduced costs at the same row multipliers.
 2. Reduced-cost variable fixing for a target size T:
    - exclude column c when zlb + max(0, rc_c) > T (cannot be in any cover of cost <= T)
    - force column c when rc_c < 0 and zlb - rc_c > T (must be in every such cover)
@@ -3423,8 +3424,7 @@ static int lagr_build_core(
     const int *rowsCoveredCount,
     int **colsCovering,
     int *colsCoveringCount,
-    const double *ls_best,
-    double zlb_best,
+    const LagrRootBound *proof,
     int target,
     unsigned char *allowed,      /* cols scratch, filled */
     int *forced,                 /* cols scratch, filled */
@@ -3432,18 +3432,15 @@ static int lagr_build_core(
     int ***core_covering_out,
     int **core_counts_out
 ) {
-    const double FIXTOL = 1e-7;
-
     int forced_len = 0;
     int core_count = 0;
     for (int c = 0; c < cols; ++c) {
-        double rc_c = ls_best[c];
-        if (rowsCoveredCount[c] <= 0 || zlb_best + (rc_c > 0.0 ? rc_c : 0.0) > (double)target + FIXTOL) {
+        if (rowsCoveredCount[c] <= 0 || lagr_root_excludes(proof, c, target)) {
             allowed[c] = 0;
         } else {
             allowed[c] = 1;
             ++core_count;
-            if (rc_c < 0.0 && zlb_best - rc_c > (double)target + FIXTOL) {
+            if (lagr_root_requires(proof, c, target)) {
                 forced[forced_len++] = c;
             }
         }
@@ -3565,7 +3562,7 @@ static void lagr_bounded_finish(
     int *colsCoveringCount,
     const double *weights,
     const double *ls_best,
-    double zlb_best,
+    const LagrRootBound *proof,
     long node_limit,
     int core_cap,
     int *solution,
@@ -3645,7 +3642,7 @@ static void lagr_bounded_finish(
                 rows, cols,
                 rowsCoveredCount,
                 colsCovering, colsCoveringCount,
-                ls_best, zlb_best,
+                proof,
                 target,
                 allowed, forced, &forced_len,
                 NULL, NULL
@@ -3678,7 +3675,7 @@ static void lagr_bounded_finish(
                 rows, cols,
                 rowsCoveredCount,
                 colsCovering, colsCoveringCount,
-                ls_best, zlb_best,
+                proof,
                 target,
                 allowed, forced, &forced_len,
                 &core_covering, &core_counts
@@ -3892,7 +3889,7 @@ static void lagr_bounded_finish(
                 rows, cols,
                 rowsCoveredCount,
                 colsCovering, colsCoveringCount,
-                ls_best, zlb_best,
+                proof,
                 target,
                 allowed, forced, &forced_len,
                 NULL, NULL
@@ -3904,7 +3901,7 @@ static void lagr_bounded_finish(
                 rows, cols,
                 rowsCoveredCount,
                 colsCovering, colsCoveringCount,
-                ls_best, zlb_best,
+                proof,
                 target,
                 allowed, forced, &forced_len,
                 &core_covering, &core_counts
@@ -4429,6 +4426,18 @@ void lagrangian_calibration_options_default(
     options->reset_on_continuous_improvement = false;
 }
 
+/* Floating-point search proposes the next cardinality bound. Only an
+ * increase needs a fresh certificate on this chart. Keep the original
+ * search schedule when the proposed bound passes verification. */
+static double lagr_checked_proposal(
+    double proposed, double previous, LagrRootBound *proof, int rows, int cols,
+    int **covering, const int counts[], const double prices[]
+) {
+    if (proposed <= previous) return proposed;
+    int verified = lagr_verify_root_bound(proof, rows, cols, covering, counts, prices);
+    return fmin(proposed, verified);
+}
+
 bool lagrangian_calibrate_multipliers(
     const PIChartView *chart,
     int incumbent_upper_bound,
@@ -4585,6 +4594,7 @@ bool lagrangian_calibrate_multipliers(
     int last_continuous_improvement = 0;
     int contractions = 0;
     int stuck_iterations = 0;
+    LagrRootBound proof = {.cost = calloc((size_t)chart->cols, sizeof(*proof.cost))};
     double best_integer_bound = -DBL_MAX;
     double step_coefficient =
         options->initial_step_coefficient;
@@ -4621,7 +4631,10 @@ bool lagrangian_calibrate_multipliers(
             );
         }
 
-        double integer_bound = ceil(zlb - EPS);
+        double integer_bound = lagr_checked_proposal(
+            ceil(zlb - EPS), best_integer_bound, &proof, chart->rows, chart->cols,
+            colsCovering, colsCoveringCount, multipliers
+        );
         bool integer_improved =
             integer_bound > best_integer_bound + EPS;
         if (integer_improved) {
@@ -4703,6 +4716,7 @@ bool lagrangian_calibrate_multipliers(
     stats->stop_reason = stop_reason;
     lagr_calibration_stats = previous_calibration_stats;
 
+    free(proof.cost);
     free(multipliers);
     free(best_multipliers);
     free(reduced_costs);
@@ -5222,6 +5236,7 @@ static void solve_scp_lagrangian_config(
         : -1;
     lagr_last_stats.primal_ub_loop_start = bestTerms;
 
+    LagrRootBound proof = {.cost = calloc((size_t)cols, sizeof(*proof.cost))};
     double bestLB = -DBL_MAX;
     for (int it = 0; it < max_iter; ++it) {
         if (
@@ -5258,7 +5273,9 @@ static void solve_scp_lagrangian_config(
             }
         }
 
-        double LBint = ceil(ZLB - 1e-12);
+        double LBint = lagr_checked_proposal(
+            ceil(ZLB - 1e-12), bestLB, &proof, rows, cols, colsCovering, colsCoveringCount, t
+        );
 
         if (LBint > bestLB + EPS) {
             bestLB = LBint;
@@ -5707,7 +5724,7 @@ static void solve_scp_lagrangian_config(
         )
     ) {
         /* reduced costs at the best multipliers found */
-        double zlb_best = compute_reduced_and_lb(
+        compute_reduced_and_lb(
             rows,
             cols,
             rowsCovered,
@@ -5720,6 +5737,7 @@ static void solve_scp_lagrangian_config(
         );
 
         int proved = 0;
+        lagr_verify_root_bound(&proof, rows, cols, colsCovering, colsCoveringCount, t_best);
         lagr_bounded_finish(
             rows,
             cols,
@@ -5729,7 +5747,7 @@ static void solve_scp_lagrangian_config(
             colsCoveringCount,
             weights,
             ls,
-            zlb_best,
+            &proof,
             cfg->polish_node_limit,
             cfg->polish_core_cap,
             solution,
@@ -5791,6 +5809,7 @@ static void solve_scp_lagrangian_config(
         last_continuous_improvement_iteration;
     lagr_last_stats.step_contractions = step_contractions;
 
+    free(proof.cost);
     free(t);
     free(t_best);
     free(ls);
@@ -6959,6 +6978,7 @@ void solve_scp_lagrangian_pool(
         }
     }
 
+    LagrRootBound proof = {.cost = calloc((size_t)cols, sizeof(*proof.cost))};
     double bestLB = -DBL_MAX;
 
     /* parameters */
@@ -7019,7 +7039,9 @@ void solve_scp_lagrangian_pool(
             }
         }
 
-        double LBint = ceil(ZLB - EPS);
+        double LBint = lagr_checked_proposal(
+            ceil(ZLB - EPS), bestLB, &proof, rows, cols, colsCovering, colsCoveringCount, t
+        );
         if (LBint > bestLB + EPS) {
             bestLB = LBint;
             if (!cfg.reset_on_continuous_improvement) {
@@ -7479,7 +7501,7 @@ void solve_scp_lagrangian_pool(
 
     if (cfg.polish_enabled && *solmin > 0) {
         /* reduced costs at the best multipliers found */
-        double zlb_best = compute_reduced_and_lb(
+        compute_reduced_and_lb(
             rows,
             cols,
             rowsCovered,
@@ -7494,6 +7516,7 @@ void solve_scp_lagrangian_pool(
         int proved = (stop_reason == LAGR_STOP_OPTIMAL);
         int solmin_before = *solmin;
 
+        lagr_verify_root_bound(&proof, rows, cols, colsCovering, colsCoveringCount, t_best);
         lagr_bounded_finish(
             rows,
             cols,
@@ -7503,7 +7526,7 @@ void solve_scp_lagrangian_pool(
             colsCoveringCount,
             weights,
             rc,
-            zlb_best,
+            &proof,
             cfg.polish_node_limit,
             cfg.polish_core_cap,
             sol_tmp,
@@ -7578,6 +7601,7 @@ void solve_scp_lagrangian_pool(
     }
 
     /* cleanup */
+    free(proof.cost);
     free(t);
     free(t_best);
     free(rc);
