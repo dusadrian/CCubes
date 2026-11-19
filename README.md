@@ -191,7 +191,7 @@ The automatic weighted checker gets a cumulative work allowance up to the search
 
 Certification runs independent outputs concurrently using up to `--threads`, capped at 12 active outputs. Each active output gets its own solver, checker and budget. Multi-output runs give each pricing call one thread. For a single output, IPC pricing can use the requested threads while SAT runs on one thread. `CCUBES_SYSTEMATIC_BATCH` reports the worker count and elapsed certification time.
 
-Run `make test` in the CCubesIPC development checkout to check the native solver, proof checker, weighted cover search and certification CLI.
+Run `make test` in the CCubesIPC development workspace with the local test files installed to check the native solver, proof checker, weighted cover search and certification CLI.
 
 ## Native IPC
 
@@ -205,21 +205,10 @@ For example, `--route ipc --ipc-time-target 60 --ipc-terminal-reserve 15` gives 
 
 Use `--pool-output` to retain a single-output IPC pool and `--pool-input` to validate and continue minimization from a compatible pool. These files have a different format from ordinary checkpoints. Restricted-master bounds and proofs apply to the retained pool. A global bound requires separate verification against the full pricing domain.
 
-### Shared rows under a whole-PLA budget
-
-The Python runner accepts an explicit binary care table and a new output directory. It runs native IPC on each nonconstant output and searches for a smaller merged cover using geometries already in the validated merged seed.
-
-```sh
-python3 scripts/run_ipc_shared_cover.py --binary ./ccubes \
-  --source source.pla --output joint-result --threads 8 --seconds 180
-```
-
-The runner reserves finishing time inside the total budget. It retains the validated seed if the post-pass times out or would increase the merged row count. The optional `--checker` accepts an independent executable that validates the source and serialized result. The run records merged rows, output connections, and any optimum proved within the selected pool.
-
 ### Run logs
 
 Use `--log-file FILE` to append diagnostics from either route. It defaults to information level. Set `--debug` to change the level or `--debug-file` to send debug output to a separate file. Keep logs separate from inputs, outputs, checkpoint and pool files. Help and checkpoint inspection still use standard output.
 
 ## Verification
 
-The ordinary and IPC regression suites are maintained in the CCubesIPC development repository.
+The ordinary and IPC regression suites are maintained locally in the CCubesIPC development workspace.
