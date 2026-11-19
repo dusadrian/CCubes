@@ -24,6 +24,7 @@ typedef struct {
     bool deterministic;
     bool certify;
     bool certify_systematic;
+    double systematic_sat_overlap;
     SystematicBudget systematic_budget;
     bool systematic_stage_limits_explicit;
     bool systematic_work_explicit;

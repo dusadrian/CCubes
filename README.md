@@ -59,6 +59,17 @@ Compile the binary according to your system using `make`, with various options a
 
 The destination .pla file is optional. If not specified, the result uses the input basename prefixed by `ccubes_` for ordinary runs or `progressive_` for IPC.
 
+## Distributed systematic search
+
+Build with an MPI compiler wrapper and run one process per node. Give each process the cores assigned on that node. The coordinator gathers each completed generation level, solves its output charts and writes the PLA. All processes must read the same input and checkpoint files.
+
+```sh
+make ccubes CC=mpicc FP_FLAGS=-DCCUBES_SYSTEMATIC_MPI
+mpirun -np 2 ./ccubes --route e0 --deterministic --threads 64 input.pla result.pla
+```
+
+A saved projection checkpoint can resume with a different number of processes. On a fresh binary-point run, the optional `--systematic-sat-overlap SECONDS` reserves one coordinator core for checked SAT after a plateau. Its per-output time allowance includes time spent waiting. Use it with at least two ranks and two coordinator cores. Pooling, checkpointing and `--certify-systematic` each require a separate run.
+
 ## Usage
 
 Use descriptive long options. Options taking values accept either `--name VALUE` or `--name=VALUE`. Boolean switches take no value. Use `--` before filenames beginning with a dash.

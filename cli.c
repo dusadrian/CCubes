@@ -22,7 +22,7 @@ typedef enum {
     POOL, LOCK_STATS, DEBUG, DEBUG_FILE, LOG_FILE, HELP,
     PROGRESSIVE_COVER, ROUTE, LITERAL_POLISH,
     CHECKPOINT_AFTER, CHECKPOINT_EVERY, CHECKPOINT, RESUME, INSPECT, INSPECT_LEVEL,
-    CERTIFY_SYSTEMATIC, CERTIFICATION_TIME_LIMIT,
+    CERTIFY_SYSTEMATIC, CERTIFICATION_TIME_LIMIT, SYSTEMATIC_SAT_OVERLAP,
     SYSTEMATIC_WEIGHTED_SECONDS, SYSTEMATIC_NATIVE_SAT_SECONDS, SYSTEMATIC_VERIFIER_SECONDS,
     SYSTEMATIC_WORK, SYSTEMATIC_WEIGHTED_WORK, SYSTEMATIC_VERIFIER_WORK,
     SYSTEMATIC_STRENGTHENING, SYSTEMATIC_DESCENT,
@@ -62,8 +62,12 @@ static const Option option_table[] = {
     {"inspect-level", NULL, true, INSPECT_LEVEL, "0 (default) progress, 1 full metadata"},
     {"certify-systematic", NULL, false, CERTIFY_SYSTEMATIC, "certify ordinary scalar covers with IPC pricing, weighted integer search and checked native SAT"},
     {"certification-time-limit", NULL, true, CERTIFICATION_TIME_LIMIT, "positive seconds per output after minimization, shared by validation, pricing, search and proof checking"},
+#ifdef CCUBES_SYSTEMATIC_MPI
+    {"systematic-sat-overlap", NULL, true, SYSTEMATIC_SAT_OVERLAP,
+        "seconds per output for checked SAT starting at the first MPI projection plateau"},
+#endif
     {"systematic-weighted-seconds", NULL, true, SYSTEMATIC_WEIGHTED_SECONDS, "weighted search and checking seconds per output (default 10; 0 skips)"},
-    {"systematic-native-sat-seconds", NULL, true, SYSTEMATIC_NATIVE_SAT_SECONDS, "SAT search and checking seconds per output (default 2; 0 skips)"},
+    {"systematic-native-sat-seconds", NULL, true, SYSTEMATIC_NATIVE_SAT_SECONDS, "SAT fallback search and checking seconds per output (default 2; 0 skips)"},
     {"systematic-verifier-seconds", NULL, true, SYSTEMATIC_VERIFIER_SECONDS, "positive seconds per output for separate weighted checking; pauses the weighted search clock"},
     {"systematic-certification-work", NULL, true, SYSTEMATIC_WORK, "combined weighted and SAT work per output, including checking (0 disables the cap)"},
     {"systematic-weighted-work", NULL, true, SYSTEMATIC_WEIGHTED_WORK, "weighted stage work per output (0 disables the cap)"},
@@ -89,7 +93,7 @@ void cli_help(FILE *out) {
                  "Ordinary projection checkpoints:\n");
     print_options(out, CHECKPOINT_AFTER, INSPECT_LEVEL);
     fprintf(out, "\nSystematic certification:\n");
-    print_options(out, CERTIFY_SYSTEMATIC, CERTIFICATION_TIME_LIMIT);
+    print_options(out, CERTIFY_SYSTEMATIC, SYSTEMATIC_SAT_OVERLAP);
     ccubes_options_help(out);
     fprintf(out, "\nGeneral and solver options:\n");
     print_options(out, BITS, LITERAL_POLISH);
@@ -200,6 +204,8 @@ static bool apply_option(OptionId id, char *value, CliOptions *o) {
             return true;
         case POOL: o->pool = true; return true;
         case LOCK_STATS: o->lock_stats = true; return true;
+        case SYSTEMATIC_SAT_OVERLAP:
+            return parse_seconds(value, &o->systematic_sat_overlap) && o->systematic_sat_overlap > 0.0;
         case CHECKPOINT_AFTER: return parse_seconds(value, &o->checkpoint_after);
         case CHECKPOINT_EVERY: return parse_seconds(value, &o->checkpoint_every);
         case CHECKPOINT: o->checkpoint = value; return true;

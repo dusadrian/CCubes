@@ -461,6 +461,13 @@ static void pi_search_range_worker(
     ctx->worker_next_tasks[worker_id] = task;
 }
 
+#if defined(CCUBES_SYSTEMATIC_MPI) && defined(CCUBES_DISCOVERY_MPI)
+#error Build the systematic and discovery MPI prototypes separately
+#endif
+#ifdef CCUBES_SYSTEMATIC_MPI
+#include "systematic_projection_mpi.inc"
+#endif
+
 static void mmcs_search_range_worker(
     uint64_t start,
     uint64_t end,
@@ -759,7 +766,13 @@ static void report_cover_result(int output, const PIstorage *pi, bool global_min
             output + 1, pi->solmin, status);
 }
 
-int main(int argc, char *argv[]) {
+#ifdef CCUBES_SYSTEMATIC_MPI
+static int systematic_main(int argc, char *argv[])
+#else
+int main(int argc, char *argv[])
+#endif
+{
+
 
     if (argc < 2) {
         cli_help(stderr);
@@ -792,6 +805,28 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+#ifdef CCUBES_SYSTEMATIC_MPI
+    if (systematic_ranks > 1) {
+        CCubesRouteMode route = CCUBES_ROUTE_ORDINARY;
+        if (options.route) parse_route_mode(options.route, &route);
+        if (route != CCUBES_ROUTE_ORDINARY ||
+            !options.deterministic || options.inspect || options.progressive_cover || options.certify) {
+            if (!systematic_rank)
+                fprintf(stderr, "Error: systematic MPI requires --route ordinary "
+                        "--deterministic.\n");
+            return 1;
+        }
+    }
+    if (options.systematic_sat_overlap > 0.0 &&
+        (systematic_ranks < 2 || options.pool || options.certify_systematic ||
+         options.resume || options.checkpoint_after > 0 || options.checkpoint_every > 0)) {
+        if (!systematic_rank)
+            fprintf(stderr, "Error: --systematic-sat-overlap requires multiple ranks and a fresh "
+                    "ordinary projection run without pooling, checkpoints, or --certify-systematic.\n");
+        return 1;
+    }
+    if (!systematic_rank)
+#endif
     if ((!options.resume || !options.log_file || options.inspect) &&
         !initialize_run_logging(&options, options.source, options.destination)) return 1;
     if (options.legacy_options) fprintf(stderr, "Warning: short options are deprecated; see --help for long names.\n");
@@ -827,6 +862,12 @@ int main(int argc, char *argv[]) {
     CCubesRouteMode ROUTE_MODE = CCUBES_ROUTE_ORDINARY;
     bool ROUTE_MODE_FROM_FLAG = options.route != NULL;
     if (options.route) parse_route_mode(options.route, &ROUTE_MODE);
+#ifdef CCUBES_SYSTEMATIC_MPI
+    const bool systematic_projection = DETERMINISTIC_PI_ORDER &&
+        !CERTIFIED_MODE && !PROGRESSIVE_COVER && ROUTE_MODE == CCUBES_ROUTE_ORDINARY;
+#else
+    const bool systematic_projection = false;
+#endif
     int PROGRESSIVE_LITERAL_POLISH_MODE = options.literal_polish;
     bool PROGRESSIVE_LITERAL_POLISH_MODE_EXPLICIT = options.literal_polish_explicit;
     char *SRC_FILE = options.source;
@@ -1049,6 +1090,9 @@ int main(int argc, char *argv[]) {
             if (chk_dst_path) free(chk_dst_path);
         }
 
+#ifdef CCUBES_SYSTEMATIC_MPI
+        if (!systematic_rank)
+#endif
         if (options.log_file && !initialize_run_logging(&options, SRC_FILE, DST_FILE)) {
             free(nofvalues);
             free(chk_stop_counter);
@@ -1188,6 +1232,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+#ifdef CCUBES_SYSTEMATIC_MPI
+    if (options.systematic_sat_overlap > 0.0 && !binary_points_supported) {
+        if (!systematic_rank)
+            fprintf(stderr, "Error: --systematic-sat-overlap requires nonconflicting binary point rows.\n");
+        free(nofvalues);
+        free(chk_stop_counter);
+        cleanup(PInfo, NULL);
+        return 1;
+    }
+#endif
     if (!binary_points_supported && CERTIFIED_MODE) {
         fprintf(
             stderr,
@@ -2158,6 +2212,12 @@ int main(int argc, char *argv[]) {
         THREADS = available_threads;
     }
     THREADS = ccubes_effective_thread_count(THREADS);
+#ifdef CCUBES_SYSTEMATIC_MPI
+    if (!systematic_rank && options.systematic_sat_overlap > 0.0) {
+        systematic_require(THREADS >= 2, "SAT overlap requires two available coordinator cores");
+        --THREADS; /* The proof thread never calls MPI or starts an OpenMP team. */
+    }
+#endif
     ccubes_set_thread_count(THREADS);
 
     /* opt-in (--lock-stats) profiling of the PI-insertion locks */
@@ -2538,6 +2598,28 @@ int main(int argc, char *argv[]) {
         output_completed_level[o] = search_level - 1;
     }
 
+#ifdef CCUBES_SYSTEMATIC_MPI
+    systematic_overlap_open(ninputs, noutputs, options.systematic_sat_overlap);
+    systematic_workers_ready = systematic_ranks > 1;
+    if (systematic_rank) {
+        atomic_bool stopped = false, failed = false;
+        uint64_t next_tasks[THREADS];
+        PIWorkerContext worker = {
+            .ninputs = ninputs, .noutputs = noutputs, .nofvalues = nofvalues,
+            .bit_index = bit_index, .word_index = word_index, .shifted_mask = shifted_mask,
+            .implicant_words = implicant_words, .PInfo = PInfo, .buffer = buffer,
+            .output_locks = output_locks, .max_shared = &max_shared,
+            .increase = increase, .multiplier = &multiplier, .time_up = &stopped,
+            .failed = &failed, .worker_next_tasks = next_tasks
+        };
+        systematic_follow(&worker, THREADS);
+        destroy_output_locks(output_locks, noutputs);
+        cleanup(PInfo, buffer);
+        free(certified_states);
+        return 0;
+    }
+#endif
+
     int k;
     for (k = search_level; any_output_searching && k <= ninputs; k++) {
         const bool complete_mmcs_chart = CERTIFIED_MODE;
@@ -2560,6 +2642,7 @@ int main(int argc, char *argv[]) {
 
         uint64_t projection_tasks = nchoosek(ninputs, k);
         bool automatic_mmcs_trial =
+            !systematic_projection &&
             !complete_mmcs_chart &&
             binary_points_supported &&
             !RESUME_PATH &&
@@ -2638,6 +2721,9 @@ int main(int argc, char *argv[]) {
             worker_next_tasks[t] = UINT64_MAX;
         }
         uint64_t start_task = resume_task <= maxtasks ? resume_task : maxtasks;
+#ifdef CCUBES_SYSTEMATIC_MPI
+        uint64_t systematic_frontier = start_task;
+#endif
 
         if (!attempt_mmcs && maxtasks == 0) {
             // overflow, too many tasks
@@ -2811,14 +2897,28 @@ int main(int argc, char *argv[]) {
                 .failed = &generation_failed,
                 .worker_next_tasks = worker_next_tasks
             };
-            if (!ccubes_parallel_for(
+            bool generated;
+#ifdef CCUBES_SYSTEMATIC_MPI
+            if (systematic_projection) {
+                systematic_frontier = systematic_dispatch(&pi_ctx, level_start, start_task, maxtasks, THREADS);
+                /* An early proof can discard the unfinished level for all
+                   still-active outputs without changing sharing mid-level. */
+                if (systematic_frontier < maxtasks && !atomic_load(&time_up)) {
+                    for (int o = 0; o < noutputs; ++o)
+                        if (PInfo[o].stop_search) level_active[o] = false;
+                }
+                generated = true;
+            } else
+#endif
+            generated = ccubes_parallel_for(
                 start_task,
                 maxtasks,
                 THREADS,
                 true,
                 pi_search_range_worker,
                 &pi_ctx
-            )) {
+            );
+            if (!generated) {
                 fprintf(stderr, "Error: failed to start workers for PI search\n");
                 destroy_pi_coverage_indices(coverage_indices, noutputs);
                 destroy_output_locks(output_locks, noutputs);
@@ -2839,6 +2939,10 @@ int main(int argc, char *argv[]) {
         bool level_time_up = atomic_load_explicit(&time_up, memory_order_acquire);
         resume_task = maxtasks;
         if (level_time_up) {
+#ifdef CCUBES_SYSTEMATIC_MPI
+            if (systematic_projection) resume_task = systematic_frontier;
+            else
+#endif
             for (int t = 0; t < THREADS; ++t) {
                 if (worker_next_tasks[t] < resume_task) {
                     resume_task = worker_next_tasks[t];
@@ -2903,6 +3007,10 @@ int main(int argc, char *argv[]) {
         }
         destroy_pi_coverage_indices(coverage_indices, noutputs);
 
+        bool retain_partial_level = false;
+#ifdef CCUBES_SYSTEMATIC_MPI
+        retain_partial_level = systematic_projection && level_time_up;
+#endif
         int finalization_failed = 0;
 #ifdef HAVE_OPENMP
         /* Two concurrent sorts bound the number of temporary chart copies. */
@@ -2924,9 +3032,9 @@ int main(int argc, char *argv[]) {
                 &PInfo[o],
                 implicant_words,
                 level_start[o],
-                DETERMINISTIC_PI_ORDER,
+                DETERMINISTIC_PI_ORDER && !retain_partial_level,
                 POOL_MAX > 1 || WEIGHT_PIC == 2,
-                false
+                retain_partial_level
             )) {
                 fprintf(
                     stderr,
@@ -2941,6 +3049,13 @@ int main(int argc, char *argv[]) {
             cleanup(PInfo, buffer);
             return 1;
         }
+#ifdef CCUBES_SYSTEMATIC_MPI
+        if (systematic_projection && !level_time_up) {
+            for (int o = 0; o < noutputs; ++o)
+                if (level_active[o])
+                    systematic_trace_chart(&PInfo[o], k, o, level_start[o], implicant_words);
+        }
+#endif
         clock_gettime(CLOCK_MONOTONIC, &endpi);
         double generation_slice_seconds =
             (endpi.tv_sec - startpi.tv_sec) +
@@ -3076,6 +3191,9 @@ int main(int argc, char *argv[]) {
             if (level_active[o]) output_completed_level[o] = k;
         }
 
+#ifdef CCUBES_SYSTEMATIC_MPI
+        systematic_overlap_apply_stops(PInfo, k);
+#endif
         // solve the PI charts per output
         if (POOL_MAX == 1) {
             for (int o = 0; o < noutputs; o++) {
@@ -3288,6 +3406,12 @@ int main(int argc, char *argv[]) {
                         stderr,
                         o + 1
                     );
+
+#ifdef CCUBES_SYSTEMATIC_MPI
+                    if (plateau_triggered && PInfo[o].stop_search &&
+                        systematic_overlap_queue(PInfo, o, k))
+                        PInfo[o].stop_search = false;
+#endif
 
                     DBG_TRACE_BLOCK {
                         // fprintf(debug_out, "solmin: %d%s\n", *solmin, PInfo[o].stop_search ? ", stopping search" : "");
@@ -3808,6 +3932,9 @@ int main(int argc, char *argv[]) {
         }
 
         scp_time += k_scp_time;
+#ifdef CCUBES_SYSTEMATIC_MPI
+        systematic_overlap_apply_stops(PInfo, k);
+#endif
 
         bool stop = true;
         for (int o = 0; o < noutputs; o++) {
@@ -3904,6 +4031,14 @@ int main(int argc, char *argv[]) {
     }
 
     free(certified_states);
+#ifdef CCUBES_SYSTEMATIC_MPI
+    if (systematic_overlap.jobs) {
+        /* A search can exhaust its supports without reaching a plateau. */
+        for (int o = 0; o < noutputs; ++o)
+            systematic_overlap_queue(PInfo, o, output_completed_level[o]);
+        systematic_overlap_finish(PInfo);
+    }
+#endif
 
     for (int o = 0; o < noutputs; o++) {
         int solmin = PInfo[o].solmin > 0 ? PInfo[o].solmin : 1; // at least one solution term is needed
@@ -3929,6 +4064,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
+#ifdef CCUBES_SYSTEMATIC_MPI
+    for (int o = 0; o < noutputs; ++o) {
+        if (!systematic_overlap_publish(&PInfo[o], o, ninputs)) {
+            fprintf(stderr, "Error: SAT-certified cover failed care-row validation for output %d.\n", o + 1);
+            destroy_output_locks(output_locks, noutputs);
+            cleanup(PInfo, buffer);
+            debug_close();
+            return 1;
+        }
+    }
+#endif
     if (CERTIFY_SYSTEMATIC) {
         if (!systematic_certify_outputs(PInfo, ninputs, noutputs, THREADS,
                                         &options.systematic_budget,
@@ -3995,9 +4141,16 @@ int main(int argc, char *argv[]) {
     write_pla_file(DST_FILE, PInfo);
     for (int o = 0; o < noutputs; ++o) {
         const bool global_minimum = CERTIFIED_MODE || CERTIFY_SYSTEMATIC ||
+#ifdef CCUBES_SYSTEMATIC_MPI
+            (systematic_overlap.jobs && systematic_overlap.jobs[o].proved) ||
+#endif
             (binary_points_supported && cover_meets_cardinality_floor(&PInfo[o]));
         report_cover_result(o, &PInfo[o], global_minimum);
     }
+
+#ifdef CCUBES_SYSTEMATIC_MPI
+    free(systematic_overlap.jobs);
+#endif
 
     // Free allocated memory
     destroy_output_locks(output_locks, noutputs);
@@ -4058,3 +4211,22 @@ int main(int argc, char *argv[]) {
     return 0;
 
 }
+
+
+#ifdef CCUBES_SYSTEMATIC_MPI
+int main(int argc, char *argv[]) {
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    MPI_Comm_rank(MPI_COMM_WORLD, &systematic_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &systematic_ranks);
+    systematic_require(provided >= MPI_THREAD_FUNNELED, "MPI lacks thread-funneled support");
+    int status = systematic_main(argc, argv);
+    if (status && systematic_ranks > 1) MPI_Abort(MPI_COMM_WORLD, status);
+    if (!systematic_rank && systematic_workers_ready) {
+        SystematicJob stop = {0};
+        systematic_transfer(&stop, sizeof(stop), -1);
+    }
+    MPI_Finalize();
+    return status;
+}
+#endif

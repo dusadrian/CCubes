@@ -363,6 +363,43 @@ static NsatStatus sat_target(PIstorage *pi, int inputs, int output, int target,
     return status;
 }
 
+#ifdef CCUBES_SYSTEMATIC_MPI
+SystematicSatResult systematic_sat_descent(const PIstorage *care, int inputs, int output,
+                                          int incumbent, double deadline)
+{
+    PIstorage candidate = {.ON_set = care->ON_set, .OFF_set = care->OFF_set,
+        .ON_minterms = care->ON_minterms, .OFF_minterms = care->OFF_minterms,
+        .solmin = incumbent};
+    NsatResources resources = {.memory_limit = NATIVE_MEMORY_LIMIT};
+    NsatLimits limits = {.poll = expired, .context = &deadline, .shared = &resources};
+    SystematicSatResult result = {.lower = 1, .terms = incumbent};
+    NsatStatus status = NSAT_UNKNOWN;
+    unsigned query = 0;
+    while (candidate.solmin > 1 && !expired(&deadline)) {
+        CoverSession session = {0};
+        status = sat_target(&candidate, inputs, output, candidate.solmin - 1,
+                            ++query, limits, NSAT_COVER_BASELINE, &session);
+        close_session(&session);
+        if (status == NSAT_UNSAT) result.lower = candidate.solmin;
+        if (status != NSAT_SAT) break;
+    }
+    result.terms = candidate.solmin;
+    result.cover = candidate.solution;
+    fprintf(stderr, "CCUBES_SYSTEMATIC_SAT_OVERLAP output=%d status=%s start_cover=%d "
+            "best=%d lower=%d queries=%u\n", output,
+            result.terms == result.lower ? "proved" : expired(&deadline) ? "deadline" :
+            status == NSAT_ERROR ? "error" : "unproved",
+            incumbent, result.terms, result.lower, query);
+    return result;
+}
+
+bool systematic_validate_cover(const PIstorage *pi, int inputs)
+{
+    NsatBudget budget = {0};
+    return cover_valid(pi, inputs, pi->solution, pi->solmin, &budget);
+}
+#endif
+
 static bool systematic_certify_cover(PIstorage *pi, int inputs, int output,
                                      int threads, const SystematicBudget *budget,
                                      NsatCoverStrengthening mode, bool reuse)

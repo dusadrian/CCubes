@@ -22,4 +22,15 @@ bool systematic_certify_outputs(PIstorage *pi, int ninputs, int noutputs,
                                 NsatCoverStrengthening mode,
                                 bool reuse);
 
+#ifdef CCUBES_SYSTEMATIC_MPI
+typedef struct {
+    int lower, terms;
+    int *cover; /* Optional independently validated transposed cover. */
+} SystematicSatResult;
+
+SystematicSatResult systematic_sat_descent(const PIstorage *care, int inputs, int output,
+                                          int incumbent, double deadline);
+bool systematic_validate_cover(const PIstorage *pi, int inputs);
+#endif
+
 #endif

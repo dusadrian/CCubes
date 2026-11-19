@@ -11,6 +11,9 @@
 #include "gurobi.h"
 #include "cover_validation.h"
 #include "debug.h"
+#ifdef CCUBES_SYSTEMATIC_MPI
+#include "ccubes_threads.h"
+#endif
 
 #ifdef HAVE_GUROBI
 
@@ -33,6 +36,10 @@ int gurobi_start_environment(GRBenv **env) {
         error = GRBsetstrparam(*env, GRB_STR_PAR_LOGFILE, run_log_path);
         if (error) return error;
     }
+#ifdef CCUBES_SYSTEMATIC_MPI
+    error = GRBsetintparam(*env, GRB_INT_PAR_THREADS, ccubes_thread_count());
+    if (error) return error;
+#endif
     return GRBstartenv(*env);
 }
 
