@@ -3080,7 +3080,9 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
         !row_weights ||
         !best_vertices ||
         !result ||
-        (options && options->anchor_limit < 0) ||
+        (options && (options->anchor_limit < 0 || options->shard_begin < 0 ||
+                     options->shard_end < 0 ||
+                     (options->shard_begin && !options->shard_end))) ||
         pi->ON_minterms <= 0 ||
         pi->OFF_minterms <= 0 ||
         !pi->ON_set ||
@@ -3127,6 +3129,8 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     }
 
     int anchor_count = pi->ON_minterms;
+    int anchor_begin = 0;
+    bool shard = options && options->shard_end > 0;
     if (
         options &&
         options->anchor_limit > 0 &&
@@ -3134,7 +3138,14 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     ) {
         anchor_count = options->anchor_limit;
     }
-    result->anchors_total = pi->ON_minterms;
+    const int bound_end = shard ? options->shard_end : pi->ON_minterms;
+    if (shard) {
+        anchor_begin = options->shard_begin;
+        if (anchor_begin < 0 || anchor_begin >= bound_end || bound_end > anchor_count)
+            return WEIGHTED_MMCS_PRICE_INVALID;
+        anchor_count = bound_end;
+    }
+    result->anchors_total = bound_end - anchor_begin;
     int nthreads = options && options->requested_threads > 0
         ? options->requested_threads
         : ccubes_thread_count();
@@ -3142,7 +3153,7 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     /* Anchors are roots, not the limit on exposed work. A support search
        can donate literal branches below each root. Bound eager admission
        by that structural width as well as CPU and memory availability. */
-    uint64_t exposed = (uint64_t)anchor_count * (max_level > 1 ? (uint64_t)ninputs : 1);
+    uint64_t exposed = (uint64_t)(anchor_count - anchor_begin) * (max_level > 1 ? (uint64_t)ninputs : 1);
     if ((uint64_t)nthreads > exposed) nthreads = (int)exposed;
     if (nthreads < 1) nthreads = 1;
 
@@ -3246,9 +3257,9 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
             ? options->deadline_nanoseconds
             : 0
     };
-    atomic_init(&parallel.next_anchor, 0);
+    atomic_init(&parallel.next_anchor, anchor_begin);
     atomic_init(&parallel.stop_status, WEIGHTED_MMCS_PRICE_OK);
-    atomic_init(&parallel.completed_anchors, 0);
+    atomic_init(&parallel.completed_anchors, anchor_begin);
     atomic_init(&parallel.waiting_workers, 0);
     void *subtree_storage = weighted_price_init_sharing(
         &parallel, worker_budget, &result->estimated_bytes_per_worker
@@ -3372,7 +3383,7 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
             earliest_unfinished < assigned_anchors
         ) {
             // Never-assigned anchors remain covered by their original suffix.
-            if (assigned_anchors < pi->ON_minterms) {
+            if (assigned_anchors < bound_end) {
                 upper = fmax(upper, root_upper_bounds[assigned_anchors]);
             }
             WeightedAnchorLiteral *literals = malloc((size_t)ninputs * sizeof(*literals));
@@ -3400,7 +3411,7 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
             }
             free(remaining_off);
             free(literals);
-        } else if (earliest_unfinished < pi->ON_minterms) {
+        } else if (earliest_unfinished < bound_end) {
             double unfinished = root_upper_bounds[earliest_unfinished];
             if (unfinished > upper) upper = unfinished;
         }
@@ -3438,13 +3449,17 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     free(root_upper_bounds);
     result->limit_reached = status == WEIGHTED_MMCS_PRICE_LIMIT_REACHED;
     result->anchor_sweep_complete = status == WEIGHTED_MMCS_PRICE_OK &&
-        anchor_count == pi->ON_minterms && result->anchors_completed == result->anchors_total;
+        anchor_count == bound_end && result->anchors_completed == result->anchors_total;
     if (pricing_call_started > 0) {
         result->telemetry.pricing_call_nanoseconds +=
             monotonic_nanoseconds() - pricing_call_started;
     }
     return status;
 }
+
+#ifdef CCUBES_DISCOVERY_MPI
+#include "ipc_exact_mpi.inc"
+#endif
 
 WeightedMMCSPriceStatus bounded_mmcs_price_output_batch(
     const PIstorage *pi,

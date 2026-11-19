@@ -766,6 +766,9 @@ static void report_cover_result(int output, const PIstorage *pi, bool global_min
             output + 1, pi->solmin, status);
 }
 
+#ifdef CCUBES_DISCOVERY_MPI
+#define main ccubes_mpi_main
+#endif
 #ifdef CCUBES_SYSTEMATIC_MPI
 static int systematic_main(int argc, char *argv[])
 #else

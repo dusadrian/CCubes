@@ -280,11 +280,19 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute_filtered(
         .cache_edge_words = true,
         .disable_cover_bound = false,
         .anchor_limit = 0,
+#ifdef CCUBES_DISCOVERY_MPI
+        /* Sorted zero-weight rows contribute coverage keys but cannot own a positive witness. */
+        .shard_end = positive_rows,
+#endif
         .deadline_nanoseconds = deadline
     };
     WeightedMMCSPriceResult price;
     WeightedMMCSPriceStatus price_status =
+#ifdef CCUBES_DISCOVERY_MPI
+        ccubes_mpi_exact_price(
+#else
         bounded_mmcs_price_output_batch_prepared(
+#endif
             &compact,
             &prepared,
             ninputs,

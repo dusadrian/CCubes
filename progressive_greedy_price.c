@@ -1010,6 +1010,12 @@ static void greedy_construct_range(
     }
 }
 
+#ifdef CCUBES_DISCOVERY_MPI
+#include "ipc_greedy_mpi.inc"
+#else
+#define greedy_parallel_construct ccubes_parallel_for
+#endif
+
 bool progressive_greedy_price_candidate_capacity(
     int anchors,
     int ninputs,
@@ -1387,7 +1393,7 @@ ProgressiveGreedyPriceStatus progressive_greedy_price_batch(
             .selected = selected,
             .selection_order = selection_order
         };
-        if (!ccubes_parallel_for(
+        if (!greedy_parallel_construct(
             0,
             (uint64_t)on_rows,
             threads,
@@ -1468,7 +1474,7 @@ ProgressiveGreedyPriceStatus progressive_greedy_price_batch(
         .selected = selected,
         .selection_order = selection_order
     };
-    if (!ccubes_parallel_for(
+    if (!greedy_parallel_construct(
         0,
         (uint64_t)candidate_count,
         threads,
@@ -1527,6 +1533,9 @@ ProgressiveGreedyPriceStatus progressive_greedy_price_batch(
         output_count++;
     }
     batch->count = output_count;
+#ifdef CCUBES_DISCOVERY_MPI
+    greedy_mpi_fingerprint(batch, ninputs, on_words, stats);
+#endif
     if (output_count == 0) {
         stats->support_minimum = 0;
     } else {

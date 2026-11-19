@@ -136,6 +136,11 @@ typedef struct {
      * deterministic descending-bound tranche used by partial pricing.
      */
     int anchor_limit;
+    /* Optional half-open anchor shard [shard_begin, shard_end). A positive
+     * shard_end scopes the bound to this interval of the original chart.
+     * Both zero means the full chart. Empty shards are handled by MPI. */
+    int shard_begin;
+    int shard_end;
     /* Absolute CLOCK_MONOTONIC deadline; zero means unlimited. */
     uint64_t deadline_nanoseconds;
 } WeightedMMCSPriceOptions;
@@ -262,6 +267,14 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
     const WeightedMMCSPriceOptions *options,
     WeightedMMCSPriceResult *result
 );
+
+#ifdef CCUBES_DISCOVERY_MPI
+WeightedMMCSPriceStatus ccubes_mpi_exact_price(
+    const PIstorage *, const WeightedMMCSPreparedRows *, int, const double *,
+    int *, WeightedMMCSPriceBatch *, const WeightedMMCSPriceOptions *,
+    WeightedMMCSPriceResult *
+);
+#endif
 
 /*
  * Geometry is generated independently per output.  Recompute the number of

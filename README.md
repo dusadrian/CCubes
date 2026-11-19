@@ -59,6 +59,10 @@ Compile the binary according to your system using `make`, with various options a
 
 The destination .pla file is optional. If not specified, the result uses the input basename prefixed by `ccubes_` for ordinary runs or `progressive_` for IPC.
 
+## Distributed IPC pricing
+
+For IPC, build with `make ccubes CC=mpicc FP_FLAGS=-DCCUBES_DISCOVERY_MPI`. Run one process per node, for example `mpirun -np 2 ./ccubes --route ipc --threads 64 input.pla result.pla`. The coordinator distributes untimed greedy candidate construction and the roots of exact pricing searches. It merges the candidate batches, solves the cover and runs local recovery. Each process uses its own thread and worker-memory allowance. A timed search can return a different feasible cover with a different number of nodes.
+
 ## Distributed systematic search
 
 Build with an MPI compiler wrapper and run one process per node. Give each process the cores assigned on that node. The coordinator gathers each completed generation level, solves its output charts and writes the PLA. All processes must read the same input and checkpoint files.
