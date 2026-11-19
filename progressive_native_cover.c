@@ -57,6 +57,7 @@
 
 typedef struct {
     bool has_failed_state;
+    bool bounded_recovery;
     int failed_master_columns;
     int failed_cardinality;
     uint64_t failed_incumbent_signature;
@@ -1639,6 +1640,7 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
     bool sustained,
     double sustained_patience_seconds
 ) {
+    const bool bounded_recovery = gate && gate->bounded_recovery;
     if (
         (options->native_feasibility_jump_seconds <= 0.0 && !sustained) ||
         result->cardinality <= 1
@@ -1674,7 +1676,7 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
         result->solution
     );
     if (
-        !sustained &&
+        !sustained && !bounded_recovery &&
         gate &&
         gate->has_failed_state &&
         incumbent_signature != 0 &&
@@ -1748,6 +1750,18 @@ static ProgressiveCoverStatus apply_native_feasibility_jump(
         jump_options.sustained_until_deadline = true;
         jump_options.sustained_patience_seconds =
             sustained_patience_seconds;
+    }
+
+    if (bounded_recovery) {
+        /* Keep the chart-based family count and shared work shares. Start
+         * a fresh deterministic stream rather than repeat the checkpoint's
+         * failed opening round. All completed rounds fold in logical order. */
+        jump_options.seed ^= UINT64_C(0x7265636f76657279);
+        jump_options.budget_mode = PROGRESSIVE_RWLS_BUDGET_WORK;
+        jump_options.deadline_nanoseconds = 0;
+        jump_options.round_deadline_nanoseconds = deadline;
+        jump_options.sustained_until_deadline = true;
+        jump_options.sustained_patience_seconds = 0.0;
     }
 
     int *jump_columns = NULL;
@@ -2088,6 +2102,10 @@ static ProgressiveCoverStatus observe_native_adaptive_phase(
                 wall_deadline
             ),
         .unbudgeted = wall_deadline == 0,
+        .recovery_available =
+            options->native_feasibility_jump_work_budget &&
+            result->cardinality > 1 && wall_deadline > 0 &&
+            !native_deadline_reached(wall_deadline),
         .allow_unbudgeted_growth = options->unlimited_tail_growth,
         .rounds_in_phase = completed_round > phase_start_round
             ? (int)(completed_round - phase_start_round)
@@ -3759,6 +3777,40 @@ resume_native_pricing:
     );
     if (status != PROGRESSIVE_COVER_OK) goto cleanup;
 
+    if (phase_policy.recovery_requested) {
+        /* Freeze the master. There is no final dual refresh, ordinary jump,
+         * renewed soft target or second terminal reserve after this handoff. */
+        const uint64_t recovery_started = native_monotonic_nanoseconds();
+        const int recovery_before = result->cardinality;
+        const uint64_t iterations_before = result->native_feasibility_jump_iterations;
+        const uint64_t reserve = native_deadline_after_seconds(
+            0, options->native_terminal_reserve_seconds);
+        uint64_t recovery_deadline = UINT64_MAX - deadline < reserve
+            ? UINT64_MAX : deadline + reserve;
+        fprintf(stderr, "CCUBES_PROGRESSIVE_NATIVE_HANDOFF "
+            "status=started round=%d columns=%d cover=%d remaining_seconds=%.6f "
+            "policy=capped-work-rounds\n", round - 1, master.count,
+            result->cardinality, recovery_deadline > recovery_started
+                ? (double)(recovery_deadline - recovery_started) / 1e9 : 0.0);
+        feasibility_jump_gate.bounded_recovery = true;
+        status = apply_native_feasibility_jump(
+            &master, &prepared, options, result, recovery_deadline,
+            &feasibility_jump_gate, &selected, &selected_cardinality, false, 0.0);
+        if (status != PROGRESSIVE_COVER_OK) goto cleanup;
+        if (result->native_feasibility_jump_deadline_reached) {
+            /* Admission can stop just short of the deadline. This is still
+             * budget-limited recovery, not evidence of search saturation. */
+            result->resource_limited = true;
+            result->stop_reason = PROGRESSIVE_STOP_RESOURCE_LIMIT;
+        }
+        fprintf(stderr, "CCUBES_PROGRESSIVE_NATIVE_HANDOFF "
+            "status=finished columns=%d cover=%d->%d iterations=%" PRIu64
+            " seconds=%.6f\n", master.count, recovery_before, result->cardinality,
+            result->native_feasibility_jump_iterations - iterations_before,
+            (double)(native_monotonic_nanoseconds() - recovery_started) / 1e9);
+        goto native_search_finished;
+    }
+
     bool final_deadline_renewed = false;
     if (
         (
@@ -3915,6 +3967,7 @@ resume_native_pricing:
         goto resume_native_pricing;
     }
 
+native_search_finished:
     if (native_deadline_reached(deadline)) {
         result->resource_limited = true;
         result->stop_reason = PROGRESSIVE_STOP_RESOURCE_LIMIT;

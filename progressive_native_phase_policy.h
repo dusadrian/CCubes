@@ -14,6 +14,7 @@
 
 typedef struct {
     int stagnant_epochs;
+    bool recovery_requested;
 } ProgressiveNativePhasePolicy;
 
 typedef struct {
@@ -24,6 +25,8 @@ typedef struct {
     /* Whether the configured wall budget can still pay for another phase.
      * Computed by the caller, which owns the clock. */
     bool budget_allows_another_epoch;
+    /* A finite allowance remains for capped recovery of this pool. */
+    bool recovery_available;
     /* No wall deadline was configured for this search. */
     bool unbudgeted;
     /* Explicit quality-first override: keep promoting a stagnant unbudgeted
@@ -40,7 +43,8 @@ typedef enum {
     PROGRESSIVE_NATIVE_PHASE_PROMOTE_BUDGET,
     PROGRESSIVE_NATIVE_PHASE_PROMOTE_GROWTH,
     PROGRESSIVE_NATIVE_PHASE_STOP_EMPTY,
-    PROGRESSIVE_NATIVE_PHASE_STOP_STAGNANT
+    PROGRESSIVE_NATIVE_PHASE_STOP_STAGNANT,
+    PROGRESSIVE_NATIVE_PHASE_HANDOFF_RECOVERY
 } ProgressiveNativePhaseDecision;
 
 void progressive_native_phase_policy_initialize(

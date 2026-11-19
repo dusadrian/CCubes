@@ -22,6 +22,7 @@ void progressive_native_phase_policy_initialize(
 ) {
     if (!policy) return;
     policy->stagnant_epochs = 0;
+    policy->recovery_requested = false;
 }
 
 uint64_t progressive_native_phase_checkpoint_round(
@@ -131,6 +132,11 @@ ProgressiveNativePhaseDecision progressive_native_phase_policy_observe(
         policy->stagnant_epochs = 0;
         return PROGRESSIVE_NATIVE_PHASE_PROMOTE_PRODUCTIVE;
     }
+    if (signals.recovery_available) {
+        policy->stagnant_epochs++;
+        policy->recovery_requested = true;
+        return PROGRESSIVE_NATIVE_PHASE_HANDOFF_RECOVERY;
+    }
     if (signals.columns_added <= 0) {
         return PROGRESSIVE_NATIVE_PHASE_STOP_EMPTY;
     }
@@ -194,6 +200,8 @@ const char *progressive_native_phase_decision_name(
             return "no-new-columns";
         case PROGRESSIVE_NATIVE_PHASE_STOP_STAGNANT:
             return "unused-columns-stagnant";
+        case PROGRESSIVE_NATIVE_PHASE_HANDOFF_RECOVERY:
+            return "bounded-cover-recovery";
     }
     return "unknown";
 }
