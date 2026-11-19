@@ -1,6 +1,8 @@
 #ifndef BOUNDED_MMCS_H
 #define BOUNDED_MMCS_H
 
+#include "coverage_exclusion.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -82,6 +84,7 @@ typedef struct {
 typedef struct {
     int capacity;
     int count;
+    const CoverageExclusion *exclusion;
     double *weights;
     int *anchors;
     int *support_sizes;

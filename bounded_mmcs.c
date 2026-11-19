@@ -1021,6 +1021,7 @@ static void weighted_batch_offer(
     const int *vertices,
     const uint64_t *coverage
 ) {
+    if (coverage_exclusion_contains(batch->exclusion, coverage)) return;
     for (int i = 0; i < batch->count; ++i) {
         uint64_t *existing_coverage = &batch->coverage[
             (size_t)i * (size_t)coverage_words
@@ -1282,7 +1283,10 @@ static bool weighted_price_prune_bound(
      * Keep ties that can still replace the incumbent in canonical order. */
     bool prune_equal = context->anchor_index > context->best_anchor;
     WeightedMMCSPriceBatch *local = context->local_batch;
-    if (local && local->count > 0) {
+    /* Keep searching for the actual maximum below the admission threshold,
+     * even when every witness collected so far belongs to the master. */
+    if (local && (local->count > 0 ||
+                  (local->exclusion && context->best_weight > 1.0 + WEIGHTED_MMCS_REDUCED_COST_TOL))) {
         if (local->count < local->capacity) {
             threshold = 1.0;
             prune_equal = true;
@@ -3220,6 +3224,10 @@ WeightedMMCSPriceStatus bounded_mmcs_price_output_batch_prepared(
         )) {
             break;
         }
+    }
+    if (batch) {
+        for (int i = 0; i < initialized; ++i)
+            workers[i].local_batch.exclusion = batch->exclusion;
     }
     if (initialized != nthreads) {
         for (int i = 0; i < initialized; ++i) {

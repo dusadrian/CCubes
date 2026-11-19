@@ -57,8 +57,9 @@ static Status price_and_insert(
     int returned = 0;
     if (!patterns || !coverage) goto done;
     memset(bound, 0, sizeof(*bound));
-    const ProgressiveGlobalBoundStatus price = progressive_global_bound_compute(
-        pi, ninputs, weights, threads, memory, seconds, NULL,
+    const ProgressiveGlobalBoundStatus price = progressive_global_bound_compute_filtered(
+        pi, master->coverage, master->count, master->words,
+        ninputs, weights, threads, memory, seconds, NULL,
         EXACT_PRICE_BATCH, &returned, patterns, bound
     );
     if (price == PROGRESSIVE_GLOBAL_BOUND_OUT_OF_MEMORY) goto done;

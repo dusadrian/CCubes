@@ -62,8 +62,9 @@ static double global_bound_rounding_margin(double weight_sum, int rows) {
     );
 }
 
-ProgressiveGlobalBoundStatus progressive_global_bound_compute(
+ProgressiveGlobalBoundStatus progressive_global_bound_compute_filtered(
     const PIstorage *pi,
+    const uint64_t *existing, int existing_count, int existing_words,
     int ninputs,
     const double *row_weights,
     int requested_threads,
@@ -102,6 +103,12 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
         return PROGRESSIVE_GLOBAL_BOUND_INVALID;
     }
 
+    if (existing_count < 0 || (existing_count > 0 &&
+        (!existing || existing_words != 1 + (pi->ON_minterms - 1) / 64)))
+        return PROGRESSIVE_GLOBAL_BOUND_INVALID;
+
+    if (!witness_capacity) existing_count = 0;
+
     const uint64_t started = global_bound_monotonic_nanoseconds();
     int positive_rows = 0;
     double weight_sum = 0.0;
@@ -129,20 +136,25 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
         return PROGRESSIVE_GLOBAL_BOUND_OK;
     }
 
+    /* Candidate exclusion compares full ON coverage, including zero-weight
+     * rows. Retain those rows for filtered collection so distinct full
+     * coverage classes cannot collapse under the weight projection. */
+    const int chart_rows = existing_count > 0 ? pi->ON_minterms : positive_rows;
+
     if (
-        (size_t)positive_rows >
+        (size_t)chart_rows >
             SIZE_MAX / (size_t)ninputs / sizeof(int)
     ) {
         return PROGRESSIVE_GLOBAL_BOUND_OUT_OF_MEMORY;
     }
     int *compact_on = (int *)malloc(
-        (size_t)positive_rows * (size_t)ninputs * sizeof(int)
+        (size_t)chart_rows * (size_t)ninputs * sizeof(int)
     );
     double *compact_weights = (double *)malloc(
-        (size_t)positive_rows * sizeof(double)
+        (size_t)chart_rows * sizeof(double)
     );
     PositiveWeightedRow *ordered = (PositiveWeightedRow *)malloc(
-        (size_t)positive_rows * sizeof(PositiveWeightedRow)
+        (size_t)chart_rows * sizeof(PositiveWeightedRow)
     );
     int *best_vertices = (int *)malloc((size_t)ninputs * sizeof(int));
     if (!compact_on || !compact_weights || !ordered || !best_vertices) {
@@ -155,7 +167,7 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
 
     int compact_row = 0;
     for (int row = 0; row < pi->ON_minterms; ++row) {
-        if (row_weights[row] <= 0.0) continue;
+        if (!existing_count && row_weights[row] <= 0.0) continue;
         ordered[compact_row] = (PositiveWeightedRow){
             .row = row,
             .weight = row_weights[row]
@@ -164,11 +176,11 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
     }
     qsort(
         ordered,
-        (size_t)positive_rows,
+        (size_t)chart_rows,
         sizeof(PositiveWeightedRow),
         compare_positive_weighted_rows
     );
-    for (compact_row = 0; compact_row < positive_rows; ++compact_row) {
+    for (compact_row = 0; compact_row < chart_rows; ++compact_row) {
         const int row = ordered[compact_row].row;
         memcpy(
             compact_on + (size_t)compact_row * (size_t)ninputs,
@@ -181,12 +193,12 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
     memset(&compact, 0, sizeof(compact));
     compact.inputs = ninputs;
     compact.outputs = 1;
-    compact.ON_minterms = positive_rows;
+    compact.ON_minterms = chart_rows;
     compact.OFF_minterms = pi->OFF_minterms;
     compact.ON_set = compact_on;
     compact.OFF_set = pi->OFF_set;
     compact.cov_bits = 64;
-    compact.pichart_words = (positive_rows + 63) / 64;
+    compact.pichart_words = 1 + (chart_rows - 1) / 64;
 
     WeightedMMCSPreparedRows prepared;
     memset(&prepared, 0, sizeof(prepared));
@@ -198,8 +210,28 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
         return PROGRESSIVE_GLOBAL_BOUND_UNSUPPORTED;
     }
 
+    CoverageExclusion exclusion = {0};
+    uint64_t *ordered_existing = NULL;
+    if (existing_count > 0 && (size_t)existing_count <=
+            SIZE_MAX / sizeof(uint64_t) / (size_t)compact.pichart_words) {
+        const size_t cells = (size_t)existing_count * compact.pichart_words;
+        ordered_existing = calloc(cells, sizeof(uint64_t));
+        if (ordered_existing) {
+            for (int c = 0; c < existing_count; ++c)
+                for (int row = 0; row < chart_rows; ++row) {
+                    int original = ordered[row].row;
+                    if ((existing[(size_t)c * existing_words + original / 64] >> (original % 64)) & 1)
+                        ordered_existing[(size_t)c * compact.pichart_words + row / 64] |= UINT64_C(1) << (row % 64);
+                }
+            if (!coverage_exclusion_init(&exclusion, ordered_existing, existing_count, compact.pichart_words)) {
+                free(ordered_existing);
+                ordered_existing = NULL;
+            }
+        }
+    }
     WeightedMMCSPriceBatch batch;
     memset(&batch, 0, sizeof(batch));
+    batch.exclusion = exclusion.slots ? &exclusion : NULL;
     if (witness_capacity > 0) {
         batch.capacity = witness_capacity;
         batch.weights = (double *)malloc(
@@ -227,6 +259,8 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
             free(batch.weights); free(batch.anchors);
             free(batch.support_sizes); free(batch.vertices);
             free(batch.coverage);
+            free(exclusion.slots);
+            free(ordered_existing);
             free(compact_on); free(compact_weights); free(ordered);
             free(best_vertices);
             return PROGRESSIVE_GLOBAL_BOUND_OUT_OF_MEMORY;
@@ -288,7 +322,7 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
         memset(best_pattern, 0, (size_t)ninputs * sizeof(int));
         if (
             price.best_anchor >= 0 &&
-            price.best_anchor < positive_rows
+            price.best_anchor < chart_rows
         ) {
             const int original_anchor =
                 ordered[price.best_anchor].row;
@@ -307,7 +341,7 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
                 (size_t)witness * (size_t)ninputs;
             memset(pattern, 0, (size_t)ninputs * sizeof(int));
             const int compact_anchor = batch.anchors[witness];
-            if (compact_anchor < 0 || compact_anchor >= positive_rows) {
+            if (compact_anchor < 0 || compact_anchor >= chart_rows) {
                 status = PROGRESSIVE_GLOBAL_BOUND_PRICING_ERROR;
                 goto cleanup;
             }
@@ -352,7 +386,7 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
      */
     const double margin = global_bound_rounding_margin(
         weight_sum,
-        positive_rows
+        chart_rows
     );
     const double safe_weight_sum = fmax(0.0, weight_sum - margin);
     const double safe_upper = nextafter(
@@ -387,6 +421,8 @@ cleanup:
     free(batch.support_sizes);
     free(batch.vertices);
     free(batch.coverage);
+    free(exclusion.slots);
+    free(ordered_existing);
     return status;
 }
 
@@ -401,4 +437,23 @@ const char *progressive_global_bound_status_name(
         case PROGRESSIVE_GLOBAL_BOUND_PRICING_ERROR: return "pricing-error";
     }
     return "unknown";
+}
+
+ProgressiveGlobalBoundStatus progressive_global_bound_compute(
+    const PIstorage *pi,
+    int ninputs,
+    const double *row_weights,
+    int requested_threads,
+    uint64_t worker_memory_budget_bytes,
+    double time_limit_seconds,
+    int *best_pattern,
+    int witness_capacity,
+    int *witness_count,
+    int *witness_patterns,
+    ProgressiveGlobalBoundResult *result
+) {
+    return progressive_global_bound_compute_filtered(pi, NULL, 0, 0,
+        ninputs, row_weights, requested_threads, worker_memory_budget_bytes,
+        time_limit_seconds, best_pattern, witness_capacity, witness_count,
+        witness_patterns, result);
 }

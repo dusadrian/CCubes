@@ -67,6 +67,25 @@ ProgressiveGlobalBoundStatus progressive_global_bound_compute(
     ProgressiveGlobalBoundResult *result
 );
 
+/* Collect witnesses whose complete ON coverage is absent from existing.
+ * Existing columns use 64-bit words in the original ON-row order.
+ * This affects candidate admission only; all legal cubes still contribute
+ * to the pricing maximum and upper bound. */
+ProgressiveGlobalBoundStatus progressive_global_bound_compute_filtered(
+    const PIstorage *pi,
+    const uint64_t *existing, int existing_count, int existing_words,
+    int ninputs,
+    const double *row_weights,
+    int requested_threads,
+    uint64_t worker_memory_budget_bytes,
+    double time_limit_seconds,
+    int *best_pattern,
+    int witness_capacity,
+    int *witness_count,
+    int *witness_patterns,
+    ProgressiveGlobalBoundResult *result
+);
+
 const char *progressive_global_bound_status_name(
     ProgressiveGlobalBoundStatus status
 );
