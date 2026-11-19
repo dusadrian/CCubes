@@ -199,6 +199,26 @@ Use `--route ipc` for the native incremental prime-cover solver. It handles cons
 
 IPC defaults to the native master at effort zero with greedy and exact pricing, native repair, bounded recovery, and one final literal-polish pass. It runs without Gurobi. The ordinary route retains its optional Gurobi solver and falls back to the hybrid solver if Gurobi support was not built in. The IPC target is soft. Exact pricing extends the target, and optional global-bound calculation and final literal polishing use separate allowances. On a single-output run, the solver can publish validated incumbents atomically as it progresses.
 
+`--threads` is an upper limit, further limited by the CPUs available to the
+process. Linux affinity restrictions are respected. Pass the allocation size
+explicitly on batch systems that do not bind the process to its allocated CPUs.
+Repeated Lagrangian kernels learn their team size from timed work on the current
+machine. Arithmetic reduction order stays fixed across team sizes.
+Native dual logs report the actual reduced-cost and slack team sizes as
+minimum/mean/maximum, along with the number of serial calls out of all calls.
+
+For IPC local search, the default number of restart families depends on the
+current cover size and chart dimensions. Families run in groups of four.
+The memory budget and, in work mode, the iteration budget can reduce how
+many families run. Changing the thread count changes how many can execute
+at once. With default work settings, the first round has at most 524,288
+iterations and each family receives at most 8,192. The solver increases
+both allowances together on progress-driven retries.
+
+When a systematic generation level finishes, the OpenMP build finalizes
+up to two output charts concurrently within the thread limit. Each chart
+retains the same ordering and duplicate-coverage rules.
+
 Exact pricing adds validated candidates to the native cover pool. When a full-table call finds no new candidates, subsequent calls also try replacing groups of cubes in the current cover. Each pricing search has a two-second allowance. IPC adds the time spent in this stage to the search deadline so that it can still spend its regular allowance on greedy pricing and recovery. The candidates found can vary between runs because pricing uses a wall-clock limit. Set `--ipc-exact-pricing 0` to skip this stage.
 
 For example, `--route ipc --ipc-time-target 60 --ipc-terminal-reserve 15` gives the main IPC search a 45-second target and reserves up to 15 seconds for local search over the retained columns. The reserve can finish early after the patience interval or when the retained pool already has a proven minimum cover. The patience check runs between search rounds.
