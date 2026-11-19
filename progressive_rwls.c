@@ -1031,6 +1031,16 @@ static int find_selected_on_row(
     const FeasibilityJumpState *state,
     int row
 ) {
+    const size_t degree = state->incidence->row_offsets[row + 1] -
+        state->incidence->row_offsets[row];
+    if (state->master->words == 1 && (size_t)state->selected_columns < degree) {
+        const uint64_t bit = UINT64_C(1) << row;
+        for (int i = 0; i < state->selected_columns; ++i) {
+            const int column = state->selected_list[i];
+            if (state->master->coverage[column] & bit) return column;
+        }
+        return -1;
+    }
     for (
         size_t index = state->incidence->row_offsets[row];
         index < state->incidence->row_offsets[row + 1];
